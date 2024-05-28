@@ -1,0 +1,5 @@
+[wrap-git]
+url = https://github.com/CGAL/cgal.git
+revision = eb07187e7d078ced0af7190fcca82bb5719f52d6
+depth = 1
+method = cmake

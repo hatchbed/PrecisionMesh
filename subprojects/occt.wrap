@@ -1,0 +1,5 @@
+[wrap-git]
+url = https://github.com/Open-Cascade-SAS/OCCT.git
+revision = V7_7_2
+depth = 1
+method = cmake
