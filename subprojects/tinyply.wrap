@@ -1,0 +1,13 @@
+[wrap-file]
+source_url = https://github.com/ddiakopoulos/tinyply/archive/2.3.4.tar.gz
+source_filename = tinyply-2.3.4.tar.gz
+directory = tinyply-2.3.4
+source_hash = 1bb1462727a363f7b77a10e51cd023095db7b281d2f201167620a83e495513c6
+patch_filename = tinyply_2.3.4-1_patch.zip
+patch_url = https://wrapdb.mesonbuild.com/v2/tinyply_2.3.4-1/get_patch
+patch_hash = 05a5258df6dc3993eaa3ef8ec7a7ba1ac594aeb9c55eb22cdba18fa8f6186705
+wrapdb_version = 2.3.4-1
+
+[provide]
+tinyply = tinyply_dep
+
