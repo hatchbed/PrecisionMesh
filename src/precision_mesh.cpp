@@ -569,7 +569,7 @@ int main(int argc, char **argv) {
         selected_component->shape = subdivide_step_shape(selected_component->shape, min_edge_length,
                                                          max_edge_length, max_surface_error);
 
-        save_shape_as_step("subdivided.step", selected_component->shape);
+        //save_shape_as_step("subdivided.step", selected_component->shape);
 
         spdlog::info("  tessalating ...");
 
@@ -740,6 +740,13 @@ int main(int argc, char **argv) {
     double max_remeshing_surface_error = std::min(max_surface_error, min_edge_length * 0.1);
 
     spdlog::info("  adaptive isotropic remeshing ...");
+
+    WireProjectorCachePtr<Mesh> wire_projectors;
+    if (is_step) {
+        spdlog::info("    creating edge projectors ...");
+        wire_projectors = get_edge_vertex_wire_projectors<Mesh>(selected_component->shape);
+    }
+
     for (int i = 0; i < iterations; i++) {
         spdlog::info("    iteration {}", i + 1);
         spdlog::info("      remeshing ...");
@@ -779,7 +786,7 @@ int main(int argc, char **argv) {
                 tbb::blocked_range<size_t>(0, meshes.size()), [&](const tbb::blocked_range<size_t>& r) {
                     for (size_t m=r.begin(); m!=r.end(); ++m) {
                         double weight = 1.0 / (iterations - i);
-                        project_to_step<Mesh>(selected_component->shape, segments[m], meshes[m], weight);
+                        project_to_step<Mesh>(segments[m], meshes[m], wire_projectors, weight);
             }});
         }
     }

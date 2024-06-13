@@ -7,6 +7,7 @@
 #include <unordered_map>
 
 #include <spdlog/spdlog.h>
+#include <tbb/parallel_for.h>
 
 #include <CGAL/boost/graph/iterator.h>
 #include <CGAL/Polygon_mesh_processing/repair_polygon_soup.h>
@@ -106,19 +107,17 @@ struct StepBorderProjector {
     BRepExtrema_DistShapeShape extrema;
 };
 
-TopoDS_Wire get_border_loop_wire(const TopoDS_Shape& shape, const TopoDS_Face& face,
-                                 const TopoDS_Vertex& vertex)
-{
+template<class Mesh>
+using WireProjectorCachePtr = std::shared_ptr<std::unordered_map<int, std::unordered_map<int, StepProjector<Mesh>>>>;
 
+TopoDS_Wire get_border_loop_wire(
+    const TopoDS_Vertex& vertex,
+    const TopTools_IndexedDataMapOfShapeListOfShape& vertex_to_edge_map,
+    const TopTools_IndexedDataMapOfShapeListOfShape& edge_to_face_map)
+{
     size_t wire_size = 0;
     BRepBuilderAPI_MakeWire wire_maker;
     std::map<int, bool> evaluated;
-
-    TopTools_IndexedDataMapOfShapeListOfShape vertex_to_edge_map;
-    TopExp::MapShapesAndUniqueAncestors(face, TopAbs_VERTEX, TopAbs_EDGE, vertex_to_edge_map);
-
-    TopTools_IndexedDataMapOfShapeListOfShape edge_to_face_map;
-    TopExp::MapShapesAndUniqueAncestors(shape, TopAbs_EDGE, TopAbs_FACE, edge_to_face_map);
 
     // Get the vertices of the target edge
     std::deque<TopoDS_Vertex> vertex_queue = { vertex };
@@ -153,28 +152,85 @@ TopoDS_Wire get_border_loop_wire(const TopoDS_Shape& shape, const TopoDS_Face& f
         }
     }
 
-    spdlog::debug("made wire of size: {}", wire_size);
-    return wire_maker.Wire();
+    if (wire_size == 0) {
+        return TopoDS_Wire();
+    }
+
+    spdlog::debug("making wire of size: {}", wire_size);
+    return wire_maker.Wire();;
 }
 
 template<class Mesh>
-std::map<typename Mesh::Vertex_index, TopoDS_Wire> get_border_vertex_map(const TopoDS_Shape& shape,
-    const TopoDS_Face& face, Mesh& mesh, double tolerance=1e-3) {
+WireProjectorCachePtr<Mesh> get_edge_vertex_wire_projectors(const TopoDS_Shape& shape) {
+    auto wire_projectors =
+        std::make_shared<std::unordered_map<int, std::unordered_map<int, StepProjector<Mesh>>>>();
 
-    auto cylinder = Handle(Geom_CylindricalSurface)::DownCast(BRep_Tool::Surface(face));
-    if (!cylinder.IsNull()) {
-        spdlog::debug("CYLINDER");
-    }
-    auto cone = Handle(Geom_ConicalSurface)::DownCast(BRep_Tool::Surface(face));
-    if (!cone.IsNull()) {
-        spdlog::debug("CONE");
-    }
-    auto toroid = Handle(Geom_ToroidalSurface)::DownCast(BRep_Tool::Surface(face));
-    if (!toroid.IsNull()) {
-        spdlog::debug("TOROID");
+    TopTools_IndexedDataMapOfShapeListOfShape edge_to_face_map;
+    TopExp::MapShapesAndUniqueAncestors(shape, TopAbs_EDGE, TopAbs_FACE, edge_to_face_map);
+
+
+    std::vector<TopoDS_Face> faces;
+    for (TopExp_Explorer face_exp(shape, TopAbs_FACE); face_exp.More(); face_exp.Next()) {
+        auto face = TopoDS::Face(face_exp.Current());
+        int face_code = face.HashCode(INT_MAX);
+        faces.push_back(face);
+        (*wire_projectors)[face_code] = {};
     }
 
-    std::map<typename Mesh::Vertex_index, TopoDS_Wire> border_map;
+    tbb::parallel_for(
+        tbb::blocked_range<size_t>(0, faces.size()), [&](const tbb::blocked_range<size_t>& r) {
+            for (size_t f = r.begin(); f != r.end(); ++f) {
+                auto& face = faces[f];
+                int face_code = face.HashCode(INT_MAX);
+
+                TopTools_IndexedDataMapOfShapeListOfShape vertex_to_edge_map;
+                TopExp::MapShapesAndUniqueAncestors(face, TopAbs_VERTEX, TopAbs_EDGE, vertex_to_edge_map);
+
+                auto face_wire_projectors_it = wire_projectors->find(face_code);
+                if (face_wire_projectors_it == wire_projectors->end()) {
+                    continue;
+                }
+                auto& face_wire_projectors = face_wire_projectors_it->second;
+
+                for (TopExp_Explorer vertex_exp(face, TopAbs_VERTEX); vertex_exp.More(); vertex_exp.Next()) {
+                    auto v = TopoDS::Vertex(vertex_exp.Current());
+                    int vertex_code = v.HashCode(INT_MAX);
+
+                    auto projector_it = face_wire_projectors.find(vertex_code);
+                    if (projector_it != face_wire_projectors.end()) {
+                        face_wire_projectors[vertex_code] = projector_it->second;
+                        continue;
+                    }
+
+                    auto wire = get_border_loop_wire(v, vertex_to_edge_map, edge_to_face_map);
+                    if (wire.IsNull()) {
+                        continue;
+                    }
+
+                    auto projector = StepProjector<Mesh>(wire);
+
+                    for (TopExp_Explorer wire_exp(wire, TopAbs_VERTEX); wire_exp.More(); wire_exp.Next()) {
+                        auto wire_v = TopoDS::Vertex(wire_exp.Current());
+                        int wire_vertex_code = wire_v.HashCode(INT_MAX);
+                        face_wire_projectors[wire_vertex_code] = projector;
+                    }
+                }
+            }});
+
+    spdlog::debug("done making wire projectors.");
+
+    return wire_projectors;
+}
+
+template<class Mesh>
+std::unordered_map<typename Mesh::Vertex_index, StepProjector<Mesh>> get_border_vertex_projector_map(
+    const TopoDS_Face& face, Mesh& mesh,
+    WireProjectorCachePtr<Mesh> wire_projectors, double tolerance=1e-3)
+{
+    int face_code = face.HashCode(INT_MAX);
+    const auto& face_wire_projectors = (*wire_projectors)[face_code];
+
+    std::unordered_map<typename Mesh::Vertex_index, StepProjector<Mesh>> border_vertex_projector_map;
 
     std::vector<TopoDS_Edge> edges;
     std::vector<BRepExtrema_DistShapeShape> edge_extremas;
@@ -184,11 +240,7 @@ std::map<typename Mesh::Vertex_index, TopoDS_Wire> get_border_vertex_map(const T
         edges.push_back(TopoDS::Edge(edge_exp.Current()));
     }
 
-    std::vector<TopoDS_Wire> loops;
-    std::vector<BRepExtrema_DistShapeShape> loop_extremas;
-
-    // first pass to associate mesh border points already on the face border and to build border
-    // loops
+    // first pass to associate mesh border points already on the face border with projectors
     std::deque<typename Mesh::Vertex_index> vertex_queue;
     for (auto v: mesh.vertices()) {
         if (mesh.is_border(v)) {
@@ -196,26 +248,7 @@ std::map<typename Mesh::Vertex_index, TopoDS_Wire> get_border_vertex_map(const T
             auto point = gp_Pnt(p[0], p[1], p[2]);
             TopoDS_Vertex vertex = BRepBuilderAPI_MakeVertex(point);
 
-            // find if there is already a loop that the border vertex lies on
-            size_t nearest_loop_index = 0;
-            double nearest_loop_dist = std::numeric_limits<double>::max();
-            for (size_t i = 0; i < loop_extremas.size(); i++) {
-                loop_extremas[i].LoadS2(vertex);
-                loop_extremas[i].Perform();
-                double dist = loop_extremas[i].Value();
-
-                if (dist < nearest_loop_dist) {
-                    nearest_loop_index = i;
-                    nearest_loop_dist = dist;
-                }
-            }
-            spdlog::debug("neares loop dist: {}", nearest_loop_dist);
-            if (nearest_loop_dist <= tolerance) {
-                border_map[v] = loops[nearest_loop_index];
-                continue;
-            }
-
-            // otherwise, check if the vertex lies on a border edge
+            // check if the vertex lies on a border edge
             size_t nearest_edge_index = 0;
             double nearest_edge_dist = std::numeric_limits<double>::max();
             for (size_t i = 0; i < edge_extremas.size(); i++) {
@@ -230,7 +263,8 @@ std::map<typename Mesh::Vertex_index, TopoDS_Wire> get_border_vertex_map(const T
             }
 
             if (nearest_edge_dist <= tolerance) {
-                // make wire from edge loop
+                // if so, find the nearest edge vertex and the associate projector
+
                 const auto& nearest_edge = edges[nearest_edge_index];
                 TopoDS_Vertex v1, v2;
                 TopExp::Vertices(TopoDS::Edge(nearest_edge), v1, v2);
@@ -241,26 +275,28 @@ std::map<typename Mesh::Vertex_index, TopoDS_Wire> get_border_vertex_map(const T
                     nearest_vertex = v2;
                 }
 
-                auto border_loop = get_border_loop_wire(shape, face, nearest_vertex);
-                loops.push_back(border_loop);
-                loop_extremas.push_back(BRepExtrema_DistShapeShape());
-                loop_extremas.back().LoadS1(border_loop);
-                border_map[v] = border_loop;
+                int vertex_code = nearest_vertex.HashCode(INT_MAX);
+                auto projector_it = face_wire_projectors.find(vertex_code);
+                if (projector_it == face_wire_projectors.end()) {
+                    continue;
+                }
+
+                border_vertex_projector_map[v] = projector_it->second;
             }
             else {
+                // otherwise queue the vertex for the second pass
                 vertex_queue.push_back(v);
             }
         }
     }
 
     if (vertex_queue.empty()) {
-        return border_map;
+        return border_vertex_projector_map;
     }
 
-    spdlog::debug("border map size: {}", border_map.size());
+    spdlog::debug("border map size: {}", border_vertex_projector_map.size());
     spdlog::debug("vertex queue size: {}", vertex_queue.size());
     spdlog::debug("num edges: {}", edges.size());
-    spdlog::debug("num loops: {}", loops.size());
 
     bool made_progress = true;
     while (made_progress) {
@@ -276,11 +312,11 @@ std::map<typename Mesh::Vertex_index, TopoDS_Wire> get_border_vertex_map(const T
                     continue;
                 }
                 auto neighbor_v = mesh.source(halfedge);
-                auto v_it = border_map.find(neighbor_v);
-                if (v_it != border_map.end()) {
+                auto v_it = border_vertex_projector_map.find(neighbor_v);
+                if (v_it != border_vertex_projector_map.end()) {
 
                     // TODO(malban): track wire parameter to limit search space when projecting
-                    border_map[v] = v_it->second;
+                    border_vertex_projector_map[v] = v_it->second;
                     found_neighbor = true;
                     made_progress = true;
                     break;
@@ -300,40 +336,35 @@ std::map<typename Mesh::Vertex_index, TopoDS_Wire> get_border_vertex_map(const T
         }
     }
 
-    return border_map;
+    return border_vertex_projector_map;
 }
 
 
 template<class Mesh>
-void project_to_step(const TopoDS_Shape& shape, const TopoDS_Face& face, Mesh& mesh, double weight = 1.0) {
+void project_to_step(const TopoDS_Face& face, Mesh& mesh,
+                     WireProjectorCachePtr<Mesh> wire_projectors, double weight = 1.0)
+{
     double w1 = std::max(0.0, std::min(1.0, weight));
     double w2 = 1.0 - w1;
 
-    auto border_vertex_map = get_border_vertex_map<Mesh>(shape, face, mesh);
+    auto border_vertex_projector_map = get_border_vertex_projector_map<Mesh>(face, mesh,
+                                                                             wire_projectors);
 
     StepProjector<Mesh> surface_projector(face);
     StepBorderProjector<Mesh> border_projector(face);
-
-    std::map<int, StepProjector<Mesh>> wire_projectors;
 
     for (auto v: mesh.vertices()) {
         auto input = mesh.point(v);
 
         typename Mesh::Point projected;
         if (mesh.is_border(v)) {
-            auto wire_it = border_vertex_map.find(v);
-            if (wire_it == border_vertex_map.end()) {
-                spdlog::warn("Failed to find wire corresponding to mesh border vertex.");
+            auto wire_projector_it = border_vertex_projector_map.find(v);
+            if (wire_projector_it == border_vertex_projector_map.end()) {
+                spdlog::warn("Failed to find projector corresponding to mesh border vertex.");
                 projected = border_projector(input);
             }
             else {
-                int wire_hash_code = wire_it->second.HashCode(INT_MAX);
-                auto projector_it = wire_projectors.find(wire_hash_code);
-                if (projector_it == wire_projectors.end()) {
-                    wire_projectors[wire_hash_code].setShape(wire_it->second);
-                }
-
-                projected = wire_projectors[wire_hash_code](input);
+                projected = wire_projector_it->second(input);
             }
         }
         else {
@@ -452,31 +483,47 @@ TopoDS_Shape subdivide_step_shape(TopoDS_Shape& shape, double min_edge_length,
             Standard_Real u1, u2, v1, v2;
             BRepTools::UVBounds(face, u1, u2, v1, v2);
 
-            spdlog::debug("  U (angle): {} - {} ({})", u1, u2, u2 - u1);
-            spdlog::debug("  V (height): {} - {}", v1, v2);
+            spdlog::debug("  U (angle): {} -> {} ({})", u1, u2, u2 - u1);
+            spdlog::debug("  V (height): {} -> {} ({})", v1, v2, v2 - v1);
 
             double angle = 0;
 
+            spdlog::debug("  max edge length: {}", max_edge_length);
+
+            // adjust the max edge length down to account for the hypotenuse of
+            // the right triangle formed by the U and V edges
+            double max_u_edge_length = max_edge_length / std::sqrt(2);
+            spdlog::debug("  max u edge length: {}", max_u_edge_length);
+
+            // the edge lengths can't be shorter than the diameter
+            max_u_edge_length = std::min(max_u_edge_length, 2 * radius);
+            double min_u_edge_length = std::min(min_edge_length, 2 * radius);
+            spdlog::debug("  max u edge length: {}", max_u_edge_length);
+            spdlog::debug("  min u edge length: {}", min_u_edge_length);
+
+
+            // find the maximum angle to subdivide the cylinder by based on the
+            // maximum allowed surface error
             if (max_surface_error / radius <= 2) {
                 double max_angle = 2 * std::acos(1 - max_surface_error / radius);
-                spdlog::debug("  max angle: {}", max_angle);
+                spdlog::debug("  max surface error angle: {}", max_angle);
                 angle = max_angle;
             }
 
-            if (min_edge_length <= 2 * radius) {
-                double min_angle = 2 * std::asin(min_edge_length / (2 * radius));
-                spdlog::debug("  min angle: {}", min_angle);
-                if (min_angle > angle) {
-                    angle = min_angle;
-                }
+            // update the angle to be larger if necessary to satisfy the min
+            // edge length constraint, even at the expense of surface error
+            double min_angle = 2 * std::asin(min_u_edge_length / (2 * radius));
+            spdlog::debug("  min edge length angle: {}", min_angle);
+            if (min_angle > angle) {
+                angle = min_angle;
             }
 
-            if (max_edge_length <= 2 * radius) {
-                double max_angle = 2 * std::asin(max_edge_length / (2 * radius));
-                spdlog::debug("  max angle: {}", max_angle);
-                if (max_angle < angle) {
-                    angle = max_angle;
-                }
+            // update the angle to be smaller if necessary to satisfy the max
+            // edge length constraint
+            double max_angle = 2 * std::asin(max_u_edge_length / (2 * radius));
+            spdlog::debug("  max edge length angle: {}", max_angle);
+            if (max_angle < angle) {
+                angle = max_angle;
             }
 
             if (angle > 0) {
@@ -485,14 +532,32 @@ TopoDS_Shape subdivide_step_shape(TopoDS_Shape& shape, double min_edge_length,
                 int steps = std::ceil((u2 - u1) / angle);
                 spdlog::debug("  steps: {}", steps);
 
+                angle = (u2 - u1) / steps;
+
+                spdlog::debug("  actual step size: {}", angle);
+
                 if (steps > 1) {
                     u_steps = steps;
                 }
             }
 
-            if (v2 - v1 > max_edge_length) {
-                v_steps = static_cast<int>(std::ceil((v2 - v1) / max_edge_length));
+            // get actual edge length for the u step
+            double u_length = 2 * radius * std::sin(angle / 2);
+            spdlog::debug("  u length: {}", u_length);
+
+            // get max v edge length, taking into account the length of the
+            // hypotenuse formed by the u and v edges
+            double max_v_edge_length =
+                std::min(max_edge_length,
+                std::sqrt(max_edge_length * max_edge_length + u_length * u_length));
+            spdlog::debug("  max v length: {}", max_v_edge_length);
+
+            if (v2 - v1 > max_v_edge_length) {
+                v_steps = static_cast<int>(std::ceil((v2 - v1) / max_v_edge_length));
             }
+
+            double v_length = (v2 - v1) / v_steps;
+            spdlog::debug("  v length: {}", v_length);
         }
 
         auto swept_surface = Handle(Geom_SweptSurface)::DownCast(surface);
