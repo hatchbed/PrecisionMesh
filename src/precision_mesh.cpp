@@ -1,4 +1,3 @@
-#include <deque>
 #include <filesystem>
 #include <limits>
 #include <map>
@@ -33,6 +32,7 @@
 #include <BRep_Tool.hxx>
 #include <BRepGProp.hxx>
 #include <BRepMesh_IncrementalMesh.hxx>
+#include <gp_Trsf.hxx>
 #include <GProp_GProps.hxx>
 #include <IMeshTools_Parameters.hxx>
 #include <Message.hxx>
@@ -64,18 +64,20 @@ namespace PMP = CGAL::Polygon_mesh_processing;
 std::unordered_set<std::string> mesh_formats = {".obj", ".off", ".ply", ".stl", ".ts", ".vtp"};
 
 struct Component {
-    Component(TDF_Label label, const std::string& name, size_t index,
-              const std::string& reference_name, size_t depth) :
-        label(label), name(name), index(index), reference_name(reference_name), depth(depth) {}
+    Component(TDF_Label label, TDF_Label reference, const std::string& name,
+              const std::string& qualified_name, size_t index, const std::string& reference_name) :
+        label(label), reference(reference), name(name), qualified_name(qualified_name),
+        index(index), reference_name(reference_name) {}
 
     TDF_Label label;
+    TDF_Label reference;
     std::string name;
+    std::string qualified_name;
     int32_t index;
     std::string reference_name;
-    size_t depth;
     TopoDS_Shape shape;
-    double surface_area = 0.0;
-    std::vector<std::shared_ptr<Component>> children;
+    std::string id;
+    double surface_area=0.0;
 };
 
 std::string getName(const TDF_Label& label) {
@@ -105,10 +107,22 @@ void saveOutput(const std::vector<std::string>& outputs, const std::vector<Mesh>
     }
 }
 
-void exploreAssembly(Handle(XCAFDoc_ShapeTool) &assembly, Component& parent, std::map<std::string, size_t>& counts) {
+gp_Trsf GetTransform(Handle(XCAFDoc_ShapeTool)& assembly, const TDF_Label& label) {
+    auto transformation = assembly->GetLocation(label);
+    TDF_Label parent = label.Father();
+    if (!parent.IsNull()) {
+        auto parentTransformation = GetTransform(assembly, parent);
+        transformation = transformation.Multiplied(parentTransformation);
+    }
+    return transformation;
+}
+
+void exploreAssembly(Handle(XCAFDoc_ShapeTool) &assembly, Component& parent,
+                     std::vector<std::shared_ptr<Component>>& components) {
     TDF_LabelSequence children;
     assembly->GetComponents(parent.label, children);
 
+    std::map<std::string, size_t> counts;
     for (Standard_Integer i = 1; i <= children.Length(); i++) {
         TDF_Label label = children.Value(i);
 
@@ -116,20 +130,30 @@ void exploreAssembly(Handle(XCAFDoc_ShapeTool) &assembly, Component& parent, std
         std::string reference_name;
 
         size_t index = ++counts[name];
-
-        TDF_Label reference;
-        if (assembly->GetReferredShape(label, reference)) {
-            reference_name = getName(reference);
-            label = reference;
-            spdlog::debug("has reference: {}", reference_name);
+        std::string qualified_name = parent.qualified_name + "/" + name;
+        if (index > 1) {
+            qualified_name += "_" + std::to_string(index);
         }
 
-        spdlog::debug("    {}{}", std::string(2 * (parent.depth + 1), ' '), name);
+        TDF_Label reference = label;
+        if (assembly->GetReferredShape(label, reference)) {
+            reference_name = getName(reference);
+        }
 
-        parent.children.push_back(
-            std::make_shared<Component>(label, name, index, reference_name, parent.depth + 1));
+        auto component = std::make_shared<Component>(label, reference, name, qualified_name,
+                                                     index, reference_name);
 
-        exploreAssembly(assembly, *parent.children.back(), counts);
+        if (XCAFDoc_ShapeTool::IsSimpleShape(reference)) {
+            gp_Trsf transform = GetTransform(assembly, label);
+
+            component->shape = XCAFDoc_ShapeTool::GetShape(reference);
+            if (!component->shape.IsNull()) {
+                component->shape = component->shape.Located(TopLoc_Location(transform));
+                components.push_back(component);
+            }
+        }
+
+        exploreAssembly(assembly, *component, components);
     }
 }
 
@@ -175,11 +199,12 @@ int main(int argc, char **argv) {
         ->required();
 
     std::string shape_name;
-    app.add_option("-n,--name", shape_name, "STEP file shape name.");
+    auto shape_name_opt = app.add_option("-n,--name", shape_name, "STEP file shape name.");
 
-    int shape_instance_index = 1;
-    app.add_option("--instance", shape_instance_index, "STEP file shape instance index.")
-        ->check(CLI::PositiveNumber);
+    int shape_index = -1;
+    app.add_option("--index", shape_index, "STEP file shape index.")
+        ->check(CLI::NonNegativeNumber)
+        ->excludes(shape_name_opt);
 
     std::vector<std::string> outputs;
     app.add_option("-o,--output", outputs, "Output file (.obj|.off|.ply|.stl|.ts|.vtp)")->take_all();
@@ -282,14 +307,11 @@ int main(int argc, char **argv) {
         if (!shape_name.empty()) {
             spdlog::info("  shape                    = {}", shape_name);
         }
+        else if (shape_index >= 0) {
+            spdlog::info("  shape index              = {}", shape_index);
+        }
         else {
             spdlog::info("  shape                    = <largest> (default)");
-        }
-        if (shape_instance_index > 1) {
-            spdlog::info("  shape instance           = {}", shape_instance_index);
-        }
-        else {
-            spdlog::info("  shape instance           = {} (default)", shape_instance_index);
         }
     }
 
@@ -325,6 +347,8 @@ int main(int argc, char **argv) {
     bool min_edge_length_from_percent = !std::isfinite(min_edge_length);
     bool max_boundary_surface_error_from_percent = !std::isfinite(max_boundary_surface_error);
 
+    bool max_surface_error_from_default = false;
+
     if (max_surface_error_from_percent) {
         if (std::isfinite(max_surface_error_percent)) {
             spdlog::info("  max surface error        = {:.2f} %", max_surface_error_percent);
@@ -332,6 +356,7 @@ int main(int argc, char **argv) {
         else {
             max_surface_error_percent = 0.05;
             spdlog::info("  max surface error        = {:.2f} % (default)", max_surface_error_percent);
+            max_surface_error_from_default = true;
         }
     }
     else {
@@ -431,47 +456,48 @@ int main(int argc, char **argv) {
             std::string reference_name;
 
             size_t index = ++counts[name];
-
-            TDF_Label reference;
-            if (assembly->GetReferredShape(label, reference)) {
-                reference_name = getName(reference);
-                label = reference;
+            std::string qualified_name = name;
+            if (index > 1) {
+                qualified_name += "_" + std::to_string(index);
             }
 
-            components.push_back(
-                std::make_shared<Component>(label, name, index, reference_name, 0));
+            TDF_Label reference = label;
+            if (assembly->GetReferredShape(label, reference)) {
+                reference_name = getName(reference);
+            }
 
-            exploreAssembly(assembly, *components.back(), counts);
-        }
-
-        spdlog::info("  components:");
-        std::deque<std::shared_ptr<Component>> queue;
-        queue.insert(queue.end(), components.begin(), components.end());
-        std::shared_ptr<Component> largest_component;
-        double largest_surface_area = 0.0;
-        while (!queue.empty()) {
-            auto& component = queue.back();
-            queue.pop_back();
-            queue.insert(queue.end(), component->children.rbegin(), component->children.rend());
-
-            bool matched = component->name == shape_name && component->index == shape_instance_index;
-            if (matched || shape_name.empty()) {
-                if (XCAFDoc_ShapeTool::IsSimpleShape(component->label)) {
-                    component->shape = XCAFDoc_ShapeTool::GetShape(component->label);
-                    if (!component->shape.IsNull()) {
-                        GProp_GProps surface_props;
-                        BRepGProp::SurfaceProperties(component->shape, surface_props);
-                        component->surface_area = surface_props.Mass();
-
-                        if (component->surface_area > largest_surface_area) {
-                            largest_surface_area = component->surface_area;
-                            largest_component = component;
-                        }
-                    }
+            auto component = std::make_shared<Component>(label, reference, name, qualified_name, index,
+                                                         reference_name);
+            if (XCAFDoc_ShapeTool::IsSimpleShape(reference)) {
+                gp_Trsf transform = GetTransform(assembly, label);
+                component->shape = XCAFDoc_ShapeTool::GetShape(reference);
+                if (!component->shape.IsNull()) {
+                    component->shape = component->shape.Located(TopLoc_Location(transform));
+                    components.push_back(component);
                 }
             }
 
+            exploreAssembly(assembly, *component, components);
+        }
+
+        spdlog::info("  components:");
+        std::shared_ptr<Component> largest_component;
+        double largest_surface_area = 0.0;
+        for (size_t i = 0; i < components.size(); i++) {
+            const auto& component = components[i];
+
+            GProp_GProps surface_props;
+            BRepGProp::SurfaceProperties(component->shape, surface_props);
+            component->surface_area = surface_props.Mass();
+
+            if (component->surface_area > largest_surface_area) {
+                largest_surface_area = component->surface_area;
+                largest_component = component;
+            }
+
             std::string matched_str;
+            bool matched = component->qualified_name == shape_name ||
+                           shape_index == static_cast<int>(i);
             if (matched) {
                 selected_component = component;
                 matched_str = " <-----";
@@ -482,15 +508,15 @@ int main(int argc, char **argv) {
                 surface_area_str = fmt::format(": {:.2f} sq {}", component->surface_area, unit);
             }
 
-            spdlog::info("{}{} [instance = {}]{}{}", std::string(2 * (component->depth + 1), ' '),
-                         component->name, component->index, surface_area_str, matched_str);
+            spdlog::info("[{}] {}{}{}", i, component->qualified_name, surface_area_str,
+                         matched_str);
         }
 
         if (list_step_components) {
             return 0;
         }
 
-        if (shape_name.empty()) {
+        if (shape_name.empty() && shape_index < 0) {
             selected_component = largest_component;
         }
 
@@ -557,11 +583,11 @@ int main(int argc, char **argv) {
     std::vector<TopoDS_Face> segments;
     if (is_step) {
 
-
-        double max_surface_error_auto = find_surface_error_param<Mesh>(selected_component->shape,
-                                                                       min_edge_length, 10);
-        max_surface_error = max_surface_error_auto;
-
+        if (max_surface_error_from_default) {
+            double max_surface_error_auto = find_surface_error_param<Mesh>(selected_component->shape,
+                                                                           min_edge_length, 10);
+            max_surface_error = max_surface_error_auto;
+        }
 
         spdlog::info("  subdividing faces ...");
 

@@ -562,9 +562,14 @@ TopoDS_Shape subdivide_step_shape(TopoDS_Shape& shape, double min_edge_length,
 
         auto swept_surface = Handle(Geom_SweptSurface)::DownCast(surface);
         if (!swept_surface.IsNull()) {
-            spdlog::debug("swept surface:");
+            //spdlog::info("SKIPPING SWEPT SURFACE");
         }
 
+        auto torous = Handle(Geom_ToroidalSurface)::DownCast(surface);
+        if (!torous.IsNull()) {
+            //spdlog::info("SKIPPING TOROUS");
+            //continue;
+        }
 
         auto subdivs = subdivide_face(face, u_steps, v_steps);
         for (const auto& subdiv: subdivs) {
