@@ -50,3 +50,5 @@ RUN apt-get update && \
         libtbb12 \
         libx11-6 \
     && rm -rf /var/lib/apt/lists/*
+
+CMD precision_mesh
