@@ -76,3 +76,14 @@ precision_mesh = executable('precision_mesh', 'src/precision_mesh.cpp',
   install : true)
 
 test('basic', precision_mesh)
+
+# Install the .desktop file for application menus
+install_data('data/precision_mesh.desktop',
+  install_dir: get_option('datadir') / 'applications')
+
+# Install the application icon
+install_data('data/icon.png',
+  # It's good practice to rename the file to match the name specified
+  # in the .desktop file's 'Icon=' key. Let's assume it's 'precision_mesh'.
+  rename: 'precision_mesh.png',
+  install_dir: get_option('datadir') / 'icons/hicolor/256x256/apps')

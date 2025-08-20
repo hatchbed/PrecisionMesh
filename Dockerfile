@@ -25,6 +25,18 @@ RUN cd project && \
 RUN cd project/builddir && \
     meson compile
 
+RUN meson install -C project/builddir --destdir /AppDir
+
+RUN wget https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage -O /usr/local/bin/linuxdeploy && \
+    chmod +x /usr/local/bin/linuxdeploy
+
+WORKDIR /
+RUN linuxdeploy \
+    --appdir AppDir \
+    --desktop-file /AppDir/usr/local/share/applications/precision_mesh.desktop \
+    --output appimage \
+    --output-file Precision_Mesh.AppImage
+
 FROM ubuntu:22.04
 COPY --from=builder /project/builddir/precision_mesh /usr/bin/precision_mesh
 
