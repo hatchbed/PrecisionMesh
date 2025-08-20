@@ -16,6 +16,10 @@ tbb_dep = dependency('tbb')
 cgal_opts = cmake.subproject_options()
 cgal_opts.add_cmake_defines({
   'CMAKE_BUILD_TYPE': 'RelWithDebInfo',
+  'WITH_examples': false,
+  'WITH_tests': false,
+  'WITH_demos': false,
+  'WITH_doc': false,
   'WITH_CGAL_Qt5': false,
   'WITH_CGAL_ImageIO': false})
 cgal_proj = cmake.subproject('cgal', options: cgal_opts)

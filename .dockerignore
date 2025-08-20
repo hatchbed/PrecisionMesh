@@ -1,0 +1,5 @@
+builddir
+subprojects/*
+!subprojects/packagecache/tinyply-2.3.4.patch.tar.xz
+!subprojects/packagefiles
+!subprojects/*.wrap
