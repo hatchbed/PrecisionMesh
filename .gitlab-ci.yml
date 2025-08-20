@@ -16,3 +16,11 @@ docker:
   script:
     - DOCKER_BUILDKIT=1 docker build . -t ${IMAGE_TAG}
     - docker push $IMAGE_TAG
+
+appimage:
+  stage: build
+  variables:
+    IMAGE_TAG: ${CI_REGISTRY_IMAGE}:${CI_COMMIT_REF_SLUG}_appimage
+  script:
+    - DOCKER_BUILDKIT=1 docker build -f Dockerfile.appimage . -t ${IMAGE_TAG}
+    - docker push $IMAGE_TAG

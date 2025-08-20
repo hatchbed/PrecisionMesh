@@ -2,13 +2,16 @@
 
 #include <fstream>
 #include <iostream>
+#include <unordered_map>
 
 #include <tinyply.h>
 
 #include <precision_mesh/mesh_util.h>
 
 template <typename Traits>
-bool saveComponentsToPly(const std::string& path, const std::vector<Mesh>& components) {
+bool saveComponentsToPly(const std::string& path, const std::vector<Mesh>& components, 
+                         const std::unordered_map<size_t, int>& component_map) 
+{
     Traits traits;
 
     std::vector<std::array<float, 3>> vertices;
@@ -20,6 +23,12 @@ bool saveComponentsToPly(const std::string& path, const std::vector<Mesh>& compo
     VertexIndex vertex_lookup(traits.less_xyz_3_object());
 
     for (size_t i = 0; i < components.size(); i++) {
+        int component_id = i;
+        auto component_id_it = component_map.find(i);
+        if (component_id_it != component_map.end()) {
+            component_id = component_id_it->second;
+        }
+
         const auto& mesh = components[i];
         for (const auto& f : mesh.faces()) {
             size_t face_idx = 0;
@@ -47,7 +56,7 @@ bool saveComponentsToPly(const std::string& path, const std::vector<Mesh>& compo
                 continue;
             }
 
-            component_ids.push_back(i);
+            component_ids.push_back(component_id);
             faces.push_back(face);
         }
     }

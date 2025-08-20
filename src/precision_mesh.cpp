@@ -3,6 +3,7 @@
 #include <map>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -90,7 +91,9 @@ std::string getName(const TDF_Label& label) {
     return name;
 }
 
-void saveOutput(const std::vector<std::string>& outputs, const std::vector<Mesh>& meshes) {
+void saveOutput(const std::vector<std::string>& outputs, const std::vector<Mesh>& meshes, 
+                const std::unordered_map<size_t, int>& component_map) 
+{
     for (const auto& output: outputs) {
 
         std::filesystem::path output_path(output);
@@ -98,7 +101,7 @@ void saveOutput(const std::vector<std::string>& outputs, const std::vector<Mesh>
 
         if (extension == ".ply") {
             spdlog::info("saving mesh to: {}", output);
-            saveComponentsToPly<Point_traits>(output, meshes);
+            saveComponentsToPly<Point_traits>(output, meshes, component_map);
         }
         else if (extension == ".stl") {
             spdlog::info("saving mesh to: {}", output);
@@ -217,6 +220,9 @@ int main(int argc, char **argv) {
 
     int iterations = 0;
     app.add_option("--iterations", iterations, "Iterations")->check(CLI::PositiveNumber);
+
+    bool no_subdivision = false;
+    app.add_flag("--no-subdivision",  no_subdivision, "Skip STEP shape subdivision.");
 
     bool no_projection = false;
     app.add_flag("--no-projection",  no_projection, "Skip vertex reprojection.");
@@ -581,6 +587,7 @@ int main(int argc, char **argv) {
     }
 
     std::vector<TopoDS_Face> segments;
+    std::unordered_map<size_t, int> component_map;
     if (is_step) {
 
         if (max_surface_error_from_default) {
@@ -589,17 +596,17 @@ int main(int argc, char **argv) {
             max_surface_error = max_surface_error_auto;
         }
 
-        spdlog::info("  subdividing faces ...");
+        FaceMap face_map;
+        if (!no_subdivision) {
+            spdlog::info("  subdividing faces ...");
 
 
-        selected_component->shape = subdivide_step_shape(selected_component->shape, min_edge_length,
-                                                         max_edge_length, max_surface_error);
-
-        //save_shape_as_step("subdivided.step", selected_component->shape);
+            std::tie(selected_component->shape, face_map) = 
+                subdivide_step_shape(selected_component->shape, min_edge_length, max_edge_length, 
+                                     max_surface_error);
+        }
 
         spdlog::info("  tessalating ...");
-
-
 
         auto tesselation = tessalate_shape<Mesh>(selected_component->shape, max_surface_error);
         size_t total_faces = 0;
@@ -609,9 +616,16 @@ int main(int argc, char **argv) {
             total_faces += mesh.number_of_faces();
         }
 
-
         spdlog::info("  tesselated component into {} faces over {} segments.", total_faces, meshes.size());
+
+        if (!face_map.empty()) {
+            for (size_t i = 0; i < segments.size(); i++) {
+                component_map[i] = face_map[segments[i]];
+            }
+        }
     }
+
+
 
     size_t total_faces_init = 0;
     for (auto& mesh: meshes) {
@@ -622,11 +636,9 @@ int main(int argc, char **argv) {
 
 
     if (is_step && raw_step_mesh) {
-        saveOutput(outputs, meshes);
+        saveOutput(outputs, meshes, component_map);
         return 0;
     }
-
-
 
     spdlog::info("  splitting long border edges ...");
     // TODO(malban): ensure that border splits are consistent on shared edges
@@ -704,7 +716,7 @@ int main(int argc, char **argv) {
 
 
     if (is_step && raw_step_mesh) {
-        saveOutput(outputs, meshes);
+        saveOutput(outputs, meshes, component_map);
         return 0;
     }
 
@@ -825,7 +837,7 @@ int main(int argc, char **argv) {
 
     // auto merged = merge_meshes(meshes, Point_traits());
     // spdlog::info("  merged faces: {}",  merged.number_of_faces());
-    saveOutput(outputs, meshes);
+    saveOutput(outputs, meshes, component_map);
 
 
     return 0;

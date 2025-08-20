@@ -4,6 +4,7 @@
 #include <map>
 #include <string>
 #include <vector>
+#include <tuple>
 #include <unordered_map>
 
 #include <spdlog/spdlog.h>
@@ -45,6 +46,20 @@
 #include <TopExp_Explorer.hxx>
 #include <TopTools_ListOfShape.hxx>
 #include <TopTools_IndexedDataMapOfShapeListOfShape.hxx>
+
+struct FaceHasher {
+    std::size_t operator()(const TopoDS_Face& face) const {
+        return static_cast<std::size_t>(face.HashCode(INT_MAX));
+    }
+};
+
+struct FaceEqual {
+    bool operator()(const TopoDS_Face& a, const TopoDS_Face& b) const {
+        return a.IsSame(b);
+    }
+};
+
+typedef std::unordered_map<TopoDS_Face, int, FaceHasher, FaceEqual> FaceMap;
 
 template<class Mesh>
 struct StepProjector {
@@ -457,12 +472,17 @@ std::vector<TopoDS_Face> subdivide_face(const TopoDS_Face& face, int u_steps, in
 }
 
 
-TopoDS_Shape subdivide_step_shape(TopoDS_Shape& shape, double min_edge_length,
-                                  double max_edge_length, double max_surface_error) {
+std::tuple<TopoDS_Shape, FaceMap> subdivide_step_shape(TopoDS_Shape& shape, double min_edge_length,
+                                                       double max_edge_length, double 
+                                                       max_surface_error) 
+{
     BRep_Builder builder;
     TopoDS_Compound new_shape;
     builder.MakeCompound(new_shape);
 
+    FaceMap pre_sewn_face_map;
+
+    int original_face_id = 0;
     for (TopExp_Explorer iter(shape, TopAbs_FACE); iter.More(); iter.Next()) {
         TopoDS_Face face = TopoDS::Face(iter.Current());
 
@@ -562,19 +582,19 @@ TopoDS_Shape subdivide_step_shape(TopoDS_Shape& shape, double min_edge_length,
 
         auto swept_surface = Handle(Geom_SweptSurface)::DownCast(surface);
         if (!swept_surface.IsNull()) {
-            //spdlog::info("SKIPPING SWEPT SURFACE");
         }
 
         auto torous = Handle(Geom_ToroidalSurface)::DownCast(surface);
         if (!torous.IsNull()) {
-            //spdlog::info("SKIPPING TOROUS");
-            //continue;
         }
 
         auto subdivs = subdivide_face(face, u_steps, v_steps);
         for (const auto& subdiv: subdivs) {
             builder.Add(new_shape, subdiv);
+            pre_sewn_face_map[subdiv] = original_face_id;
         }
+
+        original_face_id++;
     }
 
     BRepBuilderAPI_Sewing sewing;
@@ -584,7 +604,17 @@ TopoDS_Shape subdivide_step_shape(TopoDS_Shape& shape, double min_edge_length,
 
     auto sewed = sewing.SewedShape();
 
-    return sewed;
+    FaceMap face_map;
+    for (const auto& [face, id] : pre_sewn_face_map) {
+        TopoDS_Shape modified = sewing.ModifiedSubShape(face);
+        if (!modified.IsNull()) {
+            for (TopExp_Explorer face_exp(modified, TopAbs_FACE); face_exp.More(); face_exp.Next()) {
+                face_map[TopoDS::Face(face_exp.Current())] = id;
+            }
+        }
+    }
+
+    return std::make_tuple(sewed, face_map);
 }
 
 bool save_shape_as_step(const std::string& path, const TopoDS_Shape& shape) {

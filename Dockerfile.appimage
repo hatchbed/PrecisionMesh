@@ -40,13 +40,8 @@ RUN wget https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous
     rm -rf ./squashfs-root
 
 
-FROM ubuntu:22.04
-COPY --from=builder /project/builddir/precision_mesh /usr/bin/precision_mesh
+FROM scratch
 
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-        libfontconfig1 \
-        libmpfr6 \
-        libtbb12 \
-        libx11-6 \
-    && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /Precision_Mesh.AppImage /Precision_Mesh.AppImage
+
+CMD ["/Precision_Mesh.AppImage"]
