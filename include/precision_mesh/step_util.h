@@ -30,6 +30,8 @@
 #include <Geom_SweptSurface.hxx>
 #include <Geom_ToroidalSurface.hxx>
 #include <Geom2d_Line.hxx>
+#include <GeomAdaptor_Surface.hxx>
+#include <GeomAbs_SurfaceType.hxx>
 #include <gp_Pnt.hxx>
 #include <IMeshTools_Parameters.hxx>
 #include <Poly_Triangulation.hxx>
@@ -471,6 +473,75 @@ std::vector<TopoDS_Face> subdivide_face(const TopoDS_Face& face, int u_steps, in
     return subdivs;
 }
 
+std::vector<TopoDS_Face> get_faces(TopoDS_Shape& shape) {
+    std::vector<TopoDS_Face> faces;
+    for (TopExp_Explorer iter(shape, TopAbs_FACE); iter.More(); iter.Next()) {
+        faces.push_back(TopoDS::Face(iter.Current()));
+    }
+    return faces;
+}
+
+int get_face_type(const TopoDS_Face& face) {
+    auto surface = BRep_Tool::Surface(face);
+
+    auto plane = Handle(Geom_Plane)::DownCast(surface);
+    if (!plane.IsNull()) {
+        return 1;
+    }
+
+    auto cylinder = Handle(Geom_CylindricalSurface)::DownCast(surface);
+    if (!cylinder.IsNull()) {
+        return 2;
+    }
+
+    auto sphere = Handle(Geom_SphericalSurface)::DownCast(surface);
+    if (!sphere.IsNull()) {
+        return 3;
+    }
+
+    auto torous = Handle(Geom_ToroidalSurface)::DownCast(surface);
+    if (!torous.IsNull()) {
+        return 4;
+    }
+
+    auto cone = Handle(Geom_ConicalSurface)::DownCast(surface);
+    if (!cone.IsNull()) {
+        return 5;
+    }
+
+    GeomAdaptor_Surface adaptor(surface);
+    GeomAbs_SurfaceType surface_type = adaptor.GetType();
+    if (surface_type == GeomAbs_Plane) {
+        return 1;
+    }
+    else if (surface_type == GeomAbs_Cylinder) {
+        return 2;
+    }
+    else if (surface_type == GeomAbs_Sphere) {
+        return 3;
+    }
+    else if (surface_type == GeomAbs_Torus) {
+        return 5;
+    }
+    else if (surface_type == GeomAbs_Cone) {
+        return 5;
+    }
+
+    return 0;   
+}
+
+float get_face_area(const TopoDS_Face& face) {
+    GProp_GProps surface_props;
+    BRepGProp::SurfaceProperties(face, surface_props);
+    return surface_props.Mass();
+}
+
+std::array<float, 3> get_face_centroid(const TopoDS_Face& face) {
+    GProp_GProps surface_props;
+    BRepGProp::SurfaceProperties(face, surface_props);
+    auto centroid = surface_props.CentreOfMass();
+    return { centroid.X(), centroid.Y(), centroid.Z() };
+}
 
 std::tuple<TopoDS_Shape, FaceMap> subdivide_step_shape(TopoDS_Shape& shape, double min_edge_length,
                                                        double max_edge_length, double 

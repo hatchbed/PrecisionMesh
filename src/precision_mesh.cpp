@@ -92,6 +92,7 @@ std::string getName(const TDF_Label& label) {
 }
 
 void saveOutput(const std::vector<std::string>& outputs, const std::vector<Mesh>& meshes, 
+                const std::vector<TopoDS_Face>& faces, 
                 const std::unordered_map<size_t, int>& component_map) 
 {
     for (const auto& output: outputs) {
@@ -101,7 +102,7 @@ void saveOutput(const std::vector<std::string>& outputs, const std::vector<Mesh>
 
         if (extension == ".ply") {
             spdlog::info("saving mesh to: {}", output);
-            saveComponentsToPly<Point_traits>(output, meshes, component_map);
+            saveComponentsToPly<Point_traits>(output, meshes, faces, component_map);
         }
         else if (extension == ".stl") {
             spdlog::info("saving mesh to: {}", output);
@@ -587,6 +588,7 @@ int main(int argc, char **argv) {
     }
 
     std::vector<TopoDS_Face> segments;
+    std::vector<TopoDS_Face> original_faces;
     std::unordered_map<size_t, int> component_map;
     if (is_step) {
 
@@ -596,8 +598,10 @@ int main(int argc, char **argv) {
             max_surface_error = max_surface_error_auto;
         }
 
+        original_faces = get_faces(selected_component->shape);
+
         FaceMap face_map;
-        if (!no_subdivision) {
+        if (!no_subdivision && !raw_step_mesh) {
             spdlog::info("  subdividing faces ...");
 
 
@@ -618,6 +622,7 @@ int main(int argc, char **argv) {
 
         spdlog::info("  tesselated component into {} faces over {} segments.", total_faces, meshes.size());
 
+        // Create mapping of subdivided components to the original components prior to subdivision
         if (!face_map.empty()) {
             for (size_t i = 0; i < segments.size(); i++) {
                 component_map[i] = face_map[segments[i]];
@@ -636,7 +641,7 @@ int main(int argc, char **argv) {
 
 
     if (is_step && raw_step_mesh) {
-        saveOutput(outputs, meshes, component_map);
+        saveOutput(outputs, meshes, segments, {});
         return 0;
     }
 
@@ -716,7 +721,7 @@ int main(int argc, char **argv) {
 
 
     if (is_step && raw_step_mesh) {
-        saveOutput(outputs, meshes, component_map);
+        saveOutput(outputs, meshes, original_faces, component_map);
         return 0;
     }
 
@@ -837,7 +842,7 @@ int main(int argc, char **argv) {
 
     // auto merged = merge_meshes(meshes, Point_traits());
     // spdlog::info("  merged faces: {}",  merged.number_of_faces());
-    saveOutput(outputs, meshes, component_map);
+    saveOutput(outputs, meshes, original_faces, component_map);
 
 
     return 0;
