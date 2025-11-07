@@ -8,7 +8,7 @@
 #include <precision_mesh/mesh_util.h>
 
 template <typename Traits>
-bool saveComponentsToStl(const std::string& path, const std::vector<Mesh>& components) {
+bool saveComponentsToStl(const std::string& path, const std::vector<Mesh>& components, float scale=1) {
     Traits traits;
 
     std::vector<typename Mesh::Point> vertices;
@@ -27,9 +27,13 @@ bool saveComponentsToStl(const std::string& path, const std::vector<Mesh>& compo
                 auto result = vertex_lookup.find(point);
                 if (result == vertex_lookup.end()) {
                     size_t index = vertices.size();
-                    vertices.push_back(point);
                     vertex_lookup[point] = index;
                     face.push_back(index);
+                    vertices.push_back({ 
+                        point[0] * scale,
+                        point[1] * scale,
+                        point[2] * scale
+                    });
                 }
                 else {
                   face.push_back(result->second);

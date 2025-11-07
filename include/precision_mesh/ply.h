@@ -13,7 +13,8 @@
 template <typename Traits>
 bool saveComponentsToPly(const std::string& path, const std::vector<Mesh>& components, 
                          const std::vector<TopoDS_Face>& step_faces,
-                         const std::unordered_map<size_t, int>& component_map) 
+                         const std::unordered_map<size_t, int>& component_map, 
+                         float scale=1) 
 {
     Traits traits;
 
@@ -35,8 +36,6 @@ bool saveComponentsToPly(const std::string& path, const std::vector<Mesh>& compo
             component_id = component_id_it->second;
         }
 
-        printf("component %zu of %zu, id = %d\n", i, components.size(), component_id);
-
         const auto& mesh = components[i];
         for (const auto& f : mesh.faces()) {
             size_t face_idx = 0;
@@ -49,9 +48,9 @@ bool saveComponentsToPly(const std::string& path, const std::vector<Mesh>& compo
                 auto result = vertex_lookup.find(point);
                 if (result == vertex_lookup.end()) {
                     uint32_t index = static_cast<uint32_t>(vertices.size());
-                    vertices.push_back({static_cast<float>(point[0]),
-                                        static_cast<float>(point[1]),
-                                        static_cast<float>(point[2])});
+                    vertices.push_back({static_cast<float>(point[0] * scale),
+                                        static_cast<float>(point[1] * scale),
+                                        static_cast<float>(point[2] * scale)});
                     vertex_lookup[point] = index;
                     face[face_idx++] = index;
                 }

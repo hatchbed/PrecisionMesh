@@ -63,6 +63,15 @@
 namespace PMP = CGAL::Polygon_mesh_processing;
 
 std::unordered_set<std::string> mesh_formats = {".obj", ".off", ".ply", ".stl", ".ts", ".vtp"};
+std::unordered_set<std::string> output_units = {"mm", "cm", "m", "in", "ft", "yd"};
+std::unordered_map<std::string, float> to_meters = {
+    {"mm", 0.001},
+    {"cm", 0.01},
+    {"m", 1.0},
+    {"in", 0.0254},
+    {"ft", 0.3048},
+    {"yd", 0.9144}
+};
 
 struct Component {
     Component(TDF_Label label, TDF_Label reference, const std::string& name,
@@ -93,7 +102,7 @@ std::string getName(const TDF_Label& label) {
 
 void saveOutput(const std::vector<std::string>& outputs, const std::vector<Mesh>& meshes, 
                 const std::vector<TopoDS_Face>& faces, 
-                const std::unordered_map<size_t, int>& component_map) 
+                const std::unordered_map<size_t, int>& component_map, float scale=1) 
 {
     for (const auto& output: outputs) {
 
@@ -102,11 +111,11 @@ void saveOutput(const std::vector<std::string>& outputs, const std::vector<Mesh>
 
         if (extension == ".ply") {
             spdlog::info("saving mesh to: {}", output);
-            saveComponentsToPly<Point_traits>(output, meshes, faces, component_map);
+            saveComponentsToPly<Point_traits>(output, meshes, faces, component_map, scale);
         }
         else if (extension == ".stl") {
             spdlog::info("saving mesh to: {}", output);
-            saveComponentsToStl<Point_traits>(output, meshes);
+            saveComponentsToStl<Point_traits>(output, meshes, scale);
         }
     }
 }
@@ -192,12 +201,23 @@ std::string normalizeUnit(const std::string& unit) {
     return lower;
 }
 
+float getUnitConversionScale(const std::string& from, const std::string& to) {
+    auto from_it = to_meters.find(from);
+    auto to_it = to_meters.find(to);
+
+    if (from_it == to_meters.end() || to_it == to_meters.end()) {
+        return 1.0;
+    }
+
+    return from_it->second / to_it->second;
+}
+
 int main(int argc, char **argv) {
 
     CLI::App app{"A flexible STEP to mesh conversion tool and general adaptive isotropic remesher.", "precision_mesh"};
     argv = app.ensure_utf8(argv);
 
-    std::string input = "";
+    std::string input;
     app.add_option("-i,--input", input, "Input file (.obj|.off|.ply|.step|.stl|.ts|.vtp)")
         ->check(CLI::ExistingFile)
         ->required();
@@ -212,6 +232,9 @@ int main(int argc, char **argv) {
 
     std::vector<std::string> outputs;
     app.add_option("-o,--output", outputs, "Output file (.obj|.off|.ply|.stl|.ts|.vtp)")->take_all();
+
+    std::string output_unit;
+    app.add_option("--output-units", output_unit, "Output units (mm|cm|m|in|ft|yd)");
 
     bool list_step_components = false;
     app.add_flag("--list",  list_step_components, "List STEP components.");
@@ -243,7 +266,7 @@ int main(int argc, char **argv) {
     auto max_surface_error_percent_opt = app.add_option("--max-surface-error-percent",
         max_surface_error_percent,
         "Target maximum surface error when remeshing as percent of sqrt of surface area")
-        ->check(CLI::PositiveNumber)
+        ->check(CLI::PositiveNumber) 
         ->check(CLI::Range(0.0, 100.0));
 
     double max_boundary_surface_error_percent = std::numeric_limits<double>::quiet_NaN();
@@ -348,6 +371,7 @@ int main(int argc, char **argv) {
     }
 
     std::string unit = "mesh_units";
+    float conversion_scale = 1.0;
 
     bool max_surface_error_from_percent = !std::isfinite(max_surface_error);
     bool max_edge_length_from_percent = !std::isfinite(max_edge_length);
@@ -413,6 +437,11 @@ int main(int argc, char **argv) {
     }
     else {
         spdlog::info("  min edge length          = {:.2f} {}", min_edge_length, unit);
+    }
+
+    if (!is_step && !output_unit.empty()) {
+        spdlog::error("Output units only valid for a STEP input.");
+        return 1;
     }
 
     //tbb::global_control global_limit(tbb::global_control::max_allowed_parallelism, 1);
@@ -515,7 +544,7 @@ int main(int argc, char **argv) {
                 surface_area_str = fmt::format(": {:.2f} sq {}", component->surface_area, unit);
             }
 
-            spdlog::info("[{}] {}{}{}", i, component->qualified_name, surface_area_str,
+            spdlog::info("    [{}] {}{}{}", i, component->qualified_name, surface_area_str,
                          matched_str);
         }
 
@@ -527,7 +556,30 @@ int main(int argc, char **argv) {
             selected_component = largest_component;
         }
 
+        if (output_unit.empty()) {
+            output_unit = unit;
+            spdlog::info("  output unit: {} (STEP)", output_unit);
+        }
+        else {
+            std::string normalized_output_unit = normalizeUnit(output_unit);
+            if (output_units.count(normalized_output_unit) == 0) {
+                spdlog::error("Output unit {} is not supported.", output_unit);
+                return 1;
+            }
+            output_unit = normalized_output_unit;
+            spdlog::info("  output unit: {} ", output_unit);
+        }
 
+        if (unit != output_unit) {
+            if (output_units.count(unit) == 0) {
+                spdlog::error("Unable to convert between input unit: {} and output unit: {}.",
+                              unit, output_unit);
+                return 1;
+            }
+
+            conversion_scale = getUnitConversionScale(unit, output_unit);
+        }
+        spdlog::info("  unit conversion scale: {} ", conversion_scale);
     }
     else if (mesh_formats.count(extension) != 0) {
         spdlog::info("reading mesh file...");
@@ -639,9 +691,8 @@ int main(int argc, char **argv) {
 
     spdlog::info("    faces: {}", total_faces_init);
 
-
     if (is_step && raw_step_mesh) {
-        saveOutput(outputs, meshes, segments, {});
+        saveOutput(outputs, meshes, segments, {}, conversion_scale);
         return 0;
     }
 
@@ -721,7 +772,7 @@ int main(int argc, char **argv) {
 
 
     if (is_step && raw_step_mesh) {
-        saveOutput(outputs, meshes, original_faces, component_map);
+        saveOutput(outputs, meshes, original_faces, component_map, conversion_scale);
         return 0;
     }
 
@@ -842,7 +893,7 @@ int main(int argc, char **argv) {
 
     // auto merged = merge_meshes(meshes, Point_traits());
     // spdlog::info("  merged faces: {}",  merged.number_of_faces());
-    saveOutput(outputs, meshes, original_faces, component_map);
+    saveOutput(outputs, meshes, original_faces, component_map, conversion_scale);
 
 
     return 0;
