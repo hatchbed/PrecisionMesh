@@ -823,7 +823,9 @@ size_t get_short_edge_count(const std::vector<std::pair<Mesh, TopoDS_Face>>& tes
 }
 
 template<class Mesh>
-double find_surface_error_param(const TopoDS_Shape& shape, double min_edge_length, int max_iterations=10) {
+double find_surface_error_param(const TopoDS_Shape& shape, double min_edge_length, int max_iterations=10, 
+                                double conversion_scale=1) 
+{
     spdlog::info("finding max surface error param ...");
     max_iterations = std::max(2, std::min(100, max_iterations));
 
@@ -844,10 +846,10 @@ double find_surface_error_param(const TopoDS_Shape& shape, double min_edge_lengt
         else {
             threshold_max = threshold;
         }
-        spdlog::info("    {} short edges at {}", num_short_edges, threshold);
+        spdlog::info("    {} short edges at {}", num_short_edges, threshold * conversion_scale);
     }
 
-    spdlog::info("  found max surface error param = {}", threshold_max);
+    spdlog::info("  found max surface error param = {}", threshold_max * conversion_scale);
 
     return threshold_max;
 }

@@ -371,6 +371,10 @@ int main(int argc, char **argv) {
     }
 
     std::string unit = "mesh_units";
+    if (!output_units.empty()) {
+        unit = output_unit;
+    }
+
     float conversion_scale = 1.0;
 
     bool max_surface_error_from_percent = !std::isfinite(max_surface_error);
@@ -382,16 +386,16 @@ int main(int argc, char **argv) {
 
     if (max_surface_error_from_percent) {
         if (std::isfinite(max_surface_error_percent)) {
-            spdlog::info("  max surface error        = {:.2f} %", max_surface_error_percent);
+            spdlog::info("  max surface error        = {:.4f} %", max_surface_error_percent);
         }
         else {
             max_surface_error_percent = 0.05;
-            spdlog::info("  max surface error        = {:.2f} % (default)", max_surface_error_percent);
+            spdlog::info("  max surface error        = {:.4f} % (default)", max_surface_error_percent);
             max_surface_error_from_default = true;
         }
     }
     else {
-        spdlog::info("  max surface error        = {:.2f} {}", max_surface_error, unit);
+        spdlog::info("  max surface error        = {:.4f} {}", max_surface_error, unit);
     }
 
     if (is_step) {
@@ -401,42 +405,42 @@ int main(int argc, char **argv) {
             }
             else if (max_surface_error_from_percent) {
                 max_boundary_surface_error_percent = max_surface_error_percent;
-                spdlog::info("  max boundary surface error = {:.2f} % (max_surface_error)", max_surface_error_percent);
+                spdlog::info("  max boundary surface error = {:.4f} % (max_surface_error)", max_surface_error_percent);
             }
             else {
                 max_boundary_surface_error_from_percent = false;
                 max_boundary_surface_error = max_surface_error;
-                spdlog::info("  max boundary surface error = {:.2f} {} (max_surface_error)", max_boundary_surface_error, unit);
+                spdlog::info("  max boundary surface error = {:.4f} {} (max_surface_error)", max_boundary_surface_error, unit);
             }
         }
         else {
-            spdlog::info("  max boundary surface error = {:.2f} {}", max_boundary_surface_error, unit);
+            spdlog::info("  max boundary surface error = {:.4f} {}", max_boundary_surface_error, unit);
         }
     }
 
     if (max_edge_length_from_percent) {
         if (std::isfinite(max_edge_length_percent)) {
-            spdlog::info("  max edge length          = {:.2f} %", max_edge_length_percent);
+            spdlog::info("  max edge length          = {:.4f} %", max_edge_length_percent);
         }
         else {
             max_edge_length_percent = 1.0;
-            spdlog::info("  max edge length          = {:.2f} % (default)", max_edge_length_percent);
+            spdlog::info("  max edge length          = {:.4f} % (default)", max_edge_length_percent);
         }
     }
     else {
-        spdlog::info("  max edge length          = {:.2f} {}", max_edge_length, unit);
+        spdlog::info("  max edge length          = {:.4f} {}", max_edge_length, unit);
     }
     if (min_edge_length_from_percent) {
         if (std::isfinite(min_edge_length_percent)) {
-            spdlog::info("  min edge length          = {:.2f} %", min_edge_length_percent);
+            spdlog::info("  min edge length          = {:.4f} %", min_edge_length_percent);
         }
         else {
             min_edge_length_percent = 0.1;
-            spdlog::info("  min edge length          = {:.2f} % (default)", min_edge_length_percent);
+            spdlog::info("  min edge length          = {:.4f} % (default)", min_edge_length_percent);
         }
     }
     else {
-        spdlog::info("  min edge length          = {:.2f} {}", min_edge_length, unit);
+        spdlog::info("  min edge length          = {:.4f} {}", min_edge_length, unit);
     }
 
     if (!is_step && !output_unit.empty()) {
@@ -478,6 +482,31 @@ int main(int argc, char **argv) {
             unit = normalizeUnit(unit_length_names.First().ToCString());
             spdlog::info("  length unit: {}", unit);
         }
+
+        if (output_unit.empty()) {
+            output_unit = unit;
+            spdlog::info("  output unit: {} (STEP)", output_unit);
+        }
+        else {
+            std::string normalized_output_unit = normalizeUnit(output_unit);
+            if (output_units.count(normalized_output_unit) == 0) {
+                spdlog::error("Output unit {} is not supported.", output_unit);
+                return 1;
+            }
+            output_unit = normalized_output_unit;
+            spdlog::info("  output unit: {} ", output_unit);
+        }
+
+        if (unit != output_unit) {
+            if (output_units.count(unit) == 0) {
+                spdlog::error("Unable to convert between input unit: {} and output unit: {}.",
+                              unit, output_unit);
+                return 1;
+            }
+
+            conversion_scale = getUnitConversionScale(unit, output_unit);
+        }
+        spdlog::info("  unit conversion scale: {} ", conversion_scale);
 
         auto assembly = XCAFDoc_DocumentTool::ShapeTool(doc->Main());
         TDF_LabelSequence labels;
@@ -541,7 +570,7 @@ int main(int argc, char **argv) {
 
             std::string surface_area_str = "";
             if (component->surface_area > 0.0) {
-                surface_area_str = fmt::format(": {:.2f} sq {}", component->surface_area, unit);
+                surface_area_str = fmt::format(": {:.2f} sq {}", component->surface_area * conversion_scale * conversion_scale, output_unit);
             }
 
             spdlog::info("    [{}] {}{}{}", i, component->qualified_name, surface_area_str,
@@ -555,31 +584,6 @@ int main(int argc, char **argv) {
         if (shape_name.empty() && shape_index < 0) {
             selected_component = largest_component;
         }
-
-        if (output_unit.empty()) {
-            output_unit = unit;
-            spdlog::info("  output unit: {} (STEP)", output_unit);
-        }
-        else {
-            std::string normalized_output_unit = normalizeUnit(output_unit);
-            if (output_units.count(normalized_output_unit) == 0) {
-                spdlog::error("Output unit {} is not supported.", output_unit);
-                return 1;
-            }
-            output_unit = normalized_output_unit;
-            spdlog::info("  output unit: {} ", output_unit);
-        }
-
-        if (unit != output_unit) {
-            if (output_units.count(unit) == 0) {
-                spdlog::error("Unable to convert between input unit: {} and output unit: {}.",
-                              unit, output_unit);
-                return 1;
-            }
-
-            conversion_scale = getUnitConversionScale(unit, output_unit);
-        }
-        spdlog::info("  unit conversion scale: {} ", conversion_scale);
     }
     else if (mesh_formats.count(extension) != 0) {
         spdlog::info("reading mesh file...");
@@ -601,52 +605,59 @@ int main(int argc, char **argv) {
             return 1;
         }
         spdlog::info("  shape: {}[instance = {}]", selected_component->name, selected_component->index);
-        surface_area = selected_component->surface_area;
+        surface_area = selected_component->surface_area * conversion_scale * conversion_scale;
     }
 
-    spdlog::info("  surface area: {:.2f} sq {}", surface_area, unit);
+    spdlog::info("  surface area: {:.4f} sq {}", surface_area, output_unit);
 
     if (max_surface_error_from_percent) {
         max_surface_error = std::sqrt(surface_area) * max_surface_error_percent / 100.0;
-        spdlog::info("  max surface error: {:.2f} {} (from %)", max_surface_error, unit);
+        spdlog::info("  max surface error: {:.4f} {} (from %)", max_surface_error, output_unit);
     }
     else {
-        spdlog::info("  max surface error: {:.2f} {}", max_surface_error, unit);
+        spdlog::info("  max surface error: {:.4f} {}", max_surface_error, output_unit);
     }
 
     if (is_step) {
         if (max_boundary_surface_error_from_percent) {
             max_boundary_surface_error = std::sqrt(surface_area) * max_boundary_surface_error_percent / 100.0;
-            spdlog::info("  max boundary surface error: {:.2f} {} (from %)", max_boundary_surface_error, unit);
+            spdlog::info("  max boundary surface error: {:.4f} {} (from %)", max_boundary_surface_error, output_unit);
         }
         else {
-            spdlog::info("  max bounary surface error: {:.2f} {}", max_boundary_surface_error, unit);
+            spdlog::info("  max bounary surface error: {:.4f} {}", max_boundary_surface_error, output_unit);
         }
     }
 
     if (max_edge_length_from_percent) {
         max_edge_length = std::sqrt(surface_area) * max_edge_length_percent / 100.0;
-        spdlog::info("  max edge length: {:.2f} {} (from %)", max_edge_length, unit);
+        spdlog::info("  max edge length: {:.4f} {} (from %)", max_edge_length, output_unit);
     }
     else {
-        spdlog::info("  max edge length: {:.2f} {}", max_edge_length, unit);
+        spdlog::info("  max edge length: {:.4f} {}", max_edge_length, output_unit);
     }
     if (min_edge_length_from_percent) {
         min_edge_length = std::sqrt(surface_area) * min_edge_length_percent / 100.0;
-        spdlog::info("  min edge length: {:.2f} {} (from %)", min_edge_length, unit);
+        spdlog::info("  min edge length: {:.4f} {} (from %)", min_edge_length, output_unit);
     }
     else {
-        spdlog::info("  min edge length: {:.2f} {}", min_edge_length, unit);
+        spdlog::info("  min edge length: {:.4f} {}", min_edge_length, output_unit);
     }
 
     std::vector<TopoDS_Face> segments;
     std::vector<TopoDS_Face> original_faces;
     std::unordered_map<size_t, int> component_map;
+
+    min_edge_length /= conversion_scale;
+    max_edge_length /= conversion_scale;
+    max_surface_error /= conversion_scale;
+    max_boundary_surface_error /= conversion_scale;
+
     if (is_step) {
 
         if (max_surface_error_from_default) {
             double max_surface_error_auto = find_surface_error_param<Mesh>(selected_component->shape,
-                                                                           min_edge_length, 10);
+                                                                           min_edge_length, 10, 
+                                                                           conversion_scale);
             max_surface_error = max_surface_error_auto;
         }
 
