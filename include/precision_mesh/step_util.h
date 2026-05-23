@@ -221,9 +221,7 @@ WireProjectorCachePtr<Mesh> get_edge_vertex_wire_projectors(const TopoDS_Shape& 
                     auto v = TopoDS::Vertex(vertex_exp.Current());
                     int vertex_code = shapeHashCode(v);
 
-                    auto projector_it = face_wire_projectors.find(vertex_code);
-                    if (projector_it != face_wire_projectors.end()) {
-                        face_wire_projectors[vertex_code] = projector_it->second;
+                    if (face_wire_projectors.count(vertex_code)) {
                         continue;
                     }
 
@@ -529,7 +527,7 @@ int get_face_type(const TopoDS_Face& face) {
         return 3;
     }
     else if (surface_type == GeomAbs_Torus) {
-        return 5;
+        return 4;
     }
     else if (surface_type == GeomAbs_Cone) {
         return 5;
