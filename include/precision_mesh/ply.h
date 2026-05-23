@@ -68,7 +68,7 @@ bool saveComponentsToPly(const std::string& path, const std::vector<Mesh>& compo
         }
     }
 
-    printf("writing metadata for %zu faces ...\n", step_faces.size());
+    spdlog::info("writing metadata for {} faces ...", step_faces.size());
     for (size_t i = 0; i < step_faces.size(); i++) {
         component_types[i] = get_face_type(step_faces[i]);
         component_areas[i] = get_face_area(step_faces[i]);
