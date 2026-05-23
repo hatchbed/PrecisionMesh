@@ -81,7 +81,7 @@ if not occt_dep.found()
   occt_opts = cmake.subproject_options()
   occt_opts.add_cmake_defines({
     'CMAKE_BUILD_TYPE': _cmake_build_type,
-    'BUILD_LIBRARY_TYPE': 'Static',
+    'BUILD_LIBRARY_TYPE': 'Shared',
     'BUILD_MODULE_ApplicationFramework': false,
     'BUILD_MODULE_DETools': false,
     'BUILD_MODULE_Draw': false,
