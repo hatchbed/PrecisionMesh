@@ -290,8 +290,8 @@ int main(int argc, char **argv) {
 
     double max_boundary_surface_error_percent = std::numeric_limits<double>::quiet_NaN();
     auto max_boundary_surface_error_percent_opt = app.add_option(
-        "--max-boundary-surface-error-percent",
-        "Target maximum STEP boundary surface error when as percent of sqrt of surface area")
+        "--max-boundary-surface-error-percent", max_boundary_surface_error_percent,
+        "Target maximum STEP boundary surface error as percent of sqrt of surface area")
         ->check(CLI::PositiveNumber)
         ->check(CLI::Range(0.0, 100.0));
 
