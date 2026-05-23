@@ -62,6 +62,25 @@
 
 namespace PMP = CGAL::Polygon_mesh_processing;
 
+// property_map() returns std::optional in released CGAL 6.x but std::pair in 5.x and 6.0-dev.
+// Detect via the return type rather than version number.
+namespace {
+    template <typename T, typename = void>
+    struct is_optional_result : std::false_type {};
+    template <typename T>
+    struct is_optional_result<T, std::void_t<decltype(std::declval<T>().value())>> : std::true_type {};
+}
+
+template <typename Index, typename Value, typename SurfaceMesh>
+auto lookup_property_map(SurfaceMesh& mesh, const std::string& name) {
+    auto result = mesh.template property_map<Index, Value>(name);
+    if constexpr (is_optional_result<decltype(result)>::value) {
+        return result.value();
+    } else {
+        return result.first;
+    }
+}
+
 std::unordered_set<std::string> mesh_formats = {".obj", ".off", ".ply", ".stl", ".ts", ".vtp"};
 std::unordered_set<std::string> output_units = {"mm", "cm", "m", "in", "ft", "yd"};
 std::unordered_map<std::string, float> to_meters = {
@@ -863,7 +882,7 @@ int main(int argc, char **argv) {
                     const std::pair edge_min_max{min_edge_length, max_edge_length};
                     PMP::Adaptive_sizing_field<Mesh> sizing_field(max_remeshing_surface_error,
                                                                   edge_min_max, faces(mesh), mesh);
-                    auto crease_map = mesh.property_map<Mesh::Edge_index, bool>("crease").first;
+                    auto crease_map = lookup_property_map<Mesh::Edge_index, bool>(mesh, "crease");
 
                     try {
                         if (is_step) {

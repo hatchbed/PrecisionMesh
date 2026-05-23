@@ -39,6 +39,7 @@
 #include <ShapeAnalysis_Surface.hxx>
 #include <ShapeFix_Edge.hxx>
 #include <STEPControl_Writer.hxx>
+#include <Standard_Version.hxx>
 #include <TopoDS_Compound.hxx>
 #include <TopoDS_Edge.hxx>
 #include <TopoDS_Face.hxx>
@@ -49,9 +50,16 @@
 #include <TopTools_ListOfShape.hxx>
 #include <TopTools_IndexedDataMapOfShapeListOfShape.hxx>
 
+// HashCode(upper) was removed in OCCT 7.8; use std::hash instead.
+#if OCC_VERSION_HEX >= 0x070800
+inline int shapeHashCode(const TopoDS_Shape& s) { return static_cast<int>(std::hash<TopoDS_Shape>{}(s)); }
+#else
+inline int shapeHashCode(const TopoDS_Shape& s) { return s.HashCode(INT_MAX); }
+#endif
+
 struct FaceHasher {
     std::size_t operator()(const TopoDS_Face& face) const {
-        return static_cast<std::size_t>(face.HashCode(INT_MAX));
+        return static_cast<std::size_t>(shapeHashCode(face));
     }
 };
 
@@ -145,7 +153,7 @@ TopoDS_Wire get_border_loop_wire(
 
         auto edges = vertex_to_edge_map.FindFromKey(v);
         for (const auto& e: edges) {
-            int edge_code = e.HashCode(INT_MAX);
+            int edge_code = shapeHashCode(e);
             auto evaluated_it = evaluated.find(edge_code);
             if (evaluated_it != evaluated.end() && evaluated_it->second) {
                 // ignore already evaluated edge
@@ -189,7 +197,7 @@ WireProjectorCachePtr<Mesh> get_edge_vertex_wire_projectors(const TopoDS_Shape& 
     std::vector<TopoDS_Face> faces;
     for (TopExp_Explorer face_exp(shape, TopAbs_FACE); face_exp.More(); face_exp.Next()) {
         auto face = TopoDS::Face(face_exp.Current());
-        int face_code = face.HashCode(INT_MAX);
+        int face_code = shapeHashCode(face);
         faces.push_back(face);
         (*wire_projectors)[face_code] = {};
     }
@@ -198,7 +206,7 @@ WireProjectorCachePtr<Mesh> get_edge_vertex_wire_projectors(const TopoDS_Shape& 
         tbb::blocked_range<size_t>(0, faces.size()), [&](const tbb::blocked_range<size_t>& r) {
             for (size_t f = r.begin(); f != r.end(); ++f) {
                 auto& face = faces[f];
-                int face_code = face.HashCode(INT_MAX);
+                int face_code = shapeHashCode(face);
 
                 TopTools_IndexedDataMapOfShapeListOfShape vertex_to_edge_map;
                 TopExp::MapShapesAndUniqueAncestors(face, TopAbs_VERTEX, TopAbs_EDGE, vertex_to_edge_map);
@@ -211,7 +219,7 @@ WireProjectorCachePtr<Mesh> get_edge_vertex_wire_projectors(const TopoDS_Shape& 
 
                 for (TopExp_Explorer vertex_exp(face, TopAbs_VERTEX); vertex_exp.More(); vertex_exp.Next()) {
                     auto v = TopoDS::Vertex(vertex_exp.Current());
-                    int vertex_code = v.HashCode(INT_MAX);
+                    int vertex_code = shapeHashCode(v);
 
                     auto projector_it = face_wire_projectors.find(vertex_code);
                     if (projector_it != face_wire_projectors.end()) {
@@ -228,7 +236,7 @@ WireProjectorCachePtr<Mesh> get_edge_vertex_wire_projectors(const TopoDS_Shape& 
 
                     for (TopExp_Explorer wire_exp(wire, TopAbs_VERTEX); wire_exp.More(); wire_exp.Next()) {
                         auto wire_v = TopoDS::Vertex(wire_exp.Current());
-                        int wire_vertex_code = wire_v.HashCode(INT_MAX);
+                        int wire_vertex_code = shapeHashCode(wire_v);
                         face_wire_projectors[wire_vertex_code] = projector;
                     }
                 }
@@ -244,7 +252,7 @@ std::unordered_map<typename Mesh::Vertex_index, StepProjector<Mesh>> get_border_
     const TopoDS_Face& face, Mesh& mesh,
     WireProjectorCachePtr<Mesh> wire_projectors, double tolerance=1e-3)
 {
-    int face_code = face.HashCode(INT_MAX);
+    int face_code = shapeHashCode(face);
     const auto& face_wire_projectors = (*wire_projectors)[face_code];
 
     std::unordered_map<typename Mesh::Vertex_index, StepProjector<Mesh>> border_vertex_projector_map;
@@ -292,7 +300,7 @@ std::unordered_map<typename Mesh::Vertex_index, StepProjector<Mesh>> get_border_
                     nearest_vertex = v2;
                 }
 
-                int vertex_code = nearest_vertex.HashCode(INT_MAX);
+                int vertex_code = shapeHashCode(nearest_vertex);
                 auto projector_it = face_wire_projectors.find(vertex_code);
                 if (projector_it == face_wire_projectors.end()) {
                     continue;
@@ -540,7 +548,7 @@ std::array<float, 3> get_face_centroid(const TopoDS_Face& face) {
     GProp_GProps surface_props;
     BRepGProp::SurfaceProperties(face, surface_props);
     auto centroid = surface_props.CentreOfMass();
-    return { centroid.X(), centroid.Y(), centroid.Z() };
+    return { static_cast<float>(centroid.X()), static_cast<float>(centroid.Y()), static_cast<float>(centroid.Z()) };
 }
 
 std::tuple<TopoDS_Shape, FaceMap> subdivide_step_shape(TopoDS_Shape& shape, double min_edge_length,

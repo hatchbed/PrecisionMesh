@@ -73,12 +73,10 @@ std::vector<std::size_t> find_invalid_polygons_in_polygon_soup(const PointRange&
                                                                const PolygonRange& polygons,
                                                                const Traits& traits = Traits())
 {
-  typedef typename PMP::internal::Polygon_types<PointRange, PolygonRange>::Polygon_3 Polygon_3;
-
   std::vector<std::size_t> invalid;
   const std::size_t ini_polygons_size = polygons.size();
   for(std::size_t polygon_index=0; polygon_index!=ini_polygons_size; ++polygon_index) {
-    const Polygon_3& polygon = polygons[polygon_index];
+    const auto& polygon = polygons[polygon_index];
     const std::size_t N = polygon.size(), last = N-1;
     if (N < 3) {
       invalid.push_back(polygon_index);
@@ -104,10 +102,8 @@ std::vector<std::size_t> find_duplicate_polygons_in_polygon_soup(const PointRang
                                                                  const PolygonRange& polygons,
                                                                  const NamedParameters& np = CGAL::parameters::default_values())
 {
-  typedef typename PMP::internal::GetPolygonGeomTraits<PointRange, PolygonRange, NamedParameters>::type Traits;
-  Traits traits = CGAL::parameters::choose_parameter<Traits>(CGAL::parameters::get_parameter(np, CGAL::internal_np::geom_traits));
-
-  typedef typename PMP::internal::Polygon_types<PointRange, PolygonRange>::P_ID P_ID;
+  PointArray_traits traits;
+  typedef std::size_t P_ID;
 
   std::deque<std::vector<P_ID> > all_duplicate_polygons;
   PMP::internal::collect_duplicate_polygons(points, polygons, std::back_inserter(all_duplicate_polygons), traits, false);
