@@ -858,9 +858,19 @@ int main(int argc, char **argv) {
     spdlog::info("  adaptive isotropic remeshing ...");
 
     WireProjectorCachePtr<Mesh> wire_projectors;
+    std::vector<std::unique_ptr<StepProjector<Mesh>>> surface_projectors;
+    std::vector<std::unique_ptr<StepBorderProjector<Mesh>>> border_projectors;
     if (is_step) {
         spdlog::info("    creating edge projectors ...");
         wire_projectors = get_edge_vertex_wire_projectors<Mesh>(selected_component->shape);
+
+        if (!no_projection) {
+            spdlog::info("    initializing surface projectors ...");
+            for (const auto& segment : segments) {
+                surface_projectors.push_back(std::make_unique<StepProjector<Mesh>>(segment));
+                border_projectors.push_back(std::make_unique<StepBorderProjector<Mesh>>(segment));
+            }
+        }
     }
 
     for (int i = 0; i < iterations; i++) {
@@ -902,7 +912,8 @@ int main(int argc, char **argv) {
                 tbb::blocked_range<size_t>(0, meshes.size()), [&](const tbb::blocked_range<size_t>& r) {
                     for (size_t m=r.begin(); m!=r.end(); ++m) {
                         double weight = 1.0 / (iterations - i);
-                        project_to_step<Mesh>(segments[m], meshes[m], wire_projectors, weight);
+                        project_to_step<Mesh>(segments[m], meshes[m], wire_projectors,
+                                              *surface_projectors[m], *border_projectors[m], weight);
             }});
         }
     }

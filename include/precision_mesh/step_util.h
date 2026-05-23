@@ -365,16 +365,16 @@ std::unordered_map<typename Mesh::Vertex_index, StepProjector<Mesh>> get_border_
 
 template<class Mesh>
 void project_to_step(const TopoDS_Face& face, Mesh& mesh,
-                     WireProjectorCachePtr<Mesh> wire_projectors, double weight = 1.0)
+                     WireProjectorCachePtr<Mesh> wire_projectors,
+                     StepProjector<Mesh>& surface_projector,
+                     StepBorderProjector<Mesh>& border_projector,
+                     double weight = 1.0)
 {
     double w1 = std::max(0.0, std::min(1.0, weight));
     double w2 = 1.0 - w1;
 
     auto border_vertex_projector_map = get_border_vertex_projector_map<Mesh>(face, mesh,
                                                                              wire_projectors);
-
-    StepProjector<Mesh> surface_projector(face);
-    StepBorderProjector<Mesh> border_projector(face);
 
     for (auto v: mesh.vertices()) {
         auto input = mesh.point(v);
