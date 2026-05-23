@@ -711,7 +711,7 @@ bool save_shape_as_step(const std::string& path, const TopoDS_Shape& shape) {
 }
 
 template<class Mesh>
-std::vector<std::pair<Mesh, TopoDS_Face>> tessalate_shape(const TopoDS_Shape& shape, double max_surface_error) {
+std::vector<std::pair<Mesh, TopoDS_Face>> tessellate_shape(const TopoDS_Shape& shape, double max_surface_error) {
     IMeshTools_Parameters meshing_params;
     meshing_params.Angle = 90.0;
     meshing_params.AngleInterior = 90.0;
@@ -725,7 +725,7 @@ std::vector<std::pair<Mesh, TopoDS_Face>> tessalate_shape(const TopoDS_Shape& sh
     std::vector<Point> vertex_buffer;
     std::vector<std::vector<size_t>> face_buffer;
 
-    std::vector<std::pair<Mesh, TopoDS_Face>> tessalation;
+    std::vector<std::pair<Mesh, TopoDS_Face>> tessellation;
     for (TopExp_Explorer iter(shape, TopAbs_FACE); iter.More(); iter.Next()) {
         Mesh mesh;
         vertex_buffer.clear();
@@ -793,16 +793,16 @@ std::vector<std::pair<Mesh, TopoDS_Face>> tessalate_shape(const TopoDS_Shape& sh
             continue;
         }
 
-        tessalation.push_back(std::make_pair(mesh, face));
+        tessellation.push_back(std::make_pair(mesh, face));
     }
 
-    return tessalation;
+    return tessellation;
 }
 
-size_t get_short_edge_count(const std::vector<std::pair<Mesh, TopoDS_Face>>& tessalation, double min_edge_length) {
+size_t get_short_edge_count(const std::vector<std::pair<Mesh, TopoDS_Face>>& tessellation, double min_edge_length) {
     size_t short_edges = 0;
     double min_edge_length_sq = min_edge_length * min_edge_length;
-    for (const auto& [mesh, face]: tessalation) {
+    for (const auto& [mesh, face]: tessellation) {
         auto plane = Handle(Geom_Plane)::DownCast(BRep_Tool::Surface(face));
         if (!plane.IsNull()) {
             // ignore planes
@@ -837,15 +837,15 @@ double find_surface_error_param(const TopoDS_Shape& shape, double min_edge_lengt
 
     double threshold_max = min_edge_length;
     double threshold_min = 0;
-    auto tessalation = tessalate_shape<Mesh>(shape, threshold_max);
+    auto tessellation = tessellate_shape<Mesh>(shape, threshold_max);
 
-    size_t max_short_edges = get_short_edge_count(tessalation, min_edge_length);
+    size_t max_short_edges = get_short_edge_count(tessellation, min_edge_length);
     spdlog::info("  initial short edges: {}", max_short_edges);
 
     for (int i = 0; i < max_iterations; i++) {
         double threshold = (threshold_min + threshold_max) / 2.0;
-        tessalation = tessalate_shape<Mesh>(shape, threshold);
-        size_t num_short_edges = get_short_edge_count(tessalation, min_edge_length);
+        tessellation = tessellate_shape<Mesh>(shape, threshold);
+        size_t num_short_edges = get_short_edge_count(tessellation, min_edge_length);
         if (num_short_edges > max_short_edges * 1.01) {
             threshold_min = threshold;
         }

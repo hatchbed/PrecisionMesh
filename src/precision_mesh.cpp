@@ -643,7 +643,7 @@ int main(int argc, char **argv) {
             spdlog::info("  max boundary surface error: {:.4f} {} (from %)", max_boundary_surface_error, output_unit);
         }
         else {
-            spdlog::info("  max bounary surface error: {:.4f} {}", max_boundary_surface_error, output_unit);
+            spdlog::info("  max boundary surface error: {:.4f} {}", max_boundary_surface_error, output_unit);
         }
     }
 
@@ -692,17 +692,17 @@ int main(int argc, char **argv) {
                                      max_surface_error);
         }
 
-        spdlog::info("  tessalating ...");
+        spdlog::info("  tessellating ...");
 
-        auto tesselation = tessalate_shape<Mesh>(selected_component->shape, max_surface_error);
+        auto tessellation = tessellate_shape<Mesh>(selected_component->shape, max_surface_error);
         size_t total_faces = 0;
-        for (const auto& [mesh, face]: tesselation) {
+        for (const auto& [mesh, face]: tessellation) {
             meshes.push_back(mesh);
             segments.push_back(face);
             total_faces += mesh.number_of_faces();
         }
 
-        spdlog::info("  tesselated component into {} faces over {} segments.", total_faces, meshes.size());
+        spdlog::info("  tessellated component into {} faces over {} segments.", total_faces, meshes.size());
 
         // Create mapping of subdivided components to the original components prior to subdivision
         if (!face_map.empty()) {
