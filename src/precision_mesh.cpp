@@ -896,7 +896,7 @@ int main(int argc, char **argv) {
                     }
                 }});
 
-        if (is_step) {
+        if (is_step && !no_projection) {
             spdlog::info("      projecting ...");
             tbb::parallel_for(
                 tbb::blocked_range<size_t>(0, meshes.size()), [&](const tbb::blocked_range<size_t>& r) {
