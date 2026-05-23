@@ -136,6 +136,9 @@ void saveOutput(const std::vector<std::string>& outputs, const std::vector<Mesh>
             spdlog::info("saving mesh to: {}", output);
             saveComponentsToStl<Point_traits>(output, meshes, scale);
         }
+        else {
+            spdlog::error("Unsupported output format: {}", extension);
+        }
     }
 }
 
