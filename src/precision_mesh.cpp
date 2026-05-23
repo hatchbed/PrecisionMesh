@@ -152,20 +152,21 @@ gp_Trsf GetTransform(Handle(XCAFDoc_ShapeTool)& assembly, const TDF_Label& label
     return transformation;
 }
 
-void exploreAssembly(Handle(XCAFDoc_ShapeTool) &assembly, Component& parent,
-                     std::vector<std::shared_ptr<Component>>& components) {
-    TDF_LabelSequence children;
-    assembly->GetComponents(parent.label, children);
-
+void collectComponents(Handle(XCAFDoc_ShapeTool)& assembly,
+                       const TDF_LabelSequence& labels,
+                       const std::string& parent_qualified_name,
+                       std::vector<std::shared_ptr<Component>>& components) {
     std::map<std::string, size_t> counts;
-    for (Standard_Integer i = 1; i <= children.Length(); i++) {
-        TDF_Label label = children.Value(i);
+    for (Standard_Integer i = 1; i <= labels.Length(); i++) {
+        TDF_Label label = labels.Value(i);
 
         std::string name = getName(label);
         std::string reference_name;
 
         size_t index = ++counts[name];
-        std::string qualified_name = parent.qualified_name + "/" + name;
+        std::string qualified_name = parent_qualified_name.empty()
+            ? name
+            : parent_qualified_name + "/" + name;
         if (index > 1) {
             qualified_name += "_" + std::to_string(index);
         }
@@ -188,7 +189,9 @@ void exploreAssembly(Handle(XCAFDoc_ShapeTool) &assembly, Component& parent,
             }
         }
 
-        exploreAssembly(assembly, *component, components);
+        TDF_LabelSequence children;
+        assembly->GetComponents(label, children);
+        collectComponents(assembly, children, qualified_name, components);
     }
 }
 
@@ -535,37 +538,7 @@ int main(int argc, char **argv) {
         assembly->GetFreeShapes(labels);
 
         std::vector<std::shared_ptr<Component>> components;
-        std::map<std::string, size_t> counts;
-        for (auto i = 1; i <= labels.Length(); i++) {
-            TDF_Label label = labels.Value(i);
-
-            std::string name = getName(label);
-            std::string reference_name;
-
-            size_t index = ++counts[name];
-            std::string qualified_name = name;
-            if (index > 1) {
-                qualified_name += "_" + std::to_string(index);
-            }
-
-            TDF_Label reference = label;
-            if (assembly->GetReferredShape(label, reference)) {
-                reference_name = getName(reference);
-            }
-
-            auto component = std::make_shared<Component>(label, reference, name, qualified_name, index,
-                                                         reference_name);
-            if (XCAFDoc_ShapeTool::IsSimpleShape(reference)) {
-                gp_Trsf transform = GetTransform(assembly, label);
-                component->shape = XCAFDoc_ShapeTool::GetShape(reference);
-                if (!component->shape.IsNull()) {
-                    component->shape = component->shape.Located(TopLoc_Location(transform));
-                    components.push_back(component);
-                }
-            }
-
-            exploreAssembly(assembly, *component, components);
-        }
+        collectComponents(assembly, labels, "", components);
 
         spdlog::info("  components:");
         std::shared_ptr<Component> largest_component;
