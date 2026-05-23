@@ -799,14 +799,6 @@ int main(int argc, char **argv) {
         border_num_after += border_edges.size();
     }
 
-
-
-    if (is_step && raw_step_mesh) {
-        saveOutput(outputs, meshes, original_faces, component_map, conversion_scale);
-        return 0;
-    }
-
-
     size_t total_faces_2 = 0;
     for (auto& mesh: meshes) {
         total_faces_2 += mesh.number_of_faces();
