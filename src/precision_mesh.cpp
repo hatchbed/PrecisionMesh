@@ -895,6 +895,12 @@ int main(int argc, char **argv) {
 
         if (is_step && !no_projection) {
             spdlog::info("      projecting ...");
+            // Weight increases each iteration (1/N, 1/(N-1), ..., 1/1), reaching
+            // full projection (weight=1) on the final iteration so vertices end up
+            // exactly on the parametric surface.  The gradual schedule is intentional:
+            // aggressively snapping vertices to the surface in early iterations can
+            // produce degenerate or inverted faces before the mesh topology has had
+            // time to adapt, so we blend toward the surface incrementally.
             tbb::parallel_for(
                 tbb::blocked_range<size_t>(0, meshes.size()), [&](const tbb::blocked_range<size_t>& r) {
                     for (size_t m=r.begin(); m!=r.end(); ++m) {
