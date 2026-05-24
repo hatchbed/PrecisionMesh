@@ -145,11 +145,15 @@ bool saveOutput(const std::vector<std::string>& outputs, const std::vector<Mesh>
     return ok;
 }
 
-gp_Trsf GetTransform(Handle(XCAFDoc_ShapeTool)& assembly, const TDF_Label& label) {
+gp_Trsf GetTransform(Handle(XCAFDoc_ShapeTool)& assembly, const TDF_Label& label, int depth = 0) {
     auto transformation = assembly->GetLocation(label);
     TDF_Label parent = label.Father();
     if (!parent.IsNull()) {
-        auto parentTransformation = GetTransform(assembly, parent);
+        if (depth >= 100) {
+            spdlog::warn("Assembly nesting depth limit reached while computing transform.");
+            return transformation;
+        }
+        auto parentTransformation = GetTransform(assembly, parent, depth + 1);
         transformation = transformation.Multiplied(parentTransformation);
     }
     return transformation;
@@ -158,7 +162,12 @@ gp_Trsf GetTransform(Handle(XCAFDoc_ShapeTool)& assembly, const TDF_Label& label
 void collectComponents(Handle(XCAFDoc_ShapeTool)& assembly,
                        const TDF_LabelSequence& labels,
                        const std::string& parent_qualified_name,
-                       std::vector<std::shared_ptr<Component>>& components) {
+                       std::vector<std::shared_ptr<Component>>& components,
+                       int depth = 0) {
+    if (depth >= 100) {
+        spdlog::warn("Assembly nesting depth limit reached at '{}'.", parent_qualified_name);
+        return;
+    }
     std::map<std::string, size_t> counts;
     for (Standard_Integer i = 1; i <= labels.Length(); i++) {
         TDF_Label label = labels.Value(i);
@@ -194,7 +203,7 @@ void collectComponents(Handle(XCAFDoc_ShapeTool)& assembly,
 
         TDF_LabelSequence children;
         assembly->GetComponents(label, children);
-        collectComponents(assembly, children, qualified_name, components);
+        collectComponents(assembly, children, qualified_name, components, depth + 1);
     }
 }
 
