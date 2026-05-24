@@ -673,8 +673,97 @@ std::tuple<TopoDS_Shape, FaceMap> subdivide_step_shape(TopoDS_Shape& shape, doub
         if (!swept_surface.IsNull()) {
         }
 
-        auto torous = Handle(Geom_ToroidalSurface)::DownCast(surface);
-        if (!torous.IsNull()) {
+        auto torus = Handle(Geom_ToroidalSurface)::DownCast(surface);
+        if (!torus.IsNull()) {
+            double major_radius = torus->MajorRadius();  // R: ring center to tube center
+            double minor_radius = torus->MinorRadius();  // r: tube cross-section radius
+            double outer_radius = major_radius + minor_radius;  // radius at outer equator
+
+            spdlog::debug("torus:");
+            spdlog::debug("  major radius: {}", major_radius);
+            spdlog::debug("  minor radius: {}", minor_radius);
+
+            Standard_Real u1, u2, v1, v2;
+            BRepTools::UVBounds(face, u1, u2, v1, v2);
+
+            spdlog::debug("  U (ring angle): {} -> {} ({})", u1, u2, u2 - u1);
+            spdlog::debug("  V (tube angle): {} -> {} ({})", v1, v2, v2 - v1);
+
+            // --- U direction: angle around the ring axis ---
+            // Surface error and chord length are both worst-case at the outer
+            // equator (v=0) where the ring radius is R+r.  Using outer_radius
+            // as the characteristic radius is conservative and ensures quality
+            // everywhere across the torus face.
+            spdlog::debug("  max edge length: {}", max_edge_length);
+
+            double max_u_edge_length = max_edge_length / std::sqrt(2);
+            max_u_edge_length = std::min(max_u_edge_length, 2 * outer_radius);
+            double min_u_edge_length = std::min(min_edge_length, 2 * outer_radius);
+            spdlog::debug("  max u edge length: {}", max_u_edge_length);
+            spdlog::debug("  min u edge length: {}", min_u_edge_length);
+
+            double u_angle = 0;
+            if (max_surface_error / outer_radius <= 2) {
+                double max_angle = 2 * std::acos(1 - max_surface_error / outer_radius);
+                spdlog::debug("  max surface error angle (U): {}", max_angle);
+                u_angle = max_angle;
+            }
+
+            double min_u_angle = 2 * std::asin(min_u_edge_length / (2 * outer_radius));
+            spdlog::debug("  min edge length angle (U): {}", min_u_angle);
+            if (min_u_angle > u_angle) {
+                u_angle = min_u_angle;
+            }
+
+            double max_u_angle = 2 * std::asin(max_u_edge_length / (2 * outer_radius));
+            spdlog::debug("  max edge length angle (U): {}", max_u_angle);
+            if (max_u_angle < u_angle) {
+                u_angle = max_u_angle;
+            }
+
+            if (u_angle > 0) {
+                int steps = std::ceil((u2 - u1) / u_angle);
+                spdlog::debug("  U steps: {}", steps);
+                u_angle = (u2 - u1) / steps;
+                spdlog::debug("  actual U angle: {}", u_angle);
+                if (steps > 1) {
+                    u_steps = steps;
+                }
+            }
+
+            double u_chord = 2 * outer_radius * std::sin(u_angle / 2);
+            spdlog::debug("  u chord: {}", u_chord);
+
+            // --- V direction: angle around the tube cross-section ---
+            // Unlike the cylinder's linear V axis, V is also angular here.
+            // Two constraints determine the maximum chord in the V direction:
+            //   1. Diagonal budget: the hypotenuse of U and V edges must not
+            //      exceed max_edge_length, so max_v_chord = sqrt(max² - u_chord²).
+            //   2. Surface error: the tube cross-section has its own curvature
+            //      (radius = minor_radius), capping the V chord independently.
+            // The tighter chord is converted back to a V angle to compute v_steps.
+
+            double max_v_chord = std::sqrt(
+                std::max(0.0, max_edge_length * max_edge_length - u_chord * u_chord));
+            spdlog::debug("  max v chord from diagonal: {}", max_v_chord);
+
+            if (max_surface_error / minor_radius <= 2) {
+                double v_angle_from_error = 2 * std::acos(1 - max_surface_error / minor_radius);
+                double v_chord_from_error = 2 * minor_radius * std::sin(v_angle_from_error / 2);
+                spdlog::debug("  max v chord from surface error: {}", v_chord_from_error);
+                max_v_chord = std::min(max_v_chord, v_chord_from_error);
+            }
+
+            max_v_chord = std::min(max_v_chord, 2 * minor_radius);
+
+            if (max_v_chord > 0) {
+                double v_angle_max = 2 * std::asin(max_v_chord / (2 * minor_radius));
+                spdlog::debug("  max V angle: {}", v_angle_max);
+                if (v_angle_max > 0 && (v2 - v1) > v_angle_max) {
+                    v_steps = static_cast<int>(std::ceil((v2 - v1) / v_angle_max));
+                    spdlog::debug("  V steps: {}", v_steps);
+                }
+            }
         }
 
         auto subdivs = subdivide_face(face, u_steps, v_steps);
