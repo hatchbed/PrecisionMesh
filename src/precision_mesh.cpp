@@ -408,7 +408,7 @@ int main(int argc, char **argv) {
     }
 
     std::string unit = "mesh_units";
-    if (!output_units.empty()) {
+    if (!output_unit.empty()) {
         unit = output_unit;
     }
 
