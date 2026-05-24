@@ -718,16 +718,6 @@ int main(int argc, char **argv) {
     size_t border_num_before = 0;
     size_t border_num_after = 0;
 
-    struct Less_xyz_3 {
-        bool operator()(const typename Mesh::Point& p, const typename Mesh::Point& q) const {
-          return std::lexicographical_compare(p.cartesian_begin(), p.cartesian_end(),
-                                              q.cartesian_begin(), q.cartesian_end());
-        }
-    };
-
-    typedef std::map<typename Mesh::Point, typename Mesh::Point, Less_xyz_3> PointMap;
-    PointMap projection_map{Less_xyz_3()};
-
     for (size_t i = 0; i < meshes.size(); i++) {
         auto& mesh = meshes[i];
         std::vector<EdgeDescriptor> border_edges;
@@ -735,53 +725,16 @@ int main(int argc, char **argv) {
             HalfEdge2Edge(mesh, border_edges)));
         border_num_before += border_edges.size();
         PMP::split_long_edges(border_edges, max_edge_length, mesh);
+        // TODO(malban): project newly split border vertices onto STEP boundary curves.
+        // split_long_edges places midpoints by linear interpolation, leaving them
+        // slightly off the STEP curve.  Snapping them to the wire here (before the
+        // remeshing loop) would give isotropic_remeshing accurate border constraints
+        // from the first iteration, improving the adaptive sizing field and preventing
+        // the interpolation error from being smoothed into adjacent interior faces.
+        // Requires initializing wire_projectors before this loop.
         border_edges.clear();
         PMP::border_halfedges(faces(mesh), mesh, boost::make_function_output_iterator(
             HalfEdge2Edge(mesh, border_edges)));
-
-        std::vector<typename Mesh::Point> vertices;
-        for (auto v: mesh.vertices()) {
-            vertices.push_back(mesh.point(v));
-        }
-
-/*
-        if (!no_projection && meshes.size() == segments.size()) {
-            // TODO: reproject border vertices back to STEP border
-            //project_to_step_border<Mesh>(segments[i], mesh);
-        }
-
-        std::vector<typename Mesh::Point> projected;
-        for (auto v: mesh.vertices()) {
-            projected.push_back(mesh.point(v));
-        }
-
-        for (size_t j = 0; j < vertices.size(); j++) {
-            auto it = projection_map.find(vertices[j]);
-            if (it == projection_map.end()) {
-                projection_map[vertices[j]] = projected[j];
-            }
-            else {
-                double dx = it->second.x() - projected[j].x();
-                double dy = it->second.y() - projected[j].y();
-                double dz = it->second.z() - projected[j].z();
-                double dist = std::sqrt(dx * dx + dy * dy + dz * dz);
-                double d1 = get_distance_to_face(segments[i], projected[j].x(), projected[j].y(), projected[j].z());
-
-                if (d1 > 0.001) {
-                    spdlog::error("d1 = {}", d1);
-                }
-
-
-                if (dist > 0.001) {
-                    spdlog::warn("large projection delta: {}", dist);
-
-                    double d2 = get_distance_to_face(segments[i], it->second.x(), it->second.y(), it->second.z());
-
-                    spdlog::warn("d1 = {}, d2 = {}", d1, d2);
-                }
-            }
-        }
-        */
 
         border_num_after += border_edges.size();
     }
