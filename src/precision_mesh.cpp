@@ -243,7 +243,7 @@ int main(int argc, char **argv) {
     argv = app.ensure_utf8(argv);
 
     std::string input;
-    app.add_option("-i,--input", input, "Input file (.obj|.off|.ply|.step|.stl|.ts|.vtp)")
+    app.add_option("-i,--input", input, "Input file (.obj|.off|.p21|.ply|.step|.stl|.stp|.ts|.vtp)")
         ->check(CLI::ExistingFile)
         ->required();
 
@@ -353,7 +353,7 @@ int main(int argc, char **argv) {
     std::filesystem::path input_path(input);
     std::string extension = boost::algorithm::to_lower_copy(input_path.extension().string());
 
-    bool is_step = extension == ".stp" || extension == ".step";
+    bool is_step = extension == ".stp" || extension == ".step" || extension == ".p21";
 
     spdlog::info("parameters:");
     spdlog::info("  input                    = {}", input);
