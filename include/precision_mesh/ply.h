@@ -76,8 +76,10 @@ bool saveComponentsToPly(const std::string& path, const std::vector<Mesh>& compo
     }
 
     std::filebuf fb;
-    //fb.open(path, std::ios::out | std::ios::binary);
-    fb.open(path, std::ios::out);
+    if (!fb.open(path, std::ios::out)) {
+        spdlog::error("Failed to open {} for writing.", path);
+        return false;
+    }
     std::ostream output_stream(&fb);
 
     tinyply::PlyFile ply_file;

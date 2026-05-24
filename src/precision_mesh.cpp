@@ -119,10 +119,11 @@ std::string getName(const TDF_Label& label) {
     return name;
 }
 
-void saveOutput(const std::vector<std::string>& outputs, const std::vector<Mesh>& meshes, 
-                const std::vector<TopoDS_Face>& faces, 
-                const std::unordered_map<size_t, int>& component_map, float scale=1) 
+bool saveOutput(const std::vector<std::string>& outputs, const std::vector<Mesh>& meshes,
+                const std::vector<TopoDS_Face>& faces,
+                const std::unordered_map<size_t, int>& component_map, float scale=1)
 {
+    bool ok = true;
     for (const auto& output: outputs) {
 
         std::filesystem::path output_path(output);
@@ -130,16 +131,18 @@ void saveOutput(const std::vector<std::string>& outputs, const std::vector<Mesh>
 
         if (extension == ".ply") {
             spdlog::info("saving mesh to: {}", output);
-            saveComponentsToPly<Point_traits>(output, meshes, faces, component_map, scale);
+            ok = saveComponentsToPly<Point_traits>(output, meshes, faces, component_map, scale) && ok;
         }
         else if (extension == ".stl") {
             spdlog::info("saving mesh to: {}", output);
-            saveComponentsToStl<Point_traits>(output, meshes, scale);
+            ok = saveComponentsToStl<Point_traits>(output, meshes, scale) && ok;
         }
         else {
             spdlog::error("Unsupported output format: {}", extension);
+            ok = false;
         }
     }
+    return ok;
 }
 
 gp_Trsf GetTransform(Handle(XCAFDoc_ShapeTool)& assembly, const TDF_Label& label) {
@@ -698,8 +701,7 @@ int main(int argc, char **argv) {
     spdlog::info("    faces: {}", total_faces_init);
 
     if (is_step && raw_step_mesh) {
-        saveOutput(outputs, meshes, segments, {}, conversion_scale);
-        return 0;
+        return saveOutput(outputs, meshes, segments, {}, conversion_scale) ? 0 : 1;
     }
 
     spdlog::info("  splitting long border edges ...");
@@ -902,7 +904,7 @@ int main(int argc, char **argv) {
 
     // auto merged = merge_meshes(meshes, Point_traits());
     // spdlog::info("  merged faces: {}",  merged.number_of_faces());
-    saveOutput(outputs, meshes, original_faces, component_map, conversion_scale);
+    return saveOutput(outputs, meshes, original_faces, component_map, conversion_scale) ? 0 : 1;
 
 
     return 0;

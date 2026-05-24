@@ -43,7 +43,10 @@ bool saveComponentsToStl(const std::string& path, const std::vector<Mesh>& compo
         }
     }
 
-    CGAL::IO::write_STL(path, vertices, faces, CGAL::parameters::stream_precision(17));
+    if (!CGAL::IO::write_STL(path, vertices, faces, CGAL::parameters::stream_precision(17))) {
+        spdlog::error("Failed to write STL file: {}", path);
+        return false;
+    }
 
     return true;
 }
