@@ -840,9 +840,33 @@ size_t get_short_edge_count(const std::vector<std::pair<Mesh, TopoDS_Face>>& tes
     return short_edges;
 }
 
+// Auto-tune the OCCT tessellation deflection parameter for a given shape when
+// the user has not specified an explicit --max-surface-error.
+//
+// OCCT's BRepMesh_IncrementalMesh accepts a deflection (max surface error) that
+// controls tessellation density.  PrecisionMesh is concerned with uniform triangle
+// sizes bounded by min/max edge length.  Edges that are too long can be split
+// during remeshing, but there is no mechanism to merge edges that are already too
+// short.  Some short border edges are unavoidable regardless of deflection — for
+// example a face whose width is less than min_edge_length will always produce short
+// edges at its boundary.  These are the "inherent" short edges.
+//
+// The goal is to find the finest deflection (most accurate surface representation)
+// that does not introduce MORE short border edges than this inherent baseline.
+// Going finer improves surface accuracy; the short-edge count acts as the brake
+// that prevents the deflection from producing a mesh that cannot be remeshed
+// cleanly.  For flat surfaces, deflection has no effect on triangle count, so the
+// search converges to a very small value harmlessly.  For curved surfaces (e.g. a
+// sphere), the search converges to the deflection where arc segments on shared
+// edges just reach min_edge_length — naturally sizing the tessellation to the
+// requested edge-length budget.
+//
+// The search is a binary search over [0, min_edge_length].  The baseline short-edge
+// count is measured at the coarsest deflection (min_edge_length).  A 1% tolerance
+// on that count allows for noise while still preventing a meaningful increase.
 template<class Mesh>
-double find_surface_error_param(const TopoDS_Shape& shape, double min_edge_length, int max_iterations=10, 
-                                double conversion_scale=1) 
+double find_surface_error_param(const TopoDS_Shape& shape, double min_edge_length, int max_iterations=10,
+                                double conversion_scale=1)
 {
     spdlog::info("finding max surface error param ...");
     max_iterations = std::max(2, std::min(100, max_iterations));
@@ -859,9 +883,12 @@ double find_surface_error_param(const TopoDS_Shape& shape, double min_edge_lengt
         tessellation = tessellate_shape<Mesh>(shape, threshold);
         size_t num_short_edges = get_short_edge_count(tessellation, min_edge_length);
         if (num_short_edges > max_short_edges * 1.01) {
+            // This deflection is too fine — it introduces new short edges beyond
+            // the inherent baseline.  Raise the lower bound to exclude it.
             threshold_min = threshold;
         }
         else {
+            // This deflection is acceptable.  Lower the upper bound and try finer.
             threshold_max = threshold;
         }
         spdlog::info("    {} short edges at {}", num_short_edges, threshold * conversion_scale);

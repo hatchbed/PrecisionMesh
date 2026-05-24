@@ -714,7 +714,19 @@ int main(int argc, char **argv) {
     }
 
     spdlog::info("  splitting long border edges ...");
-    // TODO(malban): ensure that border splits are consistent on shared edges
+    // TODO(malban): replace split_long_edges on border edges with STEP-curve-based splitting.
+    // The current approach uses PMP::split_long_edges which places new vertices by linear
+    // interpolation (midpoint of the 3D chord).  The preferred approach is:
+    //   1. For each STEP edge shared between adjacent sub-face meshes, compute arc-length-uniform
+    //      split points directly on the parametric curve via BRep_Tool::Curve().
+    //   2. Insert those vertices into each adjacent mesh using CGAL::Euler::split_edge followed
+    //      by explicit repositioning (mesh.point(new_v) = curve_point).
+    //   3. Walk each mesh's border halfedges to identify which correspond to a given STEP edge
+    //      by proximity (reusing logic similar to get_border_vertex_projector_map).
+    // Benefits over the current approach:
+    //   - Split vertices land exactly on the STEP curve (no off-surface interpolation error).
+    //   - Both adjacent meshes receive identical split points, guaranteeing topological
+    //     consistency along shared borders without relying on OCCT's tessellation guarantee.
     size_t border_num_before = 0;
     size_t border_num_after = 0;
 
