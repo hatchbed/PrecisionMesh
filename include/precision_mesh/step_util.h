@@ -669,6 +669,89 @@ std::tuple<TopoDS_Shape, FaceMap> subdivide_step_shape(TopoDS_Shape& shape, doub
             spdlog::debug("  v length: {}", v_length);
         }
 
+        auto cone = Handle(Geom_ConicalSurface)::DownCast(surface);
+        if (!cone.IsNull()) {
+            double ref_radius = cone->RefRadius();   // radius at V=0
+            double semi_angle = cone->SemiAngle();   // half-angle of the cone
+
+            Standard_Real u1, u2, v1, v2;
+            BRepTools::UVBounds(face, u1, u2, v1, v2);
+
+            spdlog::debug("cone:");
+            spdlog::debug("  ref radius: {}", ref_radius);
+            spdlog::debug("  semi angle: {}", semi_angle);
+            spdlog::debug("  U (angle): {} -> {} ({})", u1, u2, u2 - u1);
+            spdlog::debug("  V (slant height): {} -> {} ({})", v1, v2, v2 - v1);
+
+            // r(v) = RefRadius + v * sin(SemiAngle)
+            double r_v1 = ref_radius + v1 * std::sin(semi_angle);
+            double r_v2 = ref_radius + v2 * std::sin(semi_angle);
+            double r_min = std::min(r_v1, r_v2);
+            spdlog::debug("  r at v1: {}, r at v2: {}", r_v1, r_v2);
+
+            // --- U direction: angle around the cone axis ---
+            // Use the radius one ring segment away from the narrow end as the
+            // characteristic radius.  This is always positive (even for a true
+            // apex where r_min==0) and prevents over-tessellating the narrow tip
+            // (which isotropic remeshing cannot undo).  The wider flange will
+            // have fewer angular steps than ideal, but CGAL's remesher will
+            // split those larger faces as needed.
+            double r_ring = r_min + max_edge_length * std::sin(std::abs(semi_angle));
+            spdlog::debug("  r_ring (one step from narrow end): {}", r_ring);
+
+            // clamp edge length to chord diameter at r_ring
+            double max_u_edge_length = std::min(max_edge_length / std::sqrt(2), 2 * r_ring);
+            double min_u_edge_length = std::min(min_edge_length, 2 * r_ring);
+            spdlog::debug("  max u edge length: {}", max_u_edge_length);
+            spdlog::debug("  min u edge length: {}", min_u_edge_length);
+
+            double angle = 0;
+
+            // surface-error constraint (curvature radius is r_ring)
+            if (max_surface_error / r_ring <= 2) {
+                angle = 2 * std::acos(1 - max_surface_error / r_ring);
+                spdlog::debug("  max surface error angle: {}", angle);
+            }
+
+            // min edge length floor
+            double min_angle = 2 * std::asin(min_u_edge_length / (2 * r_ring));
+            if (min_angle > angle) {
+                angle = min_angle;
+            }
+
+            // max edge length ceiling
+            double max_u_angle = 2 * std::asin(max_u_edge_length / (2 * r_ring));
+            if (max_u_angle < angle) {
+                angle = max_u_angle;
+            }
+
+            if (angle > 0) {
+                int steps = static_cast<int>(std::ceil((u2 - u1) / angle));
+                spdlog::debug("  U steps: {}", steps);
+                angle = (u2 - u1) / steps;
+                spdlog::debug("  actual U angle: {}", angle);
+                if (steps > 1) {
+                    u_steps = steps;
+                }
+            }
+
+            // chord at r_ring for the chosen angle step
+            double u_length = 2 * r_ring * std::sin(angle / 2);
+            spdlog::debug("  u chord at r_ring: {}", u_length);
+
+            // --- V direction: slant height (already a length unit) ---
+            // Cone generator lines are straight, so V edges lie exactly on the
+            // surface regardless of step size.  Only the diagonal budget applies.
+            double max_v_edge_length =
+                std::sqrt(std::max(0.0, max_edge_length * max_edge_length - u_length * u_length));
+            spdlog::debug("  max v edge length: {}", max_v_edge_length);
+
+            if (max_v_edge_length > 0 && (v2 - v1) > max_v_edge_length) {
+                v_steps = static_cast<int>(std::ceil((v2 - v1) / max_v_edge_length));
+                spdlog::debug("  V steps: {}", v_steps);
+            }
+        }
+
         auto swept_surface = Handle(Geom_SweptSurface)::DownCast(surface);
         if (!swept_surface.IsNull()) {
         }
