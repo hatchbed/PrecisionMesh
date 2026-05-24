@@ -6,6 +6,7 @@
 #include <vector>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 
 #include <spdlog/spdlog.h>
 #include <tbb/parallel_for.h>
@@ -142,7 +143,7 @@ TopoDS_Wire get_border_loop_wire(
 {
     size_t wire_size = 0;
     BRepBuilderAPI_MakeWire wire_maker;
-    std::map<int, bool> evaluated;
+    std::unordered_set<int> evaluated;
 
     // Get the vertices of the target edge
     std::deque<TopoDS_Vertex> vertex_queue = { vertex };
@@ -154,13 +155,10 @@ TopoDS_Wire get_border_loop_wire(
         auto edges = vertex_to_edge_map.FindFromKey(v);
         for (const auto& e: edges) {
             int edge_code = shapeHashCode(e);
-            auto evaluated_it = evaluated.find(edge_code);
-            if (evaluated_it != evaluated.end() && evaluated_it->second) {
+            if (!evaluated.insert(edge_code).second) {
                 // ignore already evaluated edge
                 continue;
             }
-
-            evaluated[edge_code] = true;
             auto faces = edge_to_face_map.FindFromKey(e);
             if (faces.Size() == 1) {
                 // ignore internal edge
