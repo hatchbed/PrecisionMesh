@@ -161,8 +161,23 @@ TopoDS_Wire get_border_loop_wire(
             }
             auto faces = edge_to_face_map.FindFromKey(e);
             if (faces.Size() == 1) {
-                // ignore internal edge
-                continue;
+                auto single_face = TopoDS::Face(faces.First());
+                // Seam edges (e.g. the U=0/2π closure of a full 360° cylinder)
+                // belong to only one face but appear twice in its wire with
+                // opposing orientations.  They are parametric artifacts with no
+                // corresponding physical surface boundary, so skip them.
+                if (BRep_Tool::IsClosed(TopoDS::Edge(e), single_face)) {
+                    continue;
+                }
+                // Degenerate edges (e.g. the apex of a cone or sphere) are also
+                // single-face and have zero length; adding them to
+                // BRepBuilderAPI_MakeWire would corrupt the wire, so skip them.
+                if (BRep_Tool::Degenerated(TopoDS::Edge(e))) {
+                    continue;
+                }
+                // Free outer-boundary edges of open shells are also Size()==1
+                // but represent real surface boundaries that mesh border vertices
+                // must project onto, so fall through and include them in the wire.
             }
 
             wire_maker.Add(TopoDS::Edge(e));
