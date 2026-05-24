@@ -643,8 +643,7 @@ std::tuple<TopoDS_Shape, FaceMap> subdivide_step_shape(TopoDS_Shape& shape, doub
             // get max v edge length, taking into account the length of the
             // hypotenuse formed by the u and v edges
             double max_v_edge_length =
-                std::min(max_edge_length,
-                std::sqrt(max_edge_length * max_edge_length + u_length * u_length));
+                std::sqrt(std::max(0.0, max_edge_length * max_edge_length - u_length * u_length));
             spdlog::debug("  max v length: {}", max_v_edge_length);
 
             if (v2 - v1 > max_v_edge_length) {
