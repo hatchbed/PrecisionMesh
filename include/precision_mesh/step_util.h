@@ -28,6 +28,9 @@
 #include <Geom_CylindricalSurface.hxx>
 #include <Geom_ConicalSurface.hxx>
 #include <Geom_SphericalSurface.hxx>
+#include <Geom_Curve.hxx>
+#include <Geom_SurfaceOfLinearExtrusion.hxx>
+#include <Geom_SurfaceOfRevolution.hxx>
 #include <Geom_SweptSurface.hxx>
 #include <Geom_ToroidalSurface.hxx>
 #include <Geom2d_Line.hxx>
@@ -752,8 +755,99 @@ std::tuple<TopoDS_Shape, FaceMap> subdivide_step_shape(TopoDS_Shape& shape, doub
             }
         }
 
-        auto swept_surface = Handle(Geom_SweptSurface)::DownCast(surface);
-        if (!swept_surface.IsNull()) {
+        auto revolution = Handle(Geom_SurfaceOfRevolution)::DownCast(surface);
+        if (!revolution.IsNull()) {
+            gp_Pnt axis_origin = revolution->Axis().Location();
+            gp_Vec axis_dir(revolution->Axis().Direction());
+            Handle(Geom_Curve) basis_curve = revolution->BasisCurve();
+
+            Standard_Real u1, u2, v1, v2;
+            BRepTools::UVBounds(face, u1, u2, v1, v2);
+
+            spdlog::debug("surface of revolution:");
+            spdlog::debug("  U (angle): {} -> {} ({})", u1, u2, u2 - u1);
+            spdlog::debug("  V (profile): {} -> {} ({})", v1, v2, v2 - v1);
+
+            // Sample the profile curve to find the minimum radius from the
+            // revolution axis across the face's V range.  This characterizes
+            // the tightest U-direction curvature.
+            // Note: analytical revolved surfaces (cylinder, cone, sphere, torus)
+            // are already caught by earlier DownCasts and never reach here.
+            const int num_samples = 20;
+            double r_min = std::numeric_limits<double>::max();
+            for (int i = 0; i <= num_samples; i++) {
+                double v = v1 + (v2 - v1) * i / num_samples;
+                gp_Pnt pt;
+                basis_curve->D0(v, pt);
+                gp_Vec OP(axis_origin, pt);
+                double along = OP.Dot(axis_dir);
+                gp_Vec perp = OP - axis_dir * along;
+                r_min = std::min(r_min, perp.Magnitude());
+            }
+            spdlog::debug("  min radius from axis: {}", r_min);
+
+            // Skip U subdivision if the profile passes through or very near
+            // the axis — the apex region is degenerate and isotropic remeshing
+            // handles it better than uniform angular cuts.
+            if (r_min > min_edge_length) {
+                double max_u_edge_length = std::min(max_edge_length / std::sqrt(2), 2 * r_min);
+                double min_u_edge_length = std::min(min_edge_length, 2 * r_min);
+
+                double angle = 0;
+                if (max_surface_error / r_min <= 2) {
+                    angle = 2 * std::acos(1 - max_surface_error / r_min);
+                    spdlog::debug("  max surface error angle: {}", angle);
+                }
+
+                double min_angle = 2 * std::asin(min_u_edge_length / (2 * r_min));
+                if (min_angle > angle) {
+                    angle = min_angle;
+                }
+
+                double max_u_angle = 2 * std::asin(max_u_edge_length / (2 * r_min));
+                if (max_u_angle < angle) {
+                    angle = max_u_angle;
+                }
+
+                if (angle > 0) {
+                    int steps = static_cast<int>(std::ceil((u2 - u1) / angle));
+                    spdlog::debug("  U steps: {}", steps);
+                    if (steps > 1) {
+                        u_steps = steps;
+                    }
+                }
+            }
+
+            // TODO: V subdivision along the profile curve.  Only analytical
+            // profiles benefit: a Geom_Line basis has no curvature and can be
+            // subdivided by max_edge_length; a Geom_Circle basis can use the
+            // same chord/surface-error angular logic as the torus V direction.
+            // For NURBS profiles, pre-cut rings become protected borders that
+            // constrain the remesher, so it is better to skip subdivision and
+            // let isotropic remeshing adapt to curvature freely.
+        }
+
+        auto extrusion = Handle(Geom_SurfaceOfLinearExtrusion)::DownCast(surface);
+        if (!extrusion.IsNull()) {
+            Standard_Real u1, u2, v1, v2;
+            BRepTools::UVBounds(face, u1, u2, v1, v2);
+
+            spdlog::debug("surface of linear extrusion:");
+            spdlog::debug("  U (profile): {} -> {} ({})", u1, u2, u2 - u1);
+            spdlog::debug("  V (extrusion): {} -> {} ({})", v1, v2, v2 - v1);
+
+            // V is the extrusion direction — always a straight line with zero
+            // surface error.  Subdivide purely by max_edge_length.
+            if ((v2 - v1) > max_edge_length) {
+                v_steps = static_cast<int>(std::ceil((v2 - v1) / max_edge_length));
+                spdlog::debug("  V steps: {}", v_steps);
+            }
+
+            // TODO: U subdivision along the profile curve.  Only analytical
+            // profiles benefit: a Geom_Circle basis can reuse the cylinder U
+            // chord/surface-error angular logic.  For NURBS profiles, the
+            // pre-cut lines become protected borders that constrain the remesher
+            // — skip subdivision and let isotropic remeshing adapt freely.
         }
 
         auto torus = Handle(Geom_ToroidalSurface)::DownCast(surface);
