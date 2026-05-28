@@ -108,6 +108,7 @@ include_dir = include_directories('include')
 precision_mesh = executable('precision_mesh',
   'src/precision_mesh.cpp',
   'src/step_face_util.cpp',
+  'src/step_reader.cpp',
   'src/step_subdivision.cpp',
   'src/step_tessellation.cpp',
   cpp_args : ['-DCGAL_DISABLE_ROUNDING_MATH_CHECK'],
