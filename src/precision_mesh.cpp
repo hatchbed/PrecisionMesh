@@ -836,8 +836,6 @@ int main(int argc, char **argv) {
                     const std::pair edge_min_max{min_edge_length, max_edge_length};
                     PMP::Adaptive_sizing_field<Mesh> sizing_field(max_remeshing_surface_error,
                                                                   edge_min_max, faces(mesh), mesh);
-                    auto crease_map = lookup_property_map<Mesh::Edge_index, bool>(mesh, "crease");
-
                     try {
                         if (is_step) {
                             PMP::isotropic_remeshing(faces(mesh), sizing_field, mesh,
@@ -846,6 +844,7 @@ int main(int argc, char **argv) {
                                                  .protect_constraints(true));
                         }
                         else {
+                            auto crease_map = lookup_property_map<Mesh::Edge_index, bool>(mesh, "crease");
                             PMP::isotropic_remeshing(faces(mesh), sizing_field, mesh,
                                 CGAL::parameters::number_of_iterations(1)
                                                  .number_of_relaxation_steps(3)
