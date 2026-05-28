@@ -154,7 +154,7 @@ void remove_indices(std::vector<T>& data, const std::vector<size_t>& to_remove) 
   data = output;
 }
 
-bool is_potentially_non_manifold(Mesh& mesh, Mesh::Vertex_index v1, Mesh::Vertex_index v2) {
+inline bool is_potentially_non_manifold(Mesh& mesh, Mesh::Vertex_index v1, Mesh::Vertex_index v2) {
     // Count halfedges from v1 to v2 and from v2 to v1
     int count_v1_to_v2 = 0;
     int count_v2_to_v1 = 0;

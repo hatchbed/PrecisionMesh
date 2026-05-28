@@ -57,7 +57,10 @@
 
 #include <precision_mesh/mesh_util.h>
 #include <precision_mesh/ply.h>
-#include <precision_mesh/step_util.h>
+#include <precision_mesh/step_face_util.h>
+#include <precision_mesh/step_projection.h>
+#include <precision_mesh/step_subdivision.h>
+#include <precision_mesh/step_tessellation.h>
 #include <precision_mesh/stl.h>
 
 namespace PMP = CGAL::Polygon_mesh_processing;

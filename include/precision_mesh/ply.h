@@ -8,7 +8,7 @@
 #include <TopoDS_Face.hxx>
 
 #include <precision_mesh/mesh_util.h>
-#include <precision_mesh/step_util.h>
+#include <precision_mesh/step_face_util.h>
 
 template <typename Traits>
 bool saveComponentsToPly(const std::string& path, const std::vector<Mesh>& components, 

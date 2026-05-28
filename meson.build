@@ -107,7 +107,9 @@ include_dir = include_directories('include')
 
 precision_mesh = executable('precision_mesh',
   'src/precision_mesh.cpp',
+  'src/step_face_util.cpp',
   'src/step_subdivision.cpp',
+  'src/step_tessellation.cpp',
   cpp_args : ['-DCGAL_DISABLE_ROUNDING_MATH_CHECK'],
   dependencies : [boost_dep, cgal_dep, cli11_dep, eigen_dep, gmp_dep, fontconfig_dep, freetype_dep,
                   mpfr_dep, occt_dep, spdlog_dep, tbb_dep, tinyply_dep],
