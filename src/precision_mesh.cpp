@@ -61,6 +61,7 @@
 #include <precision_mesh/step_projection.h>
 #include <precision_mesh/step_reader.h>
 #include <precision_mesh/step_subdivision.h>
+#include <precision_mesh/unit_conversion.h>
 #include <precision_mesh/step_tessellation.h>
 #include <precision_mesh/stl.h>
 
@@ -86,15 +87,6 @@ auto lookup_property_map(SurfaceMesh& mesh, const std::string& name) {
 }
 
 std::unordered_set<std::string> mesh_formats = {".obj", ".off", ".ply", ".stl", ".ts", ".vtp"};
-std::unordered_set<std::string> output_units = {"mm", "cm", "m", "in", "ft", "yd"};
-std::unordered_map<std::string, float> to_meters = {
-    {"mm", 0.001},
-    {"cm", 0.01},
-    {"m", 1.0},
-    {"in", 0.0254},
-    {"ft", 0.3048},
-    {"yd", 0.9144}
-};
 
 bool saveOutput(const std::vector<std::string>& outputs, const std::vector<Mesh>& meshes,
                 const std::vector<TopoDS_Face>& faces,
@@ -120,48 +112,6 @@ bool saveOutput(const std::vector<std::string>& outputs, const std::vector<Mesh>
         }
     }
     return ok;
-}
-
-std::string normalizeUnit(const std::string& unit) {
-    if (unit.empty()) {
-        return "mesh units";
-    }
-
-    auto lower = boost::algorithm::to_lower_copy(unit);
-    if (lower == "millimetre" || lower == "millimetres" || lower == "millimeter" ||
-        lower == "millimeters" ||  lower == "mm") {
-        return "mm";
-    }
-    else if (lower == "centimetre" || lower == "centimeters" || lower == "centimeter" ||
-             lower == "centimeters" || lower == "cm") {
-        return "cm";
-    }
-    else if (lower == "metre" || lower == "metres" || lower == "meter" || lower == "meters" ||
-             lower == "m") {
-        return "m";
-    }
-    else if (lower == "inch" || lower == "inches" || lower == "in") {
-        return "in";
-    }
-    else if (lower == "foot" || lower == "feet" || lower == "ft") {
-        return "ft";
-    }
-    else if (lower == "yard" || lower == "yards" || lower == "yd") {
-        return "yd";
-    }
-
-    return lower;
-}
-
-float getUnitConversionScale(const std::string& from, const std::string& to) {
-    auto from_it = to_meters.find(from);
-    auto to_it = to_meters.find(to);
-
-    if (from_it == to_meters.end() || to_it == to_meters.end()) {
-        return 1.0;
-    }
-
-    return from_it->second / to_it->second;
 }
 
 int main(int argc, char **argv) {
@@ -441,7 +391,7 @@ int main(int argc, char **argv) {
         }
         else {
             std::string normalized_output_unit = normalizeUnit(output_unit);
-            if (output_units.count(normalized_output_unit) == 0) {
+            if (!isKnownUnit(normalized_output_unit)) {
                 spdlog::error("Output unit {} is not supported.", output_unit);
                 return 1;
             }
@@ -450,7 +400,7 @@ int main(int argc, char **argv) {
         }
 
         if (unit != output_unit) {
-            if (output_units.count(unit) == 0) {
+            if (!isKnownUnit(unit)) {
                 spdlog::error("Unable to convert between input unit: {} and output unit: {}.",
                               unit, output_unit);
                 return 1;
