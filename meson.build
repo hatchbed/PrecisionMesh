@@ -107,6 +107,7 @@ include_dir = include_directories('include')
 
 precision_mesh = executable('precision_mesh',
   'src/precision_mesh.cpp',
+  'src/remeshing.cpp',
   'src/step_face_util.cpp',
   'src/step_reader.cpp',
   'src/step_subdivision.cpp',

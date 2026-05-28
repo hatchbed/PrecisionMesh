@@ -3,6 +3,7 @@
 #include <deque>
 #include <iterator>
 #include <limits>
+#include <string>
 #include <vector>
 
 #include <CGAL/Exact_predicates_inexact_constructions_kernel.h>
@@ -221,4 +222,23 @@ Mesh merge_meshes(const std::vector<Mesh>& meshes, const Traits& traits = Traits
     }
 
     return merged;
+}
+
+// property_map() returns std::optional in released CGAL 6.x but std::pair in 5.x and 6.0-dev.
+// Detect via the return type rather than version number.
+namespace detail {
+    template <typename T, typename = void>
+    struct is_optional_result : std::false_type {};
+    template <typename T>
+    struct is_optional_result<T, std::void_t<decltype(std::declval<T>().value())>> : std::true_type {};
+}
+
+template <typename Index, typename Value, typename SurfaceMesh>
+auto lookup_property_map(SurfaceMesh& mesh, const std::string& name) {
+    auto result = mesh.template property_map<Index, Value>(name);
+    if constexpr (detail::is_optional_result<decltype(result)>::value) {
+        return result.value();
+    } else {
+        return result.first;
+    }
 }

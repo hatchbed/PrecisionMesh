@@ -57,6 +57,7 @@
 
 #include <precision_mesh/mesh_util.h>
 #include <precision_mesh/ply.h>
+#include <precision_mesh/remeshing.h>
 #include <precision_mesh/step_face_util.h>
 #include <precision_mesh/step_projection.h>
 #include <precision_mesh/step_reader.h>
@@ -66,25 +67,6 @@
 #include <precision_mesh/stl.h>
 
 namespace PMP = CGAL::Polygon_mesh_processing;
-
-// property_map() returns std::optional in released CGAL 6.x but std::pair in 5.x and 6.0-dev.
-// Detect via the return type rather than version number.
-namespace {
-    template <typename T, typename = void>
-    struct is_optional_result : std::false_type {};
-    template <typename T>
-    struct is_optional_result<T, std::void_t<decltype(std::declval<T>().value())>> : std::true_type {};
-}
-
-template <typename Index, typename Value, typename SurfaceMesh>
-auto lookup_property_map(SurfaceMesh& mesh, const std::string& name) {
-    auto result = mesh.template property_map<Index, Value>(name);
-    if constexpr (is_optional_result<decltype(result)>::value) {
-        return result.value();
-    } else {
-        return result.first;
-    }
-}
 
 std::unordered_set<std::string> mesh_formats = {".obj", ".off", ".ply", ".stl", ".ts", ".vtp"};
 
@@ -578,99 +560,11 @@ int main(int argc, char **argv) {
         return saveOutput(outputs, meshes, segments, {}, conversion_scale) ? 0 : 1;
     }
 
-    spdlog::info("  splitting long border edges ...");
-    // TODO(malban): replace split_long_edges on border edges with STEP-curve-based splitting.
-    // The current approach uses PMP::split_long_edges which places new vertices by linear
-    // interpolation (midpoint of the 3D chord).  The preferred approach is:
-    //   1. For each STEP edge shared between adjacent sub-face meshes, compute arc-length-uniform
-    //      split points directly on the parametric curve via BRep_Tool::Curve().
-    //   2. Insert those vertices into each adjacent mesh using CGAL::Euler::split_edge followed
-    //      by explicit repositioning (mesh.point(new_v) = curve_point).
-    //   3. Walk each mesh's border halfedges to identify which correspond to a given STEP edge
-    //      by proximity (reusing logic similar to get_border_vertex_projector_map).
-    // Benefits over the current approach:
-    //   - Split vertices land exactly on the STEP curve (no off-surface interpolation error).
-    //   - Both adjacent meshes receive identical split points, guaranteeing topological
-    //     consistency along shared borders without relying on OCCT's tessellation guarantee.
-    size_t border_num_before = 0;
-    size_t border_num_after = 0;
-
-    for (size_t i = 0; i < meshes.size(); i++) {
-        auto& mesh = meshes[i];
-        std::vector<EdgeDescriptor> border_edges;
-        PMP::border_halfedges(faces(mesh), mesh, boost::make_function_output_iterator(
-            HalfEdge2Edge(mesh, border_edges)));
-        border_num_before += border_edges.size();
-        PMP::split_long_edges(border_edges, max_edge_length, mesh);
-        // TODO(malban): project newly split border vertices onto STEP boundary curves.
-        // split_long_edges places midpoints by linear interpolation, leaving them
-        // slightly off the STEP curve.  Snapping them to the wire here (before the
-        // remeshing loop) would give isotropic_remeshing accurate border constraints
-        // from the first iteration, improving the adaptive sizing field and preventing
-        // the interpolation error from being smoothed into adjacent interior faces.
-        // Requires initializing wire_projectors before this loop.
-        border_edges.clear();
-        PMP::border_halfedges(faces(mesh), mesh, boost::make_function_output_iterator(
-            HalfEdge2Edge(mesh, border_edges)));
-
-        border_num_after += border_edges.size();
-    }
-
-    size_t total_faces_2 = 0;
-    for (auto& mesh: meshes) {
-        total_faces_2 += mesh.number_of_faces();
-    }
-    spdlog::info("    border edges: {} -> {}", border_num_before, border_num_after);
-    spdlog::info("    faces: {} -> {}", total_faces_init, total_faces_2);
+    split_border_edges(meshes, max_edge_length);
 
     if (!is_step) {
-        spdlog::info("  splitting long crease edges ...");
-        size_t crease_num_before = 0;
-        size_t crease_num_after = 0;
-        tbb::parallel_for(
-            tbb::blocked_range<size_t>(0, meshes.size()), [&](const tbb::blocked_range<size_t>& r) {
-                size_t num_before = 0;
-                size_t num_after = 0;
-                for (size_t i=r.begin(); i!=r.end(); ++i) {
-                    Mesh& mesh = meshes[i];
-                    Mesh::Property_map<Mesh::Edge_index, bool> crease_features =
-                        mesh.add_property_map<Mesh::Edge_index, bool>("crease", false).first;
-                    PMP::detect_sharp_edges(mesh, crease_angle, crease_features);
-                    std::vector<EdgeDescriptor> crease_edges;
-                    for(const auto& edge: edges(mesh)) {
-                        if (get(crease_features, edge)) {
-                            crease_edges.push_back(edge);
-                        }
-                    }
-                    num_before += crease_edges.size();
-                    PMP::split_long_edges(crease_edges, max_edge_length, mesh);
-                    mesh.remove_property_map(crease_features);
-                    crease_edges.clear();
-
-                    Mesh::Property_map<Mesh::Edge_index, bool> crease_features2 =
-                        mesh.add_property_map<Mesh::Edge_index, bool>("crease", false).first;
-                    PMP::detect_sharp_edges(mesh, crease_angle, crease_features2);
-                    for(const auto& edge: edges(mesh)) {
-                        if (get(crease_features2, edge)) {
-                            crease_edges.push_back(edge);
-                        }
-                    }
-
-                    num_after += crease_edges.size();
-                }
-                std::scoped_lock<std::mutex> lock(mutex);
-                crease_num_before += num_before;
-                crease_num_after += num_after;
-            });
-        size_t total_faces_3 = 0;
-        for (auto& mesh: meshes) {
-            total_faces_3 += mesh.number_of_faces();
-        }
-        spdlog::info("    crease edges: {} -> {}", crease_num_before, crease_num_after);
-        spdlog::info("    faces: {} -> {}", total_faces_2, total_faces_3);
+        split_crease_edges(meshes, crease_angle, max_edge_length);
     }
-
-    double max_remeshing_surface_error = std::min(max_surface_error, min_edge_length * 0.1);
 
     spdlog::info("  adaptive isotropic remeshing ...");
 
@@ -690,66 +584,10 @@ int main(int argc, char **argv) {
         }
     }
 
-    for (int i = 0; i < iterations; i++) {
-        spdlog::info("    iteration {}", i + 1);
-        spdlog::info("      remeshing ...");
-        tbb::parallel_for(
-            tbb::blocked_range<size_t>(0, meshes.size()), [&](const tbb::blocked_range<size_t>& r) {
-                for (size_t m=r.begin(); m!=r.end(); ++m) {
-                    Mesh& mesh = meshes[m];
+    RemeshParams rparams{min_edge_length, max_edge_length, max_surface_error,
+                         iterations, is_step, no_projection};
+    remesh_and_project(meshes, segments, wire_projectors, surface_projectors, border_projectors,
+                       rparams);
 
-                    const std::pair edge_min_max{min_edge_length, max_edge_length};
-                    PMP::Adaptive_sizing_field<Mesh> sizing_field(max_remeshing_surface_error,
-                                                                  edge_min_max, faces(mesh), mesh);
-                    try {
-                        if (is_step) {
-                            PMP::isotropic_remeshing(faces(mesh), sizing_field, mesh,
-                                CGAL::parameters::number_of_iterations(1)
-                                                 .number_of_relaxation_steps(3)
-                                                 .protect_constraints(true));
-                        }
-                        else {
-                            auto crease_map = lookup_property_map<Mesh::Edge_index, bool>(mesh, "crease");
-                            PMP::isotropic_remeshing(faces(mesh), sizing_field, mesh,
-                                CGAL::parameters::number_of_iterations(1)
-                                                 .number_of_relaxation_steps(3)
-                                                 .edge_is_constrained_map(crease_map)
-                                                 .protect_constraints(true));
-                        }
-                    }
-                    catch (const std::out_of_range& ex) {
-                        spdlog::warn("Out of range exception when remeshing segment {}.", m);
-                    }
-                }});
-
-        if (is_step && !no_projection) {
-            spdlog::info("      projecting ...");
-            // Weight increases each iteration (1/N, 1/(N-1), ..., 1/1), reaching
-            // full projection (weight=1) on the final iteration so vertices end up
-            // exactly on the parametric surface.  The gradual schedule is intentional:
-            // aggressively snapping vertices to the surface in early iterations can
-            // produce degenerate or inverted faces before the mesh topology has had
-            // time to adapt, so we blend toward the surface incrementally.
-            tbb::parallel_for(
-                tbb::blocked_range<size_t>(0, meshes.size()), [&](const tbb::blocked_range<size_t>& r) {
-                    for (size_t m=r.begin(); m!=r.end(); ++m) {
-                        double weight = 1.0 / (iterations - i);
-                        project_to_step<Mesh>(segments[m], meshes[m], wire_projectors,
-                                              *surface_projectors[m], *border_projectors[m], weight);
-            }});
-        }
-    }
-
-    size_t total_faces_remeshed = 0;
-    for (auto& mesh: meshes) {
-        total_faces_remeshed += mesh.number_of_faces();
-    }
-    //spdlog::info("    faces: {} -> {}", total_faces_3, total_faces_remeshed);
-
-    // auto merged = merge_meshes(meshes, Point_traits());
-    // spdlog::info("  merged faces: {}",  merged.number_of_faces());
     return saveOutput(outputs, meshes, original_faces, component_map, conversion_scale) ? 0 : 1;
-
-
-    return 0;
 }
