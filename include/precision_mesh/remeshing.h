@@ -31,7 +31,7 @@ void split_crease_edges(std::vector<Mesh>& meshes, double crease_angle, double m
 void remesh_and_project(
     std::vector<Mesh>& meshes,
     const std::vector<TopoDS_Face>& segments,
-    WireProjectorCachePtr<Mesh> wire_projectors,
-    std::vector<std::unique_ptr<StepProjector<Mesh>>>& surface_projectors,
-    std::vector<std::unique_ptr<StepBorderProjector<Mesh>>>& border_projectors,
+    WireProjectorCachePtr wire_projectors,
+    std::vector<std::unique_ptr<StepProjector>>& surface_projectors,
+    std::vector<std::unique_ptr<StepBorderProjector>>& border_projectors,
     const RemeshParams& params);

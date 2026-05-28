@@ -509,7 +509,7 @@ int main(int argc, char **argv) {
     if (is_step) {
 
         if (max_surface_error_from_default) {
-            double max_surface_error_auto = find_surface_error_param<Mesh>(selected_component->shape,
+            double max_surface_error_auto = find_surface_error_param(selected_component->shape,
                                                                            min_edge_length, 10, 
                                                                            conversion_scale);
             max_surface_error = max_surface_error_auto;
@@ -529,7 +529,7 @@ int main(int argc, char **argv) {
 
         spdlog::info("  tessellating ...");
 
-        auto tessellation = tessellate_shape<Mesh>(selected_component->shape, max_surface_error);
+        auto tessellation = tessellate_shape(selected_component->shape, max_surface_error);
         size_t total_faces = 0;
         for (const auto& [mesh, face]: tessellation) {
             meshes.push_back(mesh);
@@ -568,18 +568,18 @@ int main(int argc, char **argv) {
 
     spdlog::info("  adaptive isotropic remeshing ...");
 
-    WireProjectorCachePtr<Mesh> wire_projectors;
-    std::vector<std::unique_ptr<StepProjector<Mesh>>> surface_projectors;
-    std::vector<std::unique_ptr<StepBorderProjector<Mesh>>> border_projectors;
+    WireProjectorCachePtr wire_projectors;
+    std::vector<std::unique_ptr<StepProjector>> surface_projectors;
+    std::vector<std::unique_ptr<StepBorderProjector>> border_projectors;
     if (is_step) {
         spdlog::info("    creating edge projectors ...");
-        wire_projectors = get_edge_vertex_wire_projectors<Mesh>(selected_component->shape);
+        wire_projectors = get_edge_vertex_wire_projectors(selected_component->shape);
 
         if (!no_projection) {
             spdlog::info("    initializing surface projectors ...");
             for (const auto& segment : segments) {
-                surface_projectors.push_back(std::make_unique<StepProjector<Mesh>>(segment));
-                border_projectors.push_back(std::make_unique<StepBorderProjector<Mesh>>(segment));
+                surface_projectors.push_back(std::make_unique<StepProjector>(segment));
+                border_projectors.push_back(std::make_unique<StepBorderProjector>(segment));
             }
         }
     }

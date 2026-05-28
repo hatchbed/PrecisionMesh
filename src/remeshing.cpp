@@ -118,9 +118,9 @@ void split_crease_edges(std::vector<Mesh>& meshes, double crease_angle, double m
 void remesh_and_project(
     std::vector<Mesh>& meshes,
     const std::vector<TopoDS_Face>& segments,
-    WireProjectorCachePtr<Mesh> wire_projectors,
-    std::vector<std::unique_ptr<StepProjector<Mesh>>>& surface_projectors,
-    std::vector<std::unique_ptr<StepBorderProjector<Mesh>>>& border_projectors,
+    WireProjectorCachePtr wire_projectors,
+    std::vector<std::unique_ptr<StepProjector>>& surface_projectors,
+    std::vector<std::unique_ptr<StepBorderProjector>>& border_projectors,
     const RemeshParams& params)
 {
     double max_remeshing_surface_error =
@@ -168,7 +168,7 @@ void remesh_and_project(
                 tbb::blocked_range<size_t>(0, meshes.size()), [&](const tbb::blocked_range<size_t>& r) {
                     for (size_t m = r.begin(); m != r.end(); ++m) {
                         double weight = 1.0 / (params.iterations - i);
-                        project_to_step<Mesh>(segments[m], meshes[m], wire_projectors,
+                        project_to_step(segments[m], meshes[m], wire_projectors,
                                               *surface_projectors[m], *border_projectors[m], weight);
                     }});
         }
