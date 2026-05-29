@@ -1,4 +1,4 @@
-FROM ubuntu:22.04 AS builder
+FROM ubuntu:26.04 AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -10,9 +10,16 @@ RUN apt-get update && \
         file \
         git \
         libboost-dev \
+        libcgal-dev \
         libfontconfig-dev \
         libgmp3-dev \
         libmpfr-dev \
+        libocct-foundation-dev \
+        libocct-modeling-data-dev \
+        libocct-modeling-algorithms-dev \
+        libocct-ocaf-dev \
+        libocct-data-exchange-dev \
+        libocct-visualization-dev \
         libtbb-dev \
         libx11-dev \
         meson \

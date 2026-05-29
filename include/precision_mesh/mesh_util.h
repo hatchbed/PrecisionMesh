@@ -3,6 +3,7 @@
 #include <deque>
 #include <iterator>
 #include <limits>
+#include <string>
 #include <vector>
 
 #include <CGAL/Exact_predicates_inexact_constructions_kernel.h>
@@ -73,12 +74,10 @@ std::vector<std::size_t> find_invalid_polygons_in_polygon_soup(const PointRange&
                                                                const PolygonRange& polygons,
                                                                const Traits& traits = Traits())
 {
-  typedef typename PMP::internal::Polygon_types<PointRange, PolygonRange>::Polygon_3 Polygon_3;
-
   std::vector<std::size_t> invalid;
   const std::size_t ini_polygons_size = polygons.size();
   for(std::size_t polygon_index=0; polygon_index!=ini_polygons_size; ++polygon_index) {
-    const Polygon_3& polygon = polygons[polygon_index];
+    const auto& polygon = polygons[polygon_index];
     const std::size_t N = polygon.size(), last = N-1;
     if (N < 3) {
       invalid.push_back(polygon_index);
@@ -104,10 +103,8 @@ std::vector<std::size_t> find_duplicate_polygons_in_polygon_soup(const PointRang
                                                                  const PolygonRange& polygons,
                                                                  const NamedParameters& np = CGAL::parameters::default_values())
 {
-  typedef typename PMP::internal::GetPolygonGeomTraits<PointRange, PolygonRange, NamedParameters>::type Traits;
-  Traits traits = CGAL::parameters::choose_parameter<Traits>(CGAL::parameters::get_parameter(np, CGAL::internal_np::geom_traits));
-
-  typedef typename PMP::internal::Polygon_types<PointRange, PolygonRange>::P_ID P_ID;
+  PointArray_traits traits;
+  typedef std::size_t P_ID;
 
   std::deque<std::vector<P_ID> > all_duplicate_polygons;
   PMP::internal::collect_duplicate_polygons(points, polygons, std::back_inserter(all_duplicate_polygons), traits, false);
@@ -158,7 +155,7 @@ void remove_indices(std::vector<T>& data, const std::vector<size_t>& to_remove) 
   data = output;
 }
 
-bool is_potentially_non_manifold(Mesh& mesh, Mesh::Vertex_index v1, Mesh::Vertex_index v2) {
+inline bool is_potentially_non_manifold(Mesh& mesh, Mesh::Vertex_index v1, Mesh::Vertex_index v2) {
     // Count halfedges from v1 to v2 and from v2 to v1
     int count_v1_to_v2 = 0;
     int count_v2_to_v1 = 0;
@@ -225,4 +222,23 @@ Mesh merge_meshes(const std::vector<Mesh>& meshes, const Traits& traits = Traits
     }
 
     return merged;
+}
+
+// property_map() returns std::optional in released CGAL 6.x but std::pair in 5.x and 6.0-dev.
+// Detect via the return type rather than version number.
+namespace detail {
+    template <typename T, typename = void>
+    struct is_optional_result : std::false_type {};
+    template <typename T>
+    struct is_optional_result<T, std::void_t<decltype(std::declval<T>().value())>> : std::true_type {};
+}
+
+template <typename Index, typename Value, typename SurfaceMesh>
+auto lookup_property_map(SurfaceMesh& mesh, const std::string& name) {
+    auto result = mesh.template property_map<Index, Value>(name);
+    if constexpr (detail::is_optional_result<decltype(result)>::value) {
+        return result.value();
+    } else {
+        return result.first;
+    }
 }

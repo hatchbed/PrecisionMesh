@@ -57,53 +57,24 @@
 
 #include <precision_mesh/mesh_util.h>
 #include <precision_mesh/ply.h>
-#include <precision_mesh/step_util.h>
+#include <precision_mesh/remeshing.h>
+#include <precision_mesh/step_face_util.h>
+#include <precision_mesh/step_projection.h>
+#include <precision_mesh/step_reader.h>
+#include <precision_mesh/step_subdivision.h>
+#include <precision_mesh/unit_conversion.h>
+#include <precision_mesh/step_tessellation.h>
 #include <precision_mesh/stl.h>
 
 namespace PMP = CGAL::Polygon_mesh_processing;
 
 std::unordered_set<std::string> mesh_formats = {".obj", ".off", ".ply", ".stl", ".ts", ".vtp"};
-std::unordered_set<std::string> output_units = {"mm", "cm", "m", "in", "ft", "yd"};
-std::unordered_map<std::string, float> to_meters = {
-    {"mm", 0.001},
-    {"cm", 0.01},
-    {"m", 1.0},
-    {"in", 0.0254},
-    {"ft", 0.3048},
-    {"yd", 0.9144}
-};
 
-struct Component {
-    Component(TDF_Label label, TDF_Label reference, const std::string& name,
-              const std::string& qualified_name, size_t index, const std::string& reference_name) :
-        label(label), reference(reference), name(name), qualified_name(qualified_name),
-        index(index), reference_name(reference_name) {}
-
-    TDF_Label label;
-    TDF_Label reference;
-    std::string name;
-    std::string qualified_name;
-    int32_t index;
-    std::string reference_name;
-    TopoDS_Shape shape;
-    std::string id;
-    double surface_area=0.0;
-};
-
-std::string getName(const TDF_Label& label) {
-    std::string name = "<unknown>";
-    Handle(TDataStd_Name) name_attribute;
-    if (label.FindAttribute(TDataStd_Name::GetID(), name_attribute)) {
-        TCollection_AsciiString utf8String(name_attribute->Get().ToExtString(), Standard_False);
-        name = utf8String.ToCString();
-    }
-    return name;
-}
-
-void saveOutput(const std::vector<std::string>& outputs, const std::vector<Mesh>& meshes, 
-                const std::vector<TopoDS_Face>& faces, 
-                const std::unordered_map<size_t, int>& component_map, float scale=1) 
+bool saveOutput(const std::vector<std::string>& outputs, const std::vector<Mesh>& meshes,
+                const std::vector<TopoDS_Face>& faces,
+                const std::unordered_map<size_t, int>& component_map, float scale=1)
 {
+    bool ok = true;
     for (const auto& output: outputs) {
 
         std::filesystem::path output_path(output);
@@ -111,105 +82,18 @@ void saveOutput(const std::vector<std::string>& outputs, const std::vector<Mesh>
 
         if (extension == ".ply") {
             spdlog::info("saving mesh to: {}", output);
-            saveComponentsToPly<Point_traits>(output, meshes, faces, component_map, scale);
+            ok = saveComponentsToPly<Point_traits>(output, meshes, faces, component_map, scale) && ok;
         }
         else if (extension == ".stl") {
             spdlog::info("saving mesh to: {}", output);
-            saveComponentsToStl<Point_traits>(output, meshes, scale);
+            ok = saveComponentsToStl<Point_traits>(output, meshes, scale) && ok;
+        }
+        else {
+            spdlog::error("Unsupported output format: {}", extension);
+            ok = false;
         }
     }
-}
-
-gp_Trsf GetTransform(Handle(XCAFDoc_ShapeTool)& assembly, const TDF_Label& label) {
-    auto transformation = assembly->GetLocation(label);
-    TDF_Label parent = label.Father();
-    if (!parent.IsNull()) {
-        auto parentTransformation = GetTransform(assembly, parent);
-        transformation = transformation.Multiplied(parentTransformation);
-    }
-    return transformation;
-}
-
-void exploreAssembly(Handle(XCAFDoc_ShapeTool) &assembly, Component& parent,
-                     std::vector<std::shared_ptr<Component>>& components) {
-    TDF_LabelSequence children;
-    assembly->GetComponents(parent.label, children);
-
-    std::map<std::string, size_t> counts;
-    for (Standard_Integer i = 1; i <= children.Length(); i++) {
-        TDF_Label label = children.Value(i);
-
-        std::string name = getName(label);
-        std::string reference_name;
-
-        size_t index = ++counts[name];
-        std::string qualified_name = parent.qualified_name + "/" + name;
-        if (index > 1) {
-            qualified_name += "_" + std::to_string(index);
-        }
-
-        TDF_Label reference = label;
-        if (assembly->GetReferredShape(label, reference)) {
-            reference_name = getName(reference);
-        }
-
-        auto component = std::make_shared<Component>(label, reference, name, qualified_name,
-                                                     index, reference_name);
-
-        if (XCAFDoc_ShapeTool::IsSimpleShape(reference)) {
-            gp_Trsf transform = GetTransform(assembly, label);
-
-            component->shape = XCAFDoc_ShapeTool::GetShape(reference);
-            if (!component->shape.IsNull()) {
-                component->shape = component->shape.Located(TopLoc_Location(transform));
-                components.push_back(component);
-            }
-        }
-
-        exploreAssembly(assembly, *component, components);
-    }
-}
-
-std::string normalizeUnit(const std::string& unit) {
-    if (unit.empty()) {
-        return "mesh units";
-    }
-
-    auto lower = boost::algorithm::to_lower_copy(unit);
-    if (lower == "millimetre" || lower == "millimetres" || lower == "millimeter" ||
-        lower == "millimeters" ||  lower == "mm") {
-        return "mm";
-    }
-    else if (lower == "centimetre" || lower == "centimeters" || lower == "centimeter" ||
-             lower == "centimeters" || lower == "cm") {
-        return "cm";
-    }
-    else if (lower == "metre" || lower == "metres" || lower == "meter" || lower == "meters" ||
-             lower == "m") {
-        return "m";
-    }
-    else if (lower == "inch" || lower == "inches" || lower == "in") {
-        return "in";
-    }
-    else if (lower == "foot" || lower == "feet" || lower == "ft") {
-        return "ft";
-    }
-    else if (lower == "yard" || lower == "yards" || lower == "yd") {
-        return "yd";
-    }
-
-    return lower;
-}
-
-float getUnitConversionScale(const std::string& from, const std::string& to) {
-    auto from_it = to_meters.find(from);
-    auto to_it = to_meters.find(to);
-
-    if (from_it == to_meters.end() || to_it == to_meters.end()) {
-        return 1.0;
-    }
-
-    return from_it->second / to_it->second;
+    return ok;
 }
 
 int main(int argc, char **argv) {
@@ -218,7 +102,7 @@ int main(int argc, char **argv) {
     argv = app.ensure_utf8(argv);
 
     std::string input;
-    app.add_option("-i,--input", input, "Input file (.obj|.off|.ply|.step|.stl|.ts|.vtp)")
+    app.add_option("-i,--input", input, "Input file (.obj|.off|.p21|.ply|.step|.stl|.stp|.ts|.vtp)")
         ->check(CLI::ExistingFile)
         ->required();
 
@@ -271,8 +155,8 @@ int main(int argc, char **argv) {
 
     double max_boundary_surface_error_percent = std::numeric_limits<double>::quiet_NaN();
     auto max_boundary_surface_error_percent_opt = app.add_option(
-        "--max-boundary-surface-error-percent",
-        "Target maximum STEP boundary surface error when as percent of sqrt of surface area")
+        "--max-boundary-surface-error-percent", max_boundary_surface_error_percent,
+        "Target maximum STEP boundary surface error as percent of sqrt of surface area")
         ->check(CLI::PositiveNumber)
         ->check(CLI::Range(0.0, 100.0));
 
@@ -328,7 +212,7 @@ int main(int argc, char **argv) {
     std::filesystem::path input_path(input);
     std::string extension = boost::algorithm::to_lower_copy(input_path.extension().string());
 
-    bool is_step = extension == ".stp" || extension == ".step";
+    bool is_step = extension == ".stp" || extension == ".step" || extension == ".p21";
 
     spdlog::info("parameters:");
     spdlog::info("  input                    = {}", input);
@@ -371,7 +255,7 @@ int main(int argc, char **argv) {
     }
 
     std::string unit = "mesh_units";
-    if (!output_units.empty()) {
+    if (!output_unit.empty()) {
         unit = output_unit;
     }
 
@@ -489,7 +373,7 @@ int main(int argc, char **argv) {
         }
         else {
             std::string normalized_output_unit = normalizeUnit(output_unit);
-            if (output_units.count(normalized_output_unit) == 0) {
+            if (!isKnownUnit(normalized_output_unit)) {
                 spdlog::error("Output unit {} is not supported.", output_unit);
                 return 1;
             }
@@ -498,7 +382,7 @@ int main(int argc, char **argv) {
         }
 
         if (unit != output_unit) {
-            if (output_units.count(unit) == 0) {
+            if (!isKnownUnit(unit)) {
                 spdlog::error("Unable to convert between input unit: {} and output unit: {}.",
                               unit, output_unit);
                 return 1;
@@ -513,37 +397,7 @@ int main(int argc, char **argv) {
         assembly->GetFreeShapes(labels);
 
         std::vector<std::shared_ptr<Component>> components;
-        std::map<std::string, size_t> counts;
-        for (auto i = 1; i <= labels.Length(); i++) {
-            TDF_Label label = labels.Value(i);
-
-            std::string name = getName(label);
-            std::string reference_name;
-
-            size_t index = ++counts[name];
-            std::string qualified_name = name;
-            if (index > 1) {
-                qualified_name += "_" + std::to_string(index);
-            }
-
-            TDF_Label reference = label;
-            if (assembly->GetReferredShape(label, reference)) {
-                reference_name = getName(reference);
-            }
-
-            auto component = std::make_shared<Component>(label, reference, name, qualified_name, index,
-                                                         reference_name);
-            if (XCAFDoc_ShapeTool::IsSimpleShape(reference)) {
-                gp_Trsf transform = GetTransform(assembly, label);
-                component->shape = XCAFDoc_ShapeTool::GetShape(reference);
-                if (!component->shape.IsNull()) {
-                    component->shape = component->shape.Located(TopLoc_Location(transform));
-                    components.push_back(component);
-                }
-            }
-
-            exploreAssembly(assembly, *component, components);
-        }
+        collectComponents(assembly, labels, "", components);
 
         spdlog::info("  components:");
         std::shared_ptr<Component> largest_component;
@@ -624,7 +478,7 @@ int main(int argc, char **argv) {
             spdlog::info("  max boundary surface error: {:.4f} {} (from %)", max_boundary_surface_error, output_unit);
         }
         else {
-            spdlog::info("  max bounary surface error: {:.4f} {}", max_boundary_surface_error, output_unit);
+            spdlog::info("  max boundary surface error: {:.4f} {}", max_boundary_surface_error, output_unit);
         }
     }
 
@@ -655,7 +509,7 @@ int main(int argc, char **argv) {
     if (is_step) {
 
         if (max_surface_error_from_default) {
-            double max_surface_error_auto = find_surface_error_param<Mesh>(selected_component->shape,
+            double max_surface_error_auto = find_surface_error_param(selected_component->shape,
                                                                            min_edge_length, 10, 
                                                                            conversion_scale);
             max_surface_error = max_surface_error_auto;
@@ -673,17 +527,17 @@ int main(int argc, char **argv) {
                                      max_surface_error);
         }
 
-        spdlog::info("  tessalating ...");
+        spdlog::info("  tessellating ...");
 
-        auto tesselation = tessalate_shape<Mesh>(selected_component->shape, max_surface_error);
+        auto tessellation = tessellate_shape(selected_component->shape, max_surface_error);
         size_t total_faces = 0;
-        for (const auto& [mesh, face]: tesselation) {
+        for (const auto& [mesh, face]: tessellation) {
             meshes.push_back(mesh);
             segments.push_back(face);
             total_faces += mesh.number_of_faces();
         }
 
-        spdlog::info("  tesselated component into {} faces over {} segments.", total_faces, meshes.size());
+        spdlog::info("  tessellated component into {} faces over {} segments.", total_faces, meshes.size());
 
         // Create mapping of subdivided components to the original components prior to subdivision
         if (!face_map.empty()) {
@@ -703,209 +557,37 @@ int main(int argc, char **argv) {
     spdlog::info("    faces: {}", total_faces_init);
 
     if (is_step && raw_step_mesh) {
-        saveOutput(outputs, meshes, segments, {}, conversion_scale);
-        return 0;
+        return saveOutput(outputs, meshes, segments, {}, conversion_scale) ? 0 : 1;
     }
 
-    spdlog::info("  splitting long border edges ...");
-    // TODO(malban): ensure that border splits are consistent on shared edges
-    size_t border_num_before = 0;
-    size_t border_num_after = 0;
-
-    struct Less_xyz_3 {
-        bool operator()(const typename Mesh::Point& p, const typename Mesh::Point& q) const {
-          return std::lexicographical_compare(p.cartesian_begin(), p.cartesian_end(),
-                                              q.cartesian_begin(), q.cartesian_end());
-        }
-    };
-
-    typedef std::map<typename Mesh::Point, typename Mesh::Point, Less_xyz_3> PointMap;
-    PointMap projection_map{Less_xyz_3()};
-
-    for (size_t i = 0; i < meshes.size(); i++) {
-        auto& mesh = meshes[i];
-        std::vector<EdgeDescriptor> border_edges;
-        PMP::border_halfedges(faces(mesh), mesh, boost::make_function_output_iterator(
-            HalfEdge2Edge(mesh, border_edges)));
-        border_num_before += border_edges.size();
-        PMP::split_long_edges(border_edges, max_edge_length, mesh);
-        border_edges.clear();
-        PMP::border_halfedges(faces(mesh), mesh, boost::make_function_output_iterator(
-            HalfEdge2Edge(mesh, border_edges)));
-
-        std::vector<typename Mesh::Point> vertices;
-        for (auto v: mesh.vertices()) {
-            vertices.push_back(mesh.point(v));
-        }
-
-/*
-        if (!no_projection && meshes.size() == segments.size()) {
-            // TODO: reproject border vertices back to STEP border
-            //project_to_step_border<Mesh>(segments[i], mesh);
-        }
-
-        std::vector<typename Mesh::Point> projected;
-        for (auto v: mesh.vertices()) {
-            projected.push_back(mesh.point(v));
-        }
-
-        for (size_t j = 0; j < vertices.size(); j++) {
-            auto it = projection_map.find(vertices[j]);
-            if (it == projection_map.end()) {
-                projection_map[vertices[j]] = projected[j];
-            }
-            else {
-                double dx = it->second.x() - projected[j].x();
-                double dy = it->second.y() - projected[j].y();
-                double dz = it->second.z() - projected[j].z();
-                double dist = std::sqrt(dx * dx + dy * dy + dz * dz);
-                double d1 = get_distance_to_face(segments[i], projected[j].x(), projected[j].y(), projected[j].z());
-
-                if (d1 > 0.001) {
-                    spdlog::error("d1 = {}", d1);
-                }
-
-
-                if (dist > 0.001) {
-                    spdlog::warn("large projection delta: {}", dist);
-
-                    double d2 = get_distance_to_face(segments[i], it->second.x(), it->second.y(), it->second.z());
-
-                    spdlog::warn("d1 = {}, d2 = {}", d1, d2);
-                }
-            }
-        }
-        */
-
-        border_num_after += border_edges.size();
-    }
-
-
-
-    if (is_step && raw_step_mesh) {
-        saveOutput(outputs, meshes, original_faces, component_map, conversion_scale);
-        return 0;
-    }
-
-
-    size_t total_faces_2 = 0;
-    for (auto& mesh: meshes) {
-        total_faces_2 += mesh.number_of_faces();
-    }
-    spdlog::info("    border edges: {} -> {}", border_num_before, border_num_after);
-    spdlog::info("    faces: {} -> {}", total_faces_init, total_faces_2);
+    split_border_edges(meshes, max_edge_length);
 
     if (!is_step) {
-        spdlog::info("  splitting long crease edges ...");
-        size_t crease_num_before = 0;
-        size_t crease_num_after = 0;
-        tbb::parallel_for(
-            tbb::blocked_range<size_t>(0, meshes.size()), [&](const tbb::blocked_range<size_t>& r) {
-                size_t num_before = 0;
-                size_t num_after = 0;
-                for (size_t i=r.begin(); i!=r.end(); ++i) {
-                    Mesh& mesh = meshes[i];
-                    Mesh::Property_map<Mesh::Edge_index, bool> crease_features =
-                        mesh.add_property_map<Mesh::Edge_index, bool>("crease", false).first;
-                    PMP::detect_sharp_edges(mesh, crease_angle, crease_features);
-                    std::vector<EdgeDescriptor> crease_edges;
-                    for(const auto& edge: edges(mesh)) {
-                        if (get(crease_features, edge)) {
-                            crease_edges.push_back(edge);
-                        }
-                    }
-                    num_before += crease_edges.size();
-                    PMP::split_long_edges(crease_edges, max_edge_length, mesh);
-                    mesh.remove_property_map(crease_features);
-                    crease_edges.clear();
-
-                    Mesh::Property_map<Mesh::Edge_index, bool> crease_features2 =
-                        mesh.add_property_map<Mesh::Edge_index, bool>("crease", false).first;
-                    PMP::detect_sharp_edges(mesh, crease_angle, crease_features2);
-                    for(const auto& edge: edges(mesh)) {
-                        if (get(crease_features2, edge)) {
-                            crease_edges.push_back(edge);
-                        }
-                    }
-
-                    num_after += crease_edges.size();
-                }
-                std::scoped_lock<std::mutex> lock(mutex);
-                crease_num_before += num_before;
-                crease_num_after += num_after;
-            });
-        size_t total_faces_3 = 0;
-        for (auto& mesh: meshes) {
-            total_faces_3 += mesh.number_of_faces();
-        }
-        spdlog::info("    crease edges: {} -> {}", crease_num_before, crease_num_after);
-        spdlog::info("    faces: {} -> {}", total_faces_2, total_faces_3);
+        split_crease_edges(meshes, crease_angle, max_edge_length);
     }
-
-    double max_remeshing_surface_error = std::min(max_surface_error, min_edge_length * 0.1);
 
     spdlog::info("  adaptive isotropic remeshing ...");
 
-    WireProjectorCachePtr<Mesh> wire_projectors;
+    WireProjectorCachePtr wire_projectors;
+    std::vector<std::unique_ptr<StepProjector>> surface_projectors;
+    std::vector<std::unique_ptr<StepBorderProjector>> border_projectors;
     if (is_step) {
         spdlog::info("    creating edge projectors ...");
-        wire_projectors = get_edge_vertex_wire_projectors<Mesh>(selected_component->shape);
-    }
+        wire_projectors = get_edge_vertex_wire_projectors(selected_component->shape);
 
-    for (int i = 0; i < iterations; i++) {
-        spdlog::info("    iteration {}", i + 1);
-        spdlog::info("      remeshing ...");
-        tbb::parallel_for(
-            tbb::blocked_range<size_t>(0, meshes.size()), [&](const tbb::blocked_range<size_t>& r) {
-                for (size_t m=r.begin(); m!=r.end(); ++m) {
-                    Mesh& mesh = meshes[m];
-
-                    const std::pair edge_min_max{min_edge_length, max_edge_length};
-                    PMP::Adaptive_sizing_field<Mesh> sizing_field(max_remeshing_surface_error,
-                                                                  edge_min_max, faces(mesh), mesh);
-                    auto crease_map = mesh.property_map<Mesh::Edge_index, bool>("crease").first;
-
-                    try {
-                        if (is_step) {
-                            PMP::isotropic_remeshing(faces(mesh), sizing_field, mesh,
-                                CGAL::parameters::number_of_iterations(1)
-                                                 .number_of_relaxation_steps(3)
-                                                 .protect_constraints(true));
-                        }
-                        else {
-                            PMP::isotropic_remeshing(faces(mesh), sizing_field, mesh,
-                                CGAL::parameters::number_of_iterations(1)
-                                                 .number_of_relaxation_steps(3)
-                                                 .edge_is_constrained_map(crease_map)
-                                                 .protect_constraints(true));
-                        }
-                    }
-                    catch (const std::out_of_range& ex) {
-                        spdlog::warn("Out of range exception when remeshing segment {}.", m);
-                    }
-                }});
-
-        if (is_step) {
-            spdlog::info("      projecting ...");
-            tbb::parallel_for(
-                tbb::blocked_range<size_t>(0, meshes.size()), [&](const tbb::blocked_range<size_t>& r) {
-                    for (size_t m=r.begin(); m!=r.end(); ++m) {
-                        double weight = 1.0 / (iterations - i);
-                        project_to_step<Mesh>(segments[m], meshes[m], wire_projectors, weight);
-            }});
+        if (!no_projection) {
+            spdlog::info("    initializing surface projectors ...");
+            for (const auto& segment : segments) {
+                surface_projectors.push_back(std::make_unique<StepProjector>(segment));
+                border_projectors.push_back(std::make_unique<StepBorderProjector>(segment));
+            }
         }
     }
 
-    size_t total_faces_remeshed = 0;
-    for (auto& mesh: meshes) {
-        total_faces_remeshed += mesh.number_of_faces();
-    }
-    //spdlog::info("    faces: {} -> {}", total_faces_3, total_faces_remeshed);
+    RemeshParams rparams{min_edge_length, max_edge_length, max_surface_error,
+                         iterations, is_step, no_projection};
+    remesh_and_project(meshes, segments, wire_projectors, surface_projectors, border_projectors,
+                       rparams);
 
-    // auto merged = merge_meshes(meshes, Point_traits());
-    // spdlog::info("  merged faces: {}",  merged.number_of_faces());
-    saveOutput(outputs, meshes, original_faces, component_map, conversion_scale);
-
-
-    return 0;
+    return saveOutput(outputs, meshes, original_faces, component_map, conversion_scale) ? 0 : 1;
 }

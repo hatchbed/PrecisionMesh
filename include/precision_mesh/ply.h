@@ -8,7 +8,7 @@
 #include <TopoDS_Face.hxx>
 
 #include <precision_mesh/mesh_util.h>
-#include <precision_mesh/step_util.h>
+#include <precision_mesh/step_face_util.h>
 
 template <typename Traits>
 bool saveComponentsToPly(const std::string& path, const std::vector<Mesh>& components, 
@@ -68,7 +68,7 @@ bool saveComponentsToPly(const std::string& path, const std::vector<Mesh>& compo
         }
     }
 
-    printf("writing metadata for %zu faces ...\n", step_faces.size());
+    spdlog::info("writing metadata for {} faces ...", step_faces.size());
     for (size_t i = 0; i < step_faces.size(); i++) {
         component_types[i] = get_face_type(step_faces[i]);
         component_areas[i] = get_face_area(step_faces[i]);
@@ -76,8 +76,10 @@ bool saveComponentsToPly(const std::string& path, const std::vector<Mesh>& compo
     }
 
     std::filebuf fb;
-    //fb.open(path, std::ios::out | std::ios::binary);
-    fb.open(path, std::ios::out);
+    if (!fb.open(path, std::ios::out)) {
+        spdlog::error("Failed to open {} for writing.", path);
+        return false;
+    }
     std::ostream output_stream(&fb);
 
     tinyply::PlyFile ply_file;
