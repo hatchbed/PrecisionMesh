@@ -341,3 +341,115 @@ double get_distance_to_face(const TopoDS_Face& face, double x, double y, double 
     spdlog::error("Failed to calculate distance.");
     return -1;
 }
+
+TessellationValidation validate_tessellation(const std::vector<Mesh>& meshes,
+                                             const std::vector<TopoDS_Face>& segments,
+                                             double tolerance, int samples_per_tri)
+{
+    auto dist_to = [](BRepExtrema_DistShapeShape& ext, const Mesh::Point& p) -> double {
+        TopoDS_Vertex v = BRepBuilderAPI_MakeVertex(gp_Pnt(p.x(), p.y(), p.z()));
+        ext.LoadS2(v);
+        ext.Perform();
+        return (ext.IsDone() && ext.NbSolution() > 0) ? ext.Value() : -1.0;
+    };
+
+    const size_t n = std::min(meshes.size(), segments.size());
+
+    // Per-segment partials (one slot each → no races); mean_surface_error holds the sum.
+    std::vector<TessellationValidation> partials(n);
+
+    // Each segment is independent and builds its own BRepExtrema instances (OCCT is safe
+    // per-instance), so segments validate in parallel — same pattern as remesh_and_project.
+    tbb::parallel_for(tbb::blocked_range<size_t>(0, n), [&](const tbb::blocked_range<size_t>& rng) {
+        for (size_t m = rng.begin(); m != rng.end(); ++m) {
+            const Mesh& mesh = meshes[m];
+            const TopoDS_Face& face = segments[m];
+            TessellationValidation& p = partials[m];
+            double err_sum = 0.0;
+
+            BRep_Builder builder;
+            TopoDS_Compound edge_comp;
+            builder.MakeCompound(edge_comp);
+            for (TopExp_Explorer ee(face, TopAbs_EDGE); ee.More(); ee.Next())
+                builder.Add(edge_comp, ee.Current());
+            BRepExtrema_DistShapeShape edge_ext;
+            edge_ext.LoadS1(edge_comp);
+            BRepExtrema_DistShapeShape face_ext;
+            face_ext.LoadS1(face);
+
+            for (auto v : mesh.vertices()) {
+                const auto& pt = mesh.point(v);
+                if (mesh.is_border(v)) {
+                    p.border_verts++;
+                    double d = dist_to(edge_ext, pt);
+                    if (d >= 0) {
+                        p.max_border_edge_dist = std::max(p.max_border_edge_dist, d);
+                        if (d > tolerance) p.misclassified_border++;
+                    }
+                } else {
+                    p.interior_verts++;
+                    double d = dist_to(face_ext, pt);
+                    if (d >= 0) {
+                        p.max_interior_face_dist = std::max(p.max_interior_face_dist, d);
+                        if (d > tolerance) p.misclassified_interior++;
+                    }
+                }
+            }
+
+            // Surface error: sample triangle interiors (centroid, + edge midpoints) and
+            // measure to the BREP face — captures chord deviation between vertices.
+            for (auto f : mesh.faces()) {
+                p.total_tris++;
+                auto h0 = mesh.halfedge(f);
+                auto h1 = mesh.next(h0);
+                auto h2 = mesh.next(h1);
+                const auto& a = mesh.point(mesh.source(h0));
+                const auto& b = mesh.point(mesh.source(h1));
+                const auto& c = mesh.point(mesh.source(h2));
+
+                std::vector<Mesh::Point> samples;
+                samples.emplace_back((a.x()+b.x()+c.x())/3.0, (a.y()+b.y()+c.y())/3.0, (a.z()+b.z()+c.z())/3.0);
+                if (samples_per_tri >= 4) {
+                    samples.emplace_back((a.x()+b.x())/2.0, (a.y()+b.y())/2.0, (a.z()+b.z())/2.0);
+                    samples.emplace_back((b.x()+c.x())/2.0, (b.y()+c.y())/2.0, (b.z()+c.z())/2.0);
+                    samples.emplace_back((c.x()+a.x())/2.0, (c.y()+a.y())/2.0, (c.z()+a.z())/2.0);
+                }
+                for (const auto& s : samples) {
+                    double d = dist_to(face_ext, s);
+                    if (d >= 0) {
+                        p.max_surface_error = std::max(p.max_surface_error, d);
+                        err_sum += d;
+                        p.surface_samples++;
+                    }
+                }
+            }
+            p.mean_surface_error = err_sum;  // sum for now; combined below
+        }
+    });
+
+    // Reduce per-segment partials.
+    TessellationValidation r;
+    r.segments = n;
+    double err_sum = 0.0;
+    for (const auto& p : partials) {
+        r.total_tris            += p.total_tris;
+        r.border_verts          += p.border_verts;
+        r.interior_verts        += p.interior_verts;
+        r.misclassified_border  += p.misclassified_border;
+        r.misclassified_interior+= p.misclassified_interior;
+        r.surface_samples       += p.surface_samples;
+        r.max_border_edge_dist   = std::max(r.max_border_edge_dist, p.max_border_edge_dist);
+        r.max_interior_face_dist = std::max(r.max_interior_face_dist, p.max_interior_face_dist);
+        r.max_surface_error      = std::max(r.max_surface_error, p.max_surface_error);
+        err_sum += p.mean_surface_error;  // holds this segment's sum
+    }
+    r.mean_surface_error = r.surface_samples ? err_sum / r.surface_samples : 0.0;
+
+    // Watertightness: merge all segment meshes by position; any remaining border edge is a
+    // crack (or a genuine open boundary of a sheet body).
+    Mesh merged = merge_meshes<Point_traits>(meshes);
+    for (auto e : merged.edges())
+        if (merged.is_border(e)) r.open_boundary_edges++;
+
+    return r;
+}

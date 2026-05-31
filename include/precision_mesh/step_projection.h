@@ -66,3 +66,30 @@ void project_to_step(const TopoDS_Face& face, Mesh& mesh,
 
 // Returns the distance from point (x,y,z) to the nearest point on face, or -1 on failure.
 double get_distance_to_face(const TopoDS_Face& face, double x, double y, double z);
+
+// Result of validate_tessellation (all distances in model units).
+struct TessellationValidation {
+    size_t segments        = 0;
+    size_t total_tris      = 0;
+    size_t border_verts    = 0;   // mesh-border vertices (edge-origin)
+    size_t interior_verts  = 0;   // mesh-interior vertices (surface-origin)
+    double max_border_edge_dist    = 0.0;  // worst border vertex → nearest STEP edge
+    double max_interior_face_dist  = 0.0;  // worst interior vertex → its STEP face
+    size_t misclassified_border    = 0;    // border verts farther than tol from any edge
+    size_t misclassified_interior  = 0;    // interior verts farther than tol from face
+    double max_surface_error  = 0.0;  // worst triangle-interior sample → BREP face
+    double mean_surface_error = 0.0;  // mean over all samples
+    size_t surface_samples    = 0;
+    size_t open_boundary_edges = 0;   // border edges of the merged mesh (cracks / true boundary)
+};
+
+// Validate the tessellation against the BREP: per vertex, check that border vertices lie
+// on a STEP edge and interior vertices on the STEP face (invariants 2 & 3); sample each
+// triangle's interior (centroid; + edge midpoints if samples_per_tri >= 4) and measure the
+// surface error to the BREP face; and count open boundary edges of the merged mesh
+// (watertightness).  Intended as an opt-in validation pass — BRep distance queries make it
+// slow on large meshes.
+TessellationValidation validate_tessellation(const std::vector<Mesh>& meshes,
+                                             const std::vector<TopoDS_Face>& segments,
+                                             double tolerance,
+                                             int samples_per_tri = 4);

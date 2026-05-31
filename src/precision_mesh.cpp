@@ -183,6 +183,11 @@ int main(int argc, char **argv) {
     bool raw_step_mesh = false;
     app.add_flag("-r,--raw-step-mesh",  raw_step_mesh, "Generate raw mesh from STEP component without remeshing.");
 
+    bool validate = false;
+    app.add_flag("--validate", validate,
+                 "Validate the final tessellation against the BREP (vertex placement, "
+                 "surface error, watertightness).  Slow; for diagnostics.");
+
     bool no_tess_repair = false;
     app.add_flag("--no-tess-repair", no_tess_repair,
                  "Disable the inverted/holed/dropped-corner tessellation repair (diagnostic).");
@@ -695,6 +700,26 @@ int main(int argc, char **argv) {
                    "Final Result", max_surface_error);
     if (viewer_ptr) viewer_ptr->notify_done();
 #endif
+
+    if (validate && is_step) {
+        spdlog::info("validating tessellation (this may be slow) ...");
+        double vtol = std::max(min_edge_length * 0.1, 1e-9);
+        auto vr = validate_tessellation(meshes, segments, vtol);
+        spdlog::info("  validation ({} segments, {} triangles, tol={:.4g} {}):",
+                     vr.segments, vr.total_tris, vtol * conversion_scale, output_unit);
+        spdlog::info("    vertices: {} border, {} interior", vr.border_verts, vr.interior_verts);
+        spdlog::info("    border vertex -> STEP edge:   max={:.4g} {} ({} beyond tol)",
+                     vr.max_border_edge_dist * conversion_scale, output_unit, vr.misclassified_border);
+        spdlog::info("    interior vertex -> STEP face: max={:.4g} {} ({} beyond tol)",
+                     vr.max_interior_face_dist * conversion_scale, output_unit, vr.misclassified_interior);
+        spdlog::info("    surface error (tri samples):  max={:.4g} mean={:.4g} {} ({} samples)",
+                     vr.max_surface_error * conversion_scale, vr.mean_surface_error * conversion_scale,
+                     output_unit, vr.surface_samples);
+        if (vr.open_boundary_edges > 0)
+            spdlog::warn("    watertight: {} open boundary edges in merged mesh", vr.open_boundary_edges);
+        else
+            spdlog::info("    watertight: 0 open boundary edges");
+    }
 
     return saveOutput(outputs, meshes, original_faces, component_map, conversion_scale) ? 0 : 1;
 
