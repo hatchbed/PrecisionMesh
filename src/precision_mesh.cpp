@@ -66,9 +66,66 @@
 #include <precision_mesh/step_tessellation.h>
 #include <precision_mesh/stl.h>
 
+#ifdef PRECISION_MESH_HAS_VIEWER
+#include <precision_mesh/viewer.h>
+#endif
+
 namespace PMP = CGAL::Polygon_mesh_processing;
 
 std::unordered_set<std::string> mesh_formats = {".obj", ".off", ".ply", ".stl", ".ts", ".vtp"};
+
+#ifdef PRECISION_MESH_HAS_VIEWER
+static void push_to_viewer(Viewer* viewer,
+                            const std::vector<Mesh>& meshes,
+                            const std::vector<TopoDS_Face>& segments,
+                            const std::vector<TopoDS_Face>& original_faces,
+                            const std::unordered_map<size_t, int>& component_map,
+                            bool is_step,
+                            const std::string& label,
+                            double wire_deflection)
+{
+    if (!viewer) return;
+
+    // Count how many tessellation segments belong to each original face
+    std::unordered_map<int, int> subdiv_counts;
+    for (size_t i = 0; i < meshes.size(); i++) {
+        int orig = component_map.count(i) ? component_map.at(i) : (int)i;
+        subdiv_counts[orig]++;
+    }
+
+    // Pre-sample original face wires once per unique original face index
+    std::unordered_map<int, std::vector<float>> orig_wire_cache;
+    if (is_step) {
+        for (size_t i = 0; i < meshes.size(); i++) {
+            int orig_idx = component_map.count(i) ? component_map.at(i) : (int)i;
+            if (!orig_wire_cache.count(orig_idx) && orig_idx < (int)original_faces.size())
+                orig_wire_cache[orig_idx] = sample_face_wire(original_faces[orig_idx], wire_deflection);
+        }
+    }
+
+    std::vector<ViewerSegment> vsegs;
+    vsegs.reserve(meshes.size());
+    for (size_t i = 0; i < meshes.size(); i++) {
+        int orig_idx = component_map.count(i) ? component_map.at(i) : (int)i;
+        int ft       = 0;
+        float area   = 0.0f;
+        std::string desc = "Mesh";
+        std::vector<float> subseg_wire, orig_face_wire;
+        if (is_step && i < segments.size()) {
+            ft   = get_face_type(segments[i]);
+            area = get_face_area(segments[i]);
+            desc = get_face_description(segments[i]);
+            subseg_wire = sample_face_wire(segments[i], wire_deflection);
+            if (orig_wire_cache.count(orig_idx))
+                orig_face_wire = orig_wire_cache[orig_idx];
+        }
+        int sdivs = subdiv_counts.count(orig_idx) ? subdiv_counts[orig_idx] : 1;
+        vsegs.push_back({&meshes[i], ft, (int)i, orig_idx, sdivs, area, desc,
+                         std::move(subseg_wire), std::move(orig_face_wire)});
+    }
+    viewer->update(vsegs, label);
+}
+#endif
 
 bool saveOutput(const std::vector<std::string>& outputs, const std::vector<Mesh>& meshes,
                 const std::vector<TopoDS_Face>& faces,
@@ -126,11 +183,20 @@ int main(int argc, char **argv) {
     bool raw_step_mesh = false;
     app.add_flag("-r,--raw-step-mesh",  raw_step_mesh, "Generate raw mesh from STEP component without remeshing.");
 
-    int iterations = 0;
-    app.add_option("--iterations", iterations, "Iterations")->check(CLI::PositiveNumber);
+#ifdef PRECISION_MESH_HAS_VIEWER
+    bool enable_display = false;
+    app.add_flag("--display", enable_display, "Open interactive 3D viewer during processing.");
+#endif
+
+    int iterations = -1;
+    app.add_option("--iterations", iterations, "Iterations (0 = skip remeshing)")->check(CLI::NonNegativeNumber);
 
     bool no_subdivision = false;
     app.add_flag("--no-subdivision",  no_subdivision, "Skip STEP shape subdivision.");
+
+    bool boundary_mesh_mode = false;
+    app.add_flag("--boundary-mesh", boundary_mesh_mode,
+                 "Visualise raw sub-face boundaries (fan-polygon meshes, no BRepMesh).");
 
     bool no_projection = false;
     app.add_flag("--no-projection",  no_projection, "Skip vertex reprojection.");
@@ -229,12 +295,12 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (iterations > 0) {
-        spdlog::info("  iterations               = {}", iterations);
-    }
-    else {
+    if (iterations < 0) {
         iterations = 10;
         spdlog::info("  iterations               = {} (default)", iterations);
+    }
+    else {
+        spdlog::info("  iterations               = {}", iterations);
     }
 
     if (std::isfinite(crease_angle)) {
@@ -331,6 +397,12 @@ int main(int argc, char **argv) {
         spdlog::error("Output units only valid for a STEP input.");
         return 1;
     }
+
+#ifdef PRECISION_MESH_HAS_VIEWER
+    Viewer* viewer_ptr = nullptr;
+#endif
+
+    auto do_pipeline = [&]() -> int {
 
     //tbb::global_control global_limit(tbb::global_control::max_allowed_parallelism, 1);
 
@@ -529,7 +601,9 @@ int main(int argc, char **argv) {
 
         spdlog::info("  tessellating ...");
 
-        auto tessellation = tessellate_shape(selected_component->shape, max_surface_error);
+        auto tessellation = boundary_mesh_mode
+            ? boundary_meshes(selected_component->shape)
+            : tessellate_shape(selected_component->shape, max_surface_error);
         size_t total_faces = 0;
         for (const auto& [mesh, face]: tessellation) {
             meshes.push_back(mesh);
@@ -538,6 +612,10 @@ int main(int argc, char **argv) {
         }
 
         spdlog::info("  tessellated component into {} faces over {} segments.", total_faces, meshes.size());
+#ifdef PRECISION_MESH_HAS_VIEWER
+        push_to_viewer(viewer_ptr, meshes, segments, original_faces, component_map, is_step,
+                       "After Tessellation", max_surface_error);
+#endif
 
         // Create mapping of subdivided components to the original components prior to subdivision
         if (!face_map.empty()) {
@@ -560,34 +638,77 @@ int main(int argc, char **argv) {
         return saveOutput(outputs, meshes, segments, {}, conversion_scale) ? 0 : 1;
     }
 
-    split_border_edges(meshes, max_edge_length);
+    if (iterations > 0) {
+        split_border_edges(meshes, max_edge_length);
 
-    if (!is_step) {
-        split_crease_edges(meshes, crease_angle, max_edge_length);
-    }
+        if (!is_step) {
+            split_crease_edges(meshes, crease_angle, max_edge_length);
+        }
 
-    spdlog::info("  adaptive isotropic remeshing ...");
+#ifdef PRECISION_MESH_HAS_VIEWER
+        push_to_viewer(viewer_ptr, meshes, segments, original_faces, component_map, is_step,
+                       "After Border Splitting", max_surface_error);
+#endif
 
-    WireProjectorCachePtr wire_projectors;
-    std::vector<std::unique_ptr<StepProjector>> surface_projectors;
-    std::vector<std::unique_ptr<StepBorderProjector>> border_projectors;
-    if (is_step) {
-        spdlog::info("    creating edge projectors ...");
-        wire_projectors = get_edge_vertex_wire_projectors(selected_component->shape);
+        spdlog::info("  adaptive isotropic remeshing ...");
 
-        if (!no_projection) {
-            spdlog::info("    initializing surface projectors ...");
-            for (const auto& segment : segments) {
-                surface_projectors.push_back(std::make_unique<StepProjector>(segment));
-                border_projectors.push_back(std::make_unique<StepBorderProjector>(segment));
+        WireProjectorCachePtr wire_projectors;
+        std::vector<std::unique_ptr<StepProjector>> surface_projectors;
+        std::vector<std::unique_ptr<StepBorderProjector>> border_projectors;
+        if (is_step) {
+            spdlog::info("    creating edge projectors ...");
+            wire_projectors = get_edge_vertex_wire_projectors(selected_component->shape);
+
+            if (!no_projection) {
+                spdlog::info("    initializing surface projectors ...");
+                for (const auto& segment : segments) {
+                    surface_projectors.push_back(std::make_unique<StepProjector>(segment));
+                    border_projectors.push_back(std::make_unique<StepBorderProjector>(segment));
+                }
             }
         }
+
+        RemeshParams rparams{min_edge_length, max_edge_length, max_surface_error,
+                             iterations, is_step, no_projection};
+#ifdef PRECISION_MESH_HAS_VIEWER
+        if (viewer_ptr) {
+            rparams.on_iteration_done = [&](int iter) {
+                push_to_viewer(viewer_ptr, meshes, segments, original_faces, component_map, is_step,
+                               "Iteration " + std::to_string(iter) +
+                               "/" + std::to_string(iterations),
+                               max_surface_error);
+            };
+        }
+#endif
+        remesh_and_project(meshes, segments, wire_projectors, surface_projectors, border_projectors,
+                           rparams);
+    } else {
+        spdlog::info("  skipping remeshing (--iterations 0).");
     }
 
-    RemeshParams rparams{min_edge_length, max_edge_length, max_surface_error,
-                         iterations, is_step, no_projection};
-    remesh_and_project(meshes, segments, wire_projectors, surface_projectors, border_projectors,
-                       rparams);
+#ifdef PRECISION_MESH_HAS_VIEWER
+    push_to_viewer(viewer_ptr, meshes, segments, original_faces, component_map, is_step,
+                   "Final Result", max_surface_error);
+    if (viewer_ptr) viewer_ptr->notify_done();
+#endif
 
     return saveOutput(outputs, meshes, original_faces, component_map, conversion_scale) ? 0 : 1;
+
+    }; // end do_pipeline lambda
+
+#ifdef PRECISION_MESH_HAS_VIEWER
+    if (enable_display) {
+        Viewer viewer_obj(1280, 800, "PrecisionMesh");
+        viewer_ptr = &viewer_obj;
+        int result = 0;
+        std::thread worker([&] {
+            result = do_pipeline();
+            // notify_done is called inside do_pipeline when viewer_ptr is set
+        });
+        viewer_obj.run_event_loop();
+        worker.join();
+        return result;
+    }
+#endif
+    return do_pipeline();
 }

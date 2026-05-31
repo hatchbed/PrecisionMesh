@@ -103,6 +103,29 @@ spdlog_dep = dependency('spdlog', fallback: ['spdlog', 'spdlog_dep'])
 tinyply_proj = subproject('tinyply')
 tinyply_dep = tinyply_proj.get_variable('tinyply_dep')
 
+# ── Optional viewer (GLFW + GLEW + ImGui + OpenGL) ────────────────────────────
+viewer_option   = get_option('viewer')
+glfw_dep        = dependency('glfw3', version: '>=3.3', required: viewer_option,
+                             fallback: ['glfw', 'glfw_dep'])
+glew_dep        = dependency('glew',  version: '>=2.1', required: viewer_option,
+                             fallback: ['glew', 'glew_dep'])
+gl_dep          = dependency('gl', required: viewer_option)
+viewer_sources  = []
+viewer_deps     = []
+viewer_cpp_args = []
+
+if glfw_dep.found() and glew_dep.found() and gl_dep.found()
+  imgui_proj = subproject('imgui', default_options: ['glfw=enabled', 'opengl=enabled',
+                                                      'vulkan=disabled', 'dx9=disabled',
+                                                      'dx10=disabled', 'dx11=disabled',
+                                                      'dx12=disabled', 'metal=disabled'])
+  imgui_dep       = imgui_proj.get_variable('imgui_dep')
+  viewer_sources  = ['src/viewer.cpp']
+  viewer_deps     = [glfw_dep, glew_dep, gl_dep, imgui_dep]
+  viewer_cpp_args = ['-DPRECISION_MESH_HAS_VIEWER']
+endif
+# ──────────────────────────────────────────────────────────────────────────────
+
 include_dir = include_directories('include')
 
 precision_mesh = executable('precision_mesh',
@@ -114,9 +137,10 @@ precision_mesh = executable('precision_mesh',
   'src/step_subdivision.cpp',
   'src/step_tessellation.cpp',
   'src/unit_conversion.cpp',
-  cpp_args : ['-DCGAL_DISABLE_ROUNDING_MATH_CHECK'],
+  viewer_sources,
+  cpp_args : ['-DCGAL_DISABLE_ROUNDING_MATH_CHECK'] + viewer_cpp_args,
   dependencies : [boost_dep, cgal_dep, cli11_dep, eigen_dep, gmp_dep, fontconfig_dep, freetype_dep,
-                  mpfr_dep, occt_dep, spdlog_dep, tbb_dep, tinyply_dep],
+                  mpfr_dep, occt_dep, spdlog_dep, tbb_dep, tinyply_dep] + viewer_deps,
   include_directories: [include_dir],
   install : true)
 
