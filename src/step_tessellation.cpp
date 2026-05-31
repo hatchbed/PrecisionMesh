@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <limits>
 #include <list>
 #include <unordered_map>
 #include <unordered_set>
@@ -275,6 +276,22 @@ static std::vector<std::array<size_t,3>> cr_retriangulate_face(
                 vmin = std::min(vmin, p.Y()); vmax = std::max(vmax, p.Y());
             }
             double du = umax - umin, dvv = vmax - vmin;
+            // Reject seam-straddling sub-faces: across a periodic seam the UV nodes split to
+            // both ends of the period, so the UV box spans ~a full period and a UV-domain
+            // triangulation maps to overlapping/crossed triangles in 3D.  A non-straddling
+            // sub-face spans only its (sub-)sector, well under half a period.
+            Handle(Geom_Surface) psurf = BRep_Tool::Surface(face);
+            bool seam_straddle = false;
+            if (!psurf.IsNull()) {
+                if (psurf->IsUPeriodic() && du > 0.5 * psurf->UPeriod()) seam_straddle = true;
+                if (psurf->IsVPeriodic() && dvv > 0.5 * psurf->VPeriod()) seam_straddle = true;
+            }
+            if (seam_straddle) {
+                spdlog::debug("    seg {} retri bail: seam-straddling sub-face (UV span {:.4g} x {:.4g})",
+                              seg_idx, du, dvv);
+                reason = CrBail::SelfIntersect;
+                return {};
+            }
             if (du > 1e-300 && dvv > 1e-300) {
                 for (auto& kv : uv_of) {
                     kv.second.first  = (kv.second.first  - umin) / du;
@@ -365,7 +382,7 @@ std::vector<std::pair<Mesh, TopoDS_Face>> tessellate_shape(const TopoDS_Shape& s
 
     // Inverted-face repair stats (global picture).
     size_t rep_flagged = 0, rep_fixed = 0;
-    size_t rep_bail_segs = 0, rep_bail_planar = 0, rep_bail_selfint = 0;
+    size_t rep_bail_segs = 0, rep_bail_planar = 0, rep_bail_selfint = 0, rep_bail_incomplete = 0;
 
     for (TopExp_Explorer iter(shape, TopAbs_FACE); iter.More(); iter.Next()) {
         Mesh mesh;
@@ -438,12 +455,14 @@ std::vector<std::pair<Mesh, TopoDS_Face>> tessellate_shape(const TopoDS_Shape& s
                 for (const auto& kv : vertex_map)
                     uv_of[kv.second] = triangulation->UVNode(kv.first);
 
-            int nfold = 0;
-            for (const auto& t : face_buffer) {
-                std::array<double,3> tn = cr_tri_normal(vertex_buffer, t[0], t[1], t[2]);
-                std::array<double,3> ref = n_out;  // fallback
+            // A triangle is folded if its winding opposes the local surface normal (UV-node
+            // centroid → surface D1), falling back to the face-center normal when UV is
+            // unavailable or a vertex has no UV (e.g. a re-created corner).
+            auto is_folded = [&](size_t a, size_t b, size_t c) -> bool {
+                std::array<double,3> tn = cr_tri_normal(vertex_buffer, a, b, c);
+                std::array<double,3> ref = n_out;
                 if (has_uv) {
-                    auto i0 = uv_of.find(t[0]), i1 = uv_of.find(t[1]), i2 = uv_of.find(t[2]);
+                    auto i0 = uv_of.find(a), i1 = uv_of.find(b), i2 = uv_of.find(c);
                     if (i0 != uv_of.end() && i1 != uv_of.end() && i2 != uv_of.end()) {
                         double u = (i0->second.X()+i1->second.X()+i2->second.X())/3.0;
                         double v = (i0->second.Y()+i1->second.Y()+i2->second.Y())/3.0;
@@ -453,8 +472,12 @@ std::vector<std::pair<Mesh, TopoDS_Face>> tessellate_shape(const TopoDS_Shape& s
                         ref = {nn.X()*orient_sign, nn.Y()*orient_sign, nn.Z()*orient_sign};
                     }
                 }
-                if (tn[0]*ref[0] + tn[1]*ref[1] + tn[2]*ref[2] < 0.0) nfold++;
-            }
+                return tn[0]*ref[0] + tn[1]*ref[1] + tn[2]*ref[2] < 0.0;
+            };
+
+            int nfold = 0;
+            for (const auto& t : face_buffer)
+                if (is_folded(t[0], t[1], t[2])) nfold++;
             std::vector<char> used(vertex_buffer.size(), 0);
             for (const auto& t : face_buffer)
                 for (int j = 0; j < 3; j++) if (t[j] < used.size()) used[t[j]] = 1;
@@ -492,12 +515,47 @@ std::vector<std::pair<Mesh, TopoDS_Face>> tessellate_shape(const TopoDS_Shape& s
                 CrBail reason = CrBail::Ok;
                 auto fixed = cr_retriangulate_face(face, triangulation, vertex_map,
                                                    vertex_buffer, n_out, seg_idx, reason);
-                if (!fixed.empty()) {
+                // Do no harm: only accept a repair that is demonstrably valid —
+                //  (1) it doesn't drop coverage (count >= original; a hole would reduce it);
+                //  (2) it has no folded triangles of its own (catches overlapping/crossed
+                //      triangulations the count alone can't see, e.g. seam-straddling
+                //      sub-faces whose UV is discontinuous);
+                //  (3) it doesn't introduce a much thinner triangle than the original — a
+                //      sliver, typically from incorporating near-duplicate vertices left by
+                //      inconsistent subdivision/sewing, which the repair can't cleanly fix.
+                auto min_edge_sq = [&](const auto& tris) {
+                    double m = std::numeric_limits<double>::max();
+                    for (const auto& t : tris) {
+                        for (int e = 0; e < 3; e++) {
+                            size_t i = t[e], j = t[(e+1)%3];
+                            double dx=(double)vertex_buffer[i][0]-(double)vertex_buffer[j][0];
+                            double dy=(double)vertex_buffer[i][1]-(double)vertex_buffer[j][1];
+                            double dz=(double)vertex_buffer[i][2]-(double)vertex_buffer[j][2];
+                            m = std::min(m, dx*dx+dy*dy+dz*dz);
+                        }
+                    }
+                    return m;
+                };
+                bool fixed_folded = false;
+                for (const auto& t : fixed)
+                    if (is_folded(t[0], t[1], t[2])) { fixed_folded = true; break; }
+                // 0.25 in squared length = 0.5 in length: reject if the smallest edge shrank
+                // by more than half relative to the original tessellation.
+                bool introduced_sliver = !fixed.empty() &&
+                                         min_edge_sq(fixed) < 0.25 * min_edge_sq(face_buffer);
+
+                if (!fixed.empty() && fixed.size() >= face_buffer.size() &&
+                    !fixed_folded && !introduced_sliver) {
                     rep_fixed++;
                     spdlog::debug("  repaired tessellation on seg {}: {} -> {} tris",
                                   seg_idx, face_buffer.size(), fixed.size());
                     face_buffer.clear();
                     for (const auto& t : fixed) face_buffer.push_back({t[0], t[1], t[2]});
+                } else if (!fixed.empty()) {
+                    rep_bail_incomplete++;
+                    spdlog::warn("  seg {}: re-triangulation rejected ({} -> {} tris, folded={}, sliver={}); "
+                                 "kept original", seg_idx, face_buffer.size(), fixed.size(),
+                                 fixed_folded, introduced_sliver);
                 } else {
                     if (reason == CrBail::FewSegments)        rep_bail_segs++;
                     else if (reason == CrBail::NotPlanar)     rep_bail_planar++;
@@ -529,11 +587,11 @@ std::vector<std::pair<Mesh, TopoDS_Face>> tessellate_shape(const TopoDS_Shape& s
     }
 
     if (repair_inverted_faces && rep_flagged > 0) {
-        size_t bailed = rep_bail_segs + rep_bail_planar + rep_bail_selfint;
+        size_t bailed = rep_bail_segs + rep_bail_planar + rep_bail_selfint + rep_bail_incomplete;
         spdlog::info("  inverted-face repair: {}/{} segments flagged, {} repaired, {} kept original "
-                     "(bail: {} few-seg, {} non-planar, {} self-intersect)",
+                     "(bail: {} few-seg, {} non-planar, {} self-intersect, {} incomplete)",
                      rep_flagged, seg_idx, rep_fixed, bailed,
-                     rep_bail_segs, rep_bail_planar, rep_bail_selfint);
+                     rep_bail_segs, rep_bail_planar, rep_bail_selfint, rep_bail_incomplete);
     }
 
     return tessellation;

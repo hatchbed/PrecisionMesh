@@ -183,6 +183,10 @@ int main(int argc, char **argv) {
     bool raw_step_mesh = false;
     app.add_flag("-r,--raw-step-mesh",  raw_step_mesh, "Generate raw mesh from STEP component without remeshing.");
 
+    bool no_tess_repair = false;
+    app.add_flag("--no-tess-repair", no_tess_repair,
+                 "Disable the inverted/holed/dropped-corner tessellation repair (diagnostic).");
+
 #ifdef PRECISION_MESH_HAS_VIEWER
     bool enable_display = false;
     app.add_flag("--display", enable_display, "Open interactive 3D viewer during processing.");
@@ -603,7 +607,7 @@ int main(int argc, char **argv) {
 
         auto tessellation = boundary_mesh_mode
             ? boundary_meshes(selected_component->shape)
-            : tessellate_shape(selected_component->shape, max_surface_error);
+            : tessellate_shape(selected_component->shape, max_surface_error, !no_tess_repair);
         size_t total_faces = 0;
         for (const auto& [mesh, face]: tessellation) {
             meshes.push_back(mesh);
