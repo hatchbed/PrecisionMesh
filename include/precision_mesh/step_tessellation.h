@@ -10,8 +10,15 @@
 #include <TopoDS_Face.hxx>
 #include <TopoDS_Shape.hxx>
 
+// repair_inverted_faces: re-triangulate faces where BRepMesh produced folded / holed /
+// dropped-corner output (see step_tessellation.cpp).
 std::vector<std::pair<Mesh, TopoDS_Face>> tessellate_shape(const TopoDS_Shape& shape,
-                                                            double max_surface_error);
+                                                            double max_surface_error,
+                                                            bool repair_inverted_faces = true);
+
+// Build minimal fan-polygon meshes from each face's boundary wire vertices,
+// bypassing BRepMesh entirely.  Useful for visualising raw subdivision geometry.
+std::vector<std::pair<Mesh, TopoDS_Face>> boundary_meshes(const TopoDS_Shape& shape);
 
 // Count border edges shorter than min_edge_length, ignoring planar faces.
 size_t get_short_edge_count(const std::vector<std::pair<Mesh, TopoDS_Face>>& tessellation,

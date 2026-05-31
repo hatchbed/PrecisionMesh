@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <vector>
 
@@ -15,6 +16,9 @@ struct RemeshParams {
     int iterations;
     bool is_step;
     bool no_projection;
+    // Optional: called after each iteration completes (on the calling thread,
+    // after all TBB work has finished for that iteration).
+    std::function<void(int iteration)> on_iteration_done = {};
 };
 
 // Split border edges longer than max_edge_length on each mesh in the collection.

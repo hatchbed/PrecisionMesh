@@ -1,4 +1,5 @@
 #include <precision_mesh/step_subdivision.h>
+#include <precision_mesh/step_tessellation.h>
 
 #include <cmath>
 #include <vector>
@@ -19,6 +20,7 @@
 #include <TopoDS.hxx>
 #include <TopoDS_Compound.hxx>
 #include <TopoDS_Edge.hxx>
+#include <TopExp.hxx>
 #include <TopExp_Explorer.hxx>
 #include <TopTools_ListOfShape.hxx>
 
@@ -416,18 +418,28 @@ std::vector<TopoDS_Face> subdivide_face(const TopoDS_Face& face, int u_steps, in
     splitter.SetTools(cut_tools);
     splitter.Build();
 
+    const TopAbs_Orientation orig_orient = face.Orientation();
     std::vector<TopoDS_Face> subdivs;
     auto modified = splitter.Modified(face);
     for (const auto& shape: modified) {
         if (shape.ShapeType() == TopAbs_FACE) {
-            subdivs.push_back(TopoDS::Face(shape));
+            TopoDS_Face subface = TopoDS::Face(shape);
+            if (subface.Orientation() != orig_orient) {
+                spdlog::warn("subdivide_face: sub-face orientation mismatch (got {}, expected {}), correcting",
+                             (int)subface.Orientation(), (int)orig_orient);
+                subface = TopoDS::Face(subface.Reversed());
+            }
+            subdivs.push_back(subface);
         }
         else {
             spdlog::warn("Modified shape is not a face.");
         }
     }
 
-    spdlog::debug("subdivs created: {}", subdivs.size());
+    // Note: subdivs.size() < u_steps*v_steps is normal for trimmed faces — grid cells
+    // outside the trimmed UV region produce no sub-face.  Logged at debug only.
+    spdlog::debug("subdivs created: {} (full-grid would be {}, u_steps={} v_steps={})",
+                  subdivs.size(), u_steps * v_steps, u_steps, v_steps);
 
     return subdivs;
 }
@@ -468,6 +480,8 @@ std::tuple<TopoDS_Shape, FaceMap> subdivide_step_shape(TopoDS_Shape& shape,
         }
 
         auto subdivs = subdivide_face(face, u_steps, v_steps);
+        spdlog::debug("face {}: {} sub-faces, u_steps={} v_steps={} face_orient={}",
+                      original_face_id, subdivs.size(), u_steps, v_steps, (int)face.Orientation());
         for (const auto& subdiv: subdivs) {
             builder.Add(new_shape, subdiv);
             pre_sewn_face_map[subdiv] = original_face_id;
@@ -476,8 +490,14 @@ std::tuple<TopoDS_Shape, FaceMap> subdivide_step_shape(TopoDS_Shape& shape,
         original_face_id++;
     }
 
+    // Sewing tolerance must scale with the model (geometry is in native STEP units here).
+    // A hardcoded 0.1 was unit-agnostic (0.1 m for a metre-unit file) and, even in mm, was
+    // coarse enough to mis-merge tiny tip-region edges and break cross-strip adjacency,
+    // which fed BRepMesh inconsistent shared-edge nodes and produced twisted tessellations.
+    double sew_tolerance = min_edge_length * 0.01;
+    spdlog::debug("sewing tolerance: {} (native units)", sew_tolerance);
     BRepBuilderAPI_Sewing sewing;
-    sewing.SetTolerance(0.1);
+    sewing.SetTolerance(sew_tolerance);
     sewing.Add(new_shape);
     sewing.Perform();
 

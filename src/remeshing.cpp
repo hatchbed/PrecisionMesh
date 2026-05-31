@@ -172,5 +172,8 @@ void remesh_and_project(
                                               *surface_projectors[m], *border_projectors[m], weight);
                     }});
         }
+
+        if (params.on_iteration_done)
+            params.on_iteration_done(i + 1);
     }
 }
