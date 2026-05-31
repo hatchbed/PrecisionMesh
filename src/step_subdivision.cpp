@@ -392,18 +392,40 @@ std::vector<TopoDS_Face> subdivide_face(const TopoDS_Face& face, int u_steps, in
 
     ShapeFix_Edge edge_fix;
 
+    // Cut extent in each direction: extend a little past the face bounds so the cut fully
+    // crosses non-periodic boundaries.  In a PERIODIC direction, however, the cut span must
+    // never reach a full period: on a face that wraps (or nearly wraps) the whole period, an
+    // extended cut runs past the seam and overlaps itself, and the splitter then leaves the
+    // seam-adjacent cells un-split (collapsing a whole band into one giant cell).  Cap the
+    // extension by the gap to the period.  This subsumes every case with no special-casing:
+    //  - full-period face (gap 0)        -> extension 0 -> span [first,last], closes cleanly;
+    //  - almost-full face (tiny gap)     -> tiny extension, span stays just under a period;
+    //  - small arc (large gap)           -> full 0.01 extension as before.
+    // It also handles faces that span ~2pi-eps with NO seam edge (a STEP 359.98-degree
+    // cylinder), which neither a UPeriod-tolerance test nor seam detection catches.
+    double u_ext = 0.01, v_ext = 0.01;
+    if (!surface.IsNull() && surface->IsUPeriodic())
+        u_ext = std::min(0.01, std::max(0.0, (surface->UPeriod() - u_range) * 0.49));
+    if (!surface.IsNull() && surface->IsVPeriodic())
+        v_ext = std::min(0.01, std::max(0.0, (surface->VPeriod() - v_range) * 0.49));
+    // U-cut lines (constant U) span V; V-cut lines (constant V) span U.
+    double v_span_lo = v_first - v_ext;
+    double v_span_len = v_range + 2 * v_ext;
+    double u_span_lo = u_first - u_ext;
+    double u_span_len = u_range + 2 * u_ext;
+
     TopTools_ListOfShape cut_tools;
     for (int u_step = 1; u_step < u_steps; u_step++) {
         double u_val = u_first + u_step * u_step_size;
-        auto v_line = new Geom2d_Line(gp_Pnt2d(u_val, v_first - 0.01), gp_Dir2d(0, 1));
-        TopoDS_Edge v_edge = BRepBuilderAPI_MakeEdge(v_line, surface, 0, v_range + 0.02);
+        auto v_line = new Geom2d_Line(gp_Pnt2d(u_val, v_span_lo), gp_Dir2d(0, 1));
+        TopoDS_Edge v_edge = BRepBuilderAPI_MakeEdge(v_line, surface, 0, v_span_len);
         edge_fix.FixAddCurve3d(v_edge);
         cut_tools.Append(v_edge);
     }
     for (int v_step = 1; v_step < v_steps; v_step++) {
         double v_val = v_first + v_step * v_step_size;
-        auto u_line = new Geom2d_Line(gp_Pnt2d(u_first - 0.01, v_val), gp_Dir2d(1, 0));
-        TopoDS_Edge u_edge = BRepBuilderAPI_MakeEdge(u_line, surface, 0, u_range + 0.02);
+        auto u_line = new Geom2d_Line(gp_Pnt2d(u_span_lo, v_val), gp_Dir2d(1, 0));
+        TopoDS_Edge u_edge = BRepBuilderAPI_MakeEdge(u_line, surface, 0, u_span_len);
         edge_fix.FixAddCurve3d(u_edge);
         cut_tools.Append(u_edge);
     }
@@ -425,8 +447,6 @@ std::vector<TopoDS_Face> subdivide_face(const TopoDS_Face& face, int u_steps, in
         if (shape.ShapeType() == TopAbs_FACE) {
             TopoDS_Face subface = TopoDS::Face(shape);
             if (subface.Orientation() != orig_orient) {
-                spdlog::warn("subdivide_face: sub-face orientation mismatch (got {}, expected {}), correcting",
-                             (int)subface.Orientation(), (int)orig_orient);
                 subface = TopoDS::Face(subface.Reversed());
             }
             subdivs.push_back(subface);
