@@ -22,10 +22,12 @@
 #include <spdlog/spdlog.h>
 
 #include <BRep_Tool.hxx>
+#include <BRepGProp.hxx>
 #include <BRepMesh_IncrementalMesh.hxx>
 #include <BRepTools.hxx>
 #include <BRepTools_WireExplorer.hxx>
 #include <Geom_Plane.hxx>
+#include <GProp_GProps.hxx>
 #include <Geom_Surface.hxx>
 #include <GeomAPI_ProjectPointOnCurve.hxx>
 #include <gp_Pnt.hxx>
@@ -455,9 +457,17 @@ std::vector<std::pair<Mesh, TopoDS_Face>> tessellate_shape(const TopoDS_Shape& s
                 for (const auto& kv : vertex_map)
                     uv_of[kv.second] = triangulation->UVNode(kv.first);
 
-            // A triangle is folded if its winding opposes the local surface normal (UV-node
-            // centroid → surface D1), falling back to the face-center normal when UV is
-            // unavailable or a vertex has no UV (e.g. a re-created corner).
+            // A triangle is folded if its winding CLEARLY opposes the local surface normal
+            // (UV-node centroid → surface D1), falling back to the face-center normal when UV
+            // is unavailable or a vertex has no UV (e.g. a re-created corner).
+            //
+            // We require the (normalized) angle to be well past 90°, not merely past it: a
+            // genuine fold is a full winding inversion (cos ~= -1), whereas a near-degenerate
+            // sliver's normal direction is dominated by sub-micron node noise and points
+            // essentially at random — it lands near cos ~= 0 and would false-positive on a
+            // bare `dot < 0` test (these slivers are harmless: negligible area, ambiguous
+            // winding).  -0.25 (~104°) cleanly separates real folds from sliver noise.
+            constexpr double FOLD_COS_THRESH = -0.25;
             auto is_folded = [&](size_t a, size_t b, size_t c) -> bool {
                 std::array<double,3> tn = cr_tri_normal(vertex_buffer, a, b, c);
                 std::array<double,3> ref = n_out;
@@ -472,7 +482,11 @@ std::vector<std::pair<Mesh, TopoDS_Face>> tessellate_shape(const TopoDS_Shape& s
                         ref = {nn.X()*orient_sign, nn.Y()*orient_sign, nn.Z()*orient_sign};
                     }
                 }
-                return tn[0]*ref[0] + tn[1]*ref[1] + tn[2]*ref[2] < 0.0;
+                double tnlen = std::sqrt(tn[0]*tn[0]+tn[1]*tn[1]+tn[2]*tn[2]);
+                double reflen = std::sqrt(ref[0]*ref[0]+ref[1]*ref[1]+ref[2]*ref[2]);
+                if (tnlen < 1e-20 || reflen < 1e-20) return false;   // can't orient a degenerate tri
+                double cosang = (tn[0]*ref[0]+tn[1]*ref[1]+tn[2]*ref[2]) / (tnlen*reflen);
+                return cosang < FOLD_COS_THRESH;
             };
 
             int nfold = 0;
@@ -544,8 +558,28 @@ std::vector<std::pair<Mesh, TopoDS_Face>> tessellate_shape(const TopoDS_Shape& s
                 bool introduced_sliver = !fixed.empty() &&
                                          min_edge_sq(fixed) < 0.25 * min_edge_sq(face_buffer);
 
+                // Over-cover guard: a valid repair re-triangulates the SAME region, so its
+                // total area can't exceed the BREP face area.  A CDT that doesn't respect a
+                // concave/looped boundary fills the notch (or a hole) with triangles spanning
+                // empty space outside the face — those are in-plane (not folded) and not
+                // slivers, so only an area check catches them.  Curved faces chord *inside*
+                // the surface (area <= face area), so the 1% margin is just for planar noise.
+                double face_area = 0.0;
+                {
+                    GProp_GProps fgp;
+                    BRepGProp::SurfaceProperties(face, fgp);
+                    face_area = fgp.Mass();
+                }
+                double fixed_area = 0.0;
+                for (const auto& t : fixed) {
+                    std::array<double,3> nrm = cr_tri_normal(vertex_buffer, t[0], t[1], t[2]);
+                    fixed_area += 0.5 * std::sqrt(nrm[0]*nrm[0] + nrm[1]*nrm[1] + nrm[2]*nrm[2]);
+                }
+                bool overcovers = !fixed.empty() && face_area > 0.0 &&
+                                  fixed_area > face_area * 1.01;
+
                 if (!fixed.empty() && fixed.size() >= face_buffer.size() &&
-                    !fixed_folded && !introduced_sliver) {
+                    !fixed_folded && !introduced_sliver && !overcovers) {
                     rep_fixed++;
                     spdlog::debug("  repaired tessellation on seg {}: {} -> {} tris",
                                   seg_idx, face_buffer.size(), fixed.size());
@@ -553,9 +587,9 @@ std::vector<std::pair<Mesh, TopoDS_Face>> tessellate_shape(const TopoDS_Shape& s
                     for (const auto& t : fixed) face_buffer.push_back({t[0], t[1], t[2]});
                 } else if (!fixed.empty()) {
                     rep_bail_incomplete++;
-                    spdlog::warn("  seg {}: re-triangulation rejected ({} -> {} tris, folded={}, sliver={}); "
-                                 "kept original", seg_idx, face_buffer.size(), fixed.size(),
-                                 fixed_folded, introduced_sliver);
+                    spdlog::warn("  seg {}: re-triangulation rejected ({} -> {} tris, folded={}, sliver={}, "
+                                 "overcover={}); kept original", seg_idx, face_buffer.size(), fixed.size(),
+                                 fixed_folded, introduced_sliver, overcovers);
                 } else {
                     if (reason == CrBail::FewSegments)        rep_bail_segs++;
                     else if (reason == CrBail::NotPlanar)     rep_bail_planar++;
