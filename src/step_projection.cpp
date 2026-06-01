@@ -445,11 +445,57 @@ TessellationValidation validate_tessellation(const std::vector<Mesh>& meshes,
     }
     r.mean_surface_error = r.surface_samples ? err_sum / r.surface_samples : 0.0;
 
-    // Watertightness: merge all segment meshes by position; any remaining border edge is a
-    // crack (or a genuine open boundary of a sheet body).
-    Mesh merged = merge_meshes<Point_traits>(meshes);
-    for (auto e : merged.edges())
-        if (merged.is_border(e)) r.open_boundary_edges++;
+    // Watertightness, measured orientation-independently from the triangle soup (vertices
+    // merged by exact position).  We deliberately do NOT use merge_meshes() / is_border here:
+    // its incremental add_face() silently drops faces on orientation/non-manifold conflicts,
+    // fabricating border edges that aren't real holes.  An undirected edge incident to exactly
+    // one triangle is a real open boundary (crack); incident to >2 is non-manifold.
+    std::map<std::tuple<double,double,double>, int> pid;
+    std::vector<std::array<double,3>> pos;
+    auto id_of = [&](const Mesh::Point& p) {
+        double x=CGAL::to_double(p.x()), y=CGAL::to_double(p.y()), z=CGAL::to_double(p.z());
+        auto key = std::make_tuple(x,y,z);
+        auto it = pid.find(key);
+        if (it != pid.end()) return it->second;
+        int id = (int)pos.size(); pid[key]=id; pos.push_back({x,y,z}); return id;
+    };
+    std::map<std::pair<int,int>, int> edge_count;
+    for (const auto& mesh : meshes)
+        for (auto f : mesh.faces()) {
+            int ids[3]; int k = 0;
+            for (auto v : mesh.vertices_around_face(mesh.halfedge(f))) { if (k < 3) ids[k] = id_of(mesh.point(v)); k++; }
+            if (k != 3) continue;
+            for (int e = 0; e < 3; e++) { int a = ids[e], b = ids[(e+1)%3]; if (a > b) std::swap(a,b); edge_count[{a,b}]++; }
+        }
+
+    auto seg_vertex = [&](const Mesh& mesh, double X, double Y, double Z) {
+        for (auto v : mesh.vertices()) {
+            auto pt = mesh.point(v);
+            double dx=CGAL::to_double(pt.x())-X, dy=CGAL::to_double(pt.y())-Y, dz=CGAL::to_double(pt.z())-Z;
+            if (dx*dx+dy*dy+dz*dz <= tolerance*tolerance) return v;
+        }
+        return Mesh::null_vertex();
+    };
+    int non_manifold_edges = 0;
+    for (const auto& kv : edge_count) {
+        if (kv.second > 2) { non_manifold_edges++; continue; }
+        if (kv.second != 1) continue;
+        r.open_boundary_edges++;
+        const auto& A = pos[kv.first.first]; const auto& B = pos[kv.first.second];
+        double len = std::sqrt((B[0]-A[0])*(B[0]-A[0])+(B[1]-A[1])*(B[1]-A[1])+(B[2]-A[2])*(B[2]-A[2]));
+        std::string owners;
+        for (size_t m = 0; m < n; m++) {
+            auto v0 = seg_vertex(meshes[m], A[0],A[1],A[2]);
+            auto v1 = seg_vertex(meshes[m], B[0],B[1],B[2]);
+            bool h0 = (v0 != Mesh::null_vertex()), h1 = (v1 != Mesh::null_vertex());
+            if (h0 && h1)        owners += " " + std::to_string(m) + "(both," + std::to_string(meshes[m].number_of_faces()) + "t)";
+            else if (h0 || h1)   owners += " " + std::to_string(m) + (h0 ? "(p0)" : "(p1)");
+        }
+        spdlog::debug("    [openedge] ({:.4f},{:.4f},{:.4f}) -> ({:.4f},{:.4f},{:.4f}) len={:.5f} owners:{}",
+                      A[0],A[1],A[2], B[0],B[1],B[2], len, owners);
+    }
+    if (non_manifold_edges)
+        spdlog::warn("    non-manifold edges (incident>2): {}", non_manifold_edges);
 
     return r;
 }

@@ -31,6 +31,7 @@
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wpedantic"
 #include <BRep_Tool.hxx>
+#include <Geom_Curve.hxx>
 #include <BRepGProp.hxx>
 #include <BRepMesh_IncrementalMesh.hxx>
 #include <gp_Trsf.hxx>
@@ -49,7 +50,9 @@
 #include <TopoDS.hxx>
 #include <TopoDS_Face.hxx>
 #include <TopoDS_Shape.hxx>
+#include <TopExp.hxx>
 #include <TopExp_Explorer.hxx>
+#include <TopTools_IndexedDataMapOfShapeListOfShape.hxx>
 #include <XCAFApp_Application.hxx>
 #include <XCAFDoc_DocumentTool.hxx>
 #include <XCAFDoc_ShapeTool.hxx>
@@ -598,6 +601,32 @@ int main(int argc, char **argv) {
 
         original_faces = get_faces(selected_component->shape);
 
+        // DEBUG: report non-conformal topology in the INPUT shape — edges adjacent to !=2
+        // faces are free (open shell / un-stitched import) and tessellate to cracks that no
+        // amount of meshing can stitch.
+        {
+            TopTools_IndexedDataMapOfShapeListOfShape edge_faces;
+            TopExp::MapShapesAndAncestors(selected_component->shape, TopAbs_EDGE, TopAbs_FACE, edge_faces);
+            int free_edges = 0, nonmanifold = 0, shown = 0;
+            for (int i = 1; i <= edge_faces.Extent(); i++) {
+                int nf = edge_faces.FindFromIndex(i).Extent();
+                if (nf == 2) continue;
+                if (nf < 2) free_edges++; else nonmanifold++;
+                if (shown < 12) {
+                    const TopoDS_Edge& e = TopoDS::Edge(edge_faces.FindKey(i));
+                    Standard_Real f, l; Handle(Geom_Curve) c = BRep_Tool::Curve(e, f, l);
+                    if (!c.IsNull()) {
+                        gp_Pnt a = c->Value(f), b = c->Value(l);
+                        spdlog::debug("    [freeedge] nfaces={} ({:.4f},{:.4f},{:.4f})->({:.4f},{:.4f},{:.4f})",
+                                      nf, a.X(),a.Y(),a.Z(), b.X(),b.Y(),b.Z());
+                        shown++;
+                    }
+                }
+            }
+            spdlog::info("    input topology: {} edges, {} free (nfaces<2), {} non-manifold (nfaces>2)",
+                         edge_faces.Extent(), free_edges, nonmanifold);
+        }
+
         FaceMap face_map;
         if (!no_subdivision && !raw_step_mesh) {
             spdlog::info("  subdividing faces ...");
@@ -716,7 +745,7 @@ int main(int argc, char **argv) {
                      vr.max_surface_error * conversion_scale, vr.mean_surface_error * conversion_scale,
                      output_unit, vr.surface_samples);
         if (vr.open_boundary_edges > 0)
-            spdlog::warn("    watertight: {} open boundary edges in merged mesh", vr.open_boundary_edges);
+            spdlog::warn("    watertight: {} open boundary edges (triangle soup, by position)", vr.open_boundary_edges);
         else
             spdlog::info("    watertight: 0 open boundary edges");
     }
