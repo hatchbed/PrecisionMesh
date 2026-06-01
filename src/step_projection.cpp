@@ -344,6 +344,7 @@ double get_distance_to_face(const TopoDS_Face& face, double x, double y, double 
 
 TessellationValidation validate_tessellation(const std::vector<Mesh>& meshes,
                                              const std::vector<TopoDS_Face>& segments,
+                                             const std::vector<TopoDS_Face>& edge_faces,
                                              double tolerance, int samples_per_tri)
 {
     auto dist_to = [](BRepExtrema_DistShapeShape& ext, const Mesh::Point& p) -> double {
@@ -367,11 +368,19 @@ TessellationValidation validate_tessellation(const std::vector<Mesh>& meshes,
             TessellationValidation& p = partials[m];
             double err_sum = 0.0;
 
+            // Validate against the ORIGINAL face's REAL edges, excluding the periodic seam
+            // (a seam is interior to the continuous surface, not a part boundary) — and NOT
+            // against the segment's mesh border, which also includes subdivision cuts.  When
+            // there was no subdivision, edge_faces[m] == segments[m].
+            const TopoDS_Face& edge_face = (m < edge_faces.size()) ? edge_faces[m] : face;
             BRep_Builder builder;
             TopoDS_Compound edge_comp;
             builder.MakeCompound(edge_comp);
-            for (TopExp_Explorer ee(face, TopAbs_EDGE); ee.More(); ee.Next())
-                builder.Add(edge_comp, ee.Current());
+            for (TopExp_Explorer ee(edge_face, TopAbs_EDGE); ee.More(); ee.Next()) {
+                const TopoDS_Edge& e = TopoDS::Edge(ee.Current());
+                if (BRep_Tool::IsClosed(e, edge_face)) continue;   // seam edge — not a boundary
+                builder.Add(edge_comp, e);
+            }
             BRepExtrema_DistShapeShape edge_ext;
             edge_ext.LoadS1(edge_comp);
             BRepExtrema_DistShapeShape face_ext;
@@ -379,19 +388,23 @@ TessellationValidation validate_tessellation(const std::vector<Mesh>& meshes,
 
             for (auto v : mesh.vertices()) {
                 const auto& pt = mesh.point(v);
-                if (mesh.is_border(v)) {
+                // Classify by proximity to a REAL original edge, not by mesh.is_border:
+                // a vertex on a real edge is a boundary vertex; everything else (true
+                // interior, seam, subdivision cut) must lie on the surface.
+                double de = dist_to(edge_ext, pt);
+                if (de >= 0 && de <= tolerance) {
                     p.border_verts++;
-                    double d = dist_to(edge_ext, pt);
-                    if (d >= 0) {
-                        p.max_border_edge_dist = std::max(p.max_border_edge_dist, d);
-                        if (d > tolerance) p.misclassified_border++;
-                    }
+                    p.max_border_edge_dist = std::max(p.max_border_edge_dist, de);
                 } else {
                     p.interior_verts++;
                     double d = dist_to(face_ext, pt);
                     if (d >= 0) {
                         p.max_interior_face_dist = std::max(p.max_interior_face_dist, d);
-                        if (d > tolerance) p.misclassified_interior++;
+                        if (d > tolerance) {
+                            p.misclassified_interior++;
+                            spdlog::debug("    [offsurface] seg {} vert ({:.4f},{:.4f},{:.4f}) is {:.6f} off the original surface",
+                                          m, CGAL::to_double(pt.x()), CGAL::to_double(pt.y()), CGAL::to_double(pt.z()), d);
+                        }
                     }
                 }
             }

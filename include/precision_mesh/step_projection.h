@@ -89,7 +89,13 @@ struct TessellationValidation {
 // surface error to the BREP face; and count open boundary edges of the merged mesh
 // (watertightness).  Intended as an opt-in validation pass — BRep distance queries make it
 // slow on large meshes.
+// `edge_faces` is parallel to `segments`: the ORIGINAL (pre-subdivision) face each segment
+// came from.  Vertices are classified against that face's REAL edges (seam edges excluded) —
+// not the segment mesh's border — so periodic seams and subdivision cuts (which are interior
+// to the continuous surface, not true part boundaries) are validated against the surface, not
+// against a boundary.  Pass `segments` itself when there was no subdivision.
 TessellationValidation validate_tessellation(const std::vector<Mesh>& meshes,
                                              const std::vector<TopoDS_Face>& segments,
+                                             const std::vector<TopoDS_Face>& edge_faces,
                                              double tolerance,
                                              int samples_per_tri = 4);

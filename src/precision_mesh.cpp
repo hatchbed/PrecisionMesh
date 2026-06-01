@@ -733,13 +733,21 @@ int main(int argc, char **argv) {
     if (validate && is_step) {
         spdlog::info("validating tessellation (this may be slow) ...");
         double vtol = std::max(min_edge_length * 0.1, 1e-9);
-        auto vr = validate_tessellation(meshes, segments, vtol);
+        // Each segment validates against the REAL edges of the ORIGINAL face it came from
+        // (so seams and subdivision cuts aren't treated as boundaries).
+        std::vector<TopoDS_Face> edge_faces(segments.size());
+        for (size_t i = 0; i < segments.size(); i++) {
+            int orig = component_map.count(i) ? component_map.at(i) : (int)i;
+            edge_faces[i] = (orig >= 0 && orig < (int)original_faces.size())
+                            ? original_faces[orig] : segments[i];
+        }
+        auto vr = validate_tessellation(meshes, segments, edge_faces, vtol);
         spdlog::info("  validation ({} segments, {} triangles, tol={:.4g} {}):",
                      vr.segments, vr.total_tris, vtol * conversion_scale, output_unit);
-        spdlog::info("    vertices: {} border, {} interior", vr.border_verts, vr.interior_verts);
-        spdlog::info("    border vertex -> STEP edge:   max={:.4g} {} ({} beyond tol)",
+        spdlog::info("    vertices: {} on-edge, {} interior", vr.border_verts, vr.interior_verts);
+        spdlog::info("    on-edge vertex -> STEP edge:    max={:.4g} {} ({} beyond tol)",
                      vr.max_border_edge_dist * conversion_scale, output_unit, vr.misclassified_border);
-        spdlog::info("    interior vertex -> STEP face: max={:.4g} {} ({} beyond tol)",
+        spdlog::info("    other vertex   -> STEP surface: max={:.4g} {} ({} beyond tol)",
                      vr.max_interior_face_dist * conversion_scale, output_unit, vr.misclassified_interior);
         spdlog::info("    surface error (tri samples):  max={:.4g} mean={:.4g} {} ({} samples)",
                      vr.max_surface_error * conversion_scale, vr.mean_surface_error * conversion_scale,
