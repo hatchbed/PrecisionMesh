@@ -30,3 +30,15 @@ double find_surface_error_param(const TopoDS_Shape& shape, double min_edge_lengt
                                 int max_iterations = 10, double conversion_scale = 1);
 
 bool save_shape_as_step(const std::string& path, const TopoDS_Shape& shape);
+
+// Post-tessellation open boundary loop repair.  Merges the soup by exact vertex
+// position, traces open boundary edges into closed loops, and classifies each by
+// comparing the loop's polygon area to ref_area = min(avg_tri_area, 0.5*min_edge^2):
+//   loop_area < ref_area * collapse_area_ratio -> collapse (snap the shortest edge's
+//       vertex pair together and rebuild the affected segment meshes)
+//   otherwise                                  -> fill (fan-triangulate the loop)
+// Capping by 0.5*min_edge_length^2 ensures the threshold stays tight even when
+// the average triangle area is large (e.g. a part with big flat faces).
+void repair_open_boundary_loops(std::vector<std::pair<Mesh, TopoDS_Face>>& tessellation,
+                                 double min_edge_length,
+                                 double collapse_area_ratio = 0.01);

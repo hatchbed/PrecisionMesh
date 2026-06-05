@@ -16,6 +16,8 @@
 #include <cmath>
 #include <limits>
 #include <list>
+#include <map>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -46,12 +48,12 @@
 namespace PMP = CGAL::Polygon_mesh_processing;
 
 
-// ── Inverted-face repair (A2-detect-fix) ─────────────────────────────────────
+// -- Inverted-face repair (A2-detect-fix) ------------------------------------
 // Some valid sub-faces with extreme UV-parameter anisotropy are mis-triangulated by
 // BRepMesh (folded / crossed triangles).  We detect triangles whose winding opposes
 // the face's outward normal and rebuild the face's connectivity from its EXISTING
 // boundary + interior nodes via a constrained Delaunay triangulation on the best-fit
-// plane.  Vertex positions are never changed — only connectivity — so all geometry
+// plane.  Vertex positions are never changed -- only connectivity -- so all geometry
 // invariants (vertices on exact edges/faces) hold trivially.  CGAL's exact predicates
 // are robust to the parameter anisotropy that defeats BRepMesh.
 
@@ -88,7 +90,7 @@ static std::array<double,3> cr_normalize(std::array<double,3> v) {
 }
 
 // Outward (solid) normal of the face: surface normal at the UV centre, flipped for
-// TopAbs_REVERSED faces — matching the convention BRepMesh's triangles already use.
+// TopAbs_REVERSED faces -- matching the convention BRepMesh's triangles already use.
 static std::array<double,3> cr_face_outward_normal(const TopoDS_Face& face) {
     Standard_Real u1,u2,v1,v2;
     BRepTools::UVBounds(face, u1, u2, v1, v2);
@@ -119,7 +121,7 @@ static std::array<double,3> cr_tri_normal(const std::vector<Point>& vb,
 // Boundary constraint segments as (vertex_buffer index) pairs.  Reconstructed from each
 // edge's 3D CURVE + vertex projection, NOT from PolygonOnTriangulation node indices:
 // for shared/sewn edges BRepMesh can index the polygon against the wrong triangulation
-// (crossed seams) or drop wire corners entirely (T-junctions) — both corruptions we are
+// (crossed seams) or drop wire corners entirely (T-junctions) -- both corruptions we are
 // repairing.  Edge endpoint vertices (from the wire) are always included, creating a new
 // mesh vertex in `vb` for any corner BRepMesh dropped.  Orientation is irrelevant
 // (a-b == b-a as a constraint).
@@ -180,7 +182,7 @@ static std::vector<std::pair<size_t,size_t>> cr_boundary_segments(
                 on_edge.push_back({proj.LowerDistanceParameter(), vi});
         }
         // Always include the edge's two endpoint vertices; create them if BRepMesh
-        // dropped the corner (otherwise the quad loses a node → T-junction / hole).
+        // dropped the corner (otherwise the quad loses a node -> T-junction / hole).
         TopoDS_Vertex evs[2] = { TopExp::FirstVertex(edge), TopExp::LastVertex(edge) };
         for (const TopoDS_Vertex& ev : evs) {
             if (ev.IsNull()) continue;
@@ -218,7 +220,7 @@ static std::vector<std::array<size_t,3>> cr_retriangulate_face(
         return {};
     }
 
-    // Vertex set = interior nodes (vmap) ∪ boundary nodes from segments (which may
+    // Vertex set = interior nodes (vmap) union boundary nodes from segments (which may
     // include corner vertices just created in vb to replace ones BRepMesh dropped).
     std::vector<size_t> verts;
     {
@@ -261,7 +263,7 @@ static std::vector<std::array<size_t,3>> cr_retriangulate_face(
     }
     bool planar = (max_dev <= 0.1 * ext);
 
-    // Near-planar faces triangulate on the best-fit PLANE — robust even when the
+    // Near-planar faces triangulate on the best-fit PLANE -- robust even when the
     // surface's UV parameterization is folded/non-injective over the sub-face (as on
     // some subdivided faces, where the cap and far edges run in opposite U directions
     // so the seams become crossing diagonals in UV).  Only genuinely curved faces fall
@@ -336,7 +338,7 @@ static std::vector<std::array<size_t,3>> cr_retriangulate_face(
     }
 
     // If the projected boundary self-intersected, CGAL inserts crossing vertices (with
-    // no info) — the count grows.  Compare against the post-point baseline (same method),
+    // no info) -- the count grows.  Compare against the post-point baseline (same method),
     // so this is independent of whether number_of_vertices() counts the infinite vertex.
     if (cdt.number_of_vertices() != n_pts) {
         spdlog::debug("    seg {} retri bail: verts {} -> {} after constraints (n_verts_inserted={})",
@@ -438,16 +440,16 @@ std::vector<std::pair<Mesh, TopoDS_Face>> tessellate_shape(const TopoDS_Shape& s
 
         // Detect bad BRepMesh output and rebuild the face's connectivity from its nodes:
         //  - folded:  a triangle whose winding opposes the face's outward normal;
-        //  - holed:   an isolated vertex (used by no triangle) — a missing triangle;
-        //  - dropped: a wire (corner) vertex absent from the triangulation — a quad
+        //  - holed:   an isolated vertex (used by no triangle) -- a missing triangle;
+        //  - dropped: a wire (corner) vertex absent from the triangulation -- a quad
         //             tessellated as a triangle, leaving a T-junction with its neighbour.
         if (repair_inverted_faces && !face_buffer.empty()) {
             std::array<double,3> n_out = cr_face_outward_normal(face);
 
             // Fold test: compare each triangle's winding against the LOCAL surface normal
-            // at that triangle (from its UV-node centroid), not one face-center normal —
+            // at that triangle (from its UV-node centroid), not one face-center normal --
             // otherwise a correctly-tessellated curved face false-positives (its edge
-            // triangles legitimately face >90° from the centre).  Fall back to the
+            // triangles legitimately face >90 deg from the centre).  Fall back to the
             // face-center normal only when UV nodes are unavailable.
             double orient_sign = (orientation == TopAbs_REVERSED) ? -1.0 : 1.0;
             Handle(Geom_Surface) surf = BRep_Tool::Surface(face);
@@ -458,15 +460,15 @@ std::vector<std::pair<Mesh, TopoDS_Face>> tessellate_shape(const TopoDS_Shape& s
                     uv_of[kv.second] = triangulation->UVNode(kv.first);
 
             // A triangle is folded if its winding CLEARLY opposes the local surface normal
-            // (UV-node centroid → surface D1), falling back to the face-center normal when UV
+            // (UV-node centroid -> surface D1), falling back to the face-center normal when UV
             // is unavailable or a vertex has no UV (e.g. a re-created corner).
             //
-            // We require the (normalized) angle to be well past 90°, not merely past it: a
+            // We require the (normalized) angle to be well past 90 deg, not merely past it: a
             // genuine fold is a full winding inversion (cos ~= -1), whereas a near-degenerate
             // sliver's normal direction is dominated by sub-micron node noise and points
-            // essentially at random — it lands near cos ~= 0 and would false-positive on a
+            // essentially at random -- it lands near cos ~= 0 and would false-positive on a
             // bare `dot < 0` test (these slivers are harmless: negligible area, ambiguous
-            // winding).  -0.25 (~104°) cleanly separates real folds from sliver noise.
+            // winding).  -0.25 (~104 deg) cleanly separates real folds from sliver noise.
             constexpr double FOLD_COS_THRESH = -0.25;
             auto is_folded = [&](size_t a, size_t b, size_t c) -> bool {
                 std::array<double,3> tn = cr_tri_normal(vertex_buffer, a, b, c);
@@ -529,12 +531,12 @@ std::vector<std::pair<Mesh, TopoDS_Face>> tessellate_shape(const TopoDS_Shape& s
                 CrBail reason = CrBail::Ok;
                 auto fixed = cr_retriangulate_face(face, triangulation, vertex_map,
                                                    vertex_buffer, n_out, seg_idx, reason);
-                // Do no harm: only accept a repair that is demonstrably valid —
+                // Do no harm: only accept a repair that is demonstrably valid --
                 //  (1) it doesn't drop coverage (count >= original; a hole would reduce it);
                 //  (2) it has no folded triangles of its own (catches overlapping/crossed
                 //      triangulations the count alone can't see, e.g. seam-straddling
                 //      sub-faces whose UV is discontinuous);
-                //  (3) it doesn't introduce a much thinner triangle than the original — a
+                //  (3) it doesn't introduce a much thinner triangle than the original -- a
                 //      sliver, typically from incorporating near-duplicate vertices left by
                 //      inconsistent subdivision/sewing, which the repair can't cleanly fix.
                 auto min_edge_sq = [&](const auto& tris) {
@@ -561,7 +563,7 @@ std::vector<std::pair<Mesh, TopoDS_Face>> tessellate_shape(const TopoDS_Shape& s
                 // Over-cover guard: a valid repair re-triangulates the SAME region, so its
                 // total area can't exceed the BREP face area.  A CDT that doesn't respect a
                 // concave/looped boundary fills the notch (or a hole) with triangles spanning
-                // empty space outside the face — those are in-plane (not folded) and not
+                // empty space outside the face -- those are in-plane (not folded) and not
                 // slivers, so only an area check catches them.  Curved faces chord *inside*
                 // the surface (area <= face area), so the 1% margin is just for planar noise.
                 double face_area = 0.0;
@@ -666,7 +668,7 @@ double find_surface_error_param(const TopoDS_Shape& shape, double min_edge_lengt
 
     double threshold_max = min_edge_length;
     double threshold_min = 0;
-    // Deflection tuning only counts short border edges — skip the inverted-face repair.
+    // Deflection tuning only counts short border edges -- skip the inverted-face repair.
     const bool kNoRepair = false;
     auto tessellation = tessellate_shape(shape, threshold_max, kNoRepair);
 
@@ -726,6 +728,228 @@ std::vector<std::pair<Mesh, TopoDS_Face>> boundary_meshes(const TopoDS_Shape& sh
     return result;
 }
 
+
+void repair_open_boundary_loops(std::vector<std::pair<Mesh, TopoDS_Face>>& tessellation,
+                                 double min_edge_length,
+                                 double collapse_area_ratio)
+{
+    // -- Phase 1: merged position map + per-position vertex reverse lookup ------
+    std::map<std::tuple<double,double,double>, int> pid;
+    std::vector<std::array<double,3>> pos;
+    std::vector<std::vector<std::pair<size_t, Mesh::Vertex_index>>> id_to_verts;
+
+    for (size_t si = 0; si < tessellation.size(); si++) {
+        Mesh& mesh = tessellation[si].first;
+        for (auto v : mesh.vertices()) {
+            auto p = mesh.point(v);
+            double x = CGAL::to_double(p.x()), y = CGAL::to_double(p.y()), z = CGAL::to_double(p.z());
+            auto key = std::make_tuple(x, y, z);
+            auto it = pid.find(key);
+            int id;
+            if (it == pid.end()) {
+                id = (int)pos.size();
+                pid[key] = id;
+                pos.push_back({x, y, z});
+                id_to_verts.emplace_back();
+            } else {
+                id = it->second;
+            }
+            id_to_verts[id].push_back({si, v});
+        }
+    }
+
+    // -- Phase 2: edge incidence count + average triangle area ----------------
+    std::map<std::pair<int,int>, int> edge_count;
+    double total_tri_area = 0.0;
+    size_t total_tri_count = 0;
+
+    auto lookup_id = [&](const Mesh::Point& p) -> int {
+        double x = CGAL::to_double(p.x()), y = CGAL::to_double(p.y()), z = CGAL::to_double(p.z());
+        return pid.at(std::make_tuple(x, y, z));
+    };
+
+    for (const auto& [mesh, face] : tessellation) {
+        for (auto f : mesh.faces()) {
+            int ids[3]; int k = 0;
+            K::Point_3 pts[3];
+            for (auto v : mesh.vertices_around_face(mesh.halfedge(f))) {
+                if (k < 3) { ids[k] = lookup_id(mesh.point(v)); pts[k] = mesh.point(v); }
+                k++;
+            }
+            if (k != 3) continue;
+            for (int e = 0; e < 3; e++) {
+                int a = ids[e], b = ids[(e+1)%3];
+                if (a > b) std::swap(a, b);
+                edge_count[{a, b}]++;
+            }
+            auto cr = CGAL::cross_product(pts[1] - pts[0], pts[2] - pts[0]);
+            double area = 0.5 * std::sqrt(CGAL::to_double(cr.squared_length()));
+            total_tri_area += area;
+            total_tri_count++;
+        }
+    }
+    double avg_tri_area = (total_tri_count > 0) ? total_tri_area / total_tri_count : 1.0;
+    // Cap the reference by the smallest possible triangle at the minimum edge length
+    // so a large average (from big flat faces) doesn't make the collapse threshold too coarse.
+    double ref_area = std::min(avg_tri_area, 0.5 * min_edge_length * min_edge_length);
+
+    // -- Phase 3: collect open edges and trace into closed loops --------------
+    std::map<int, std::vector<int>> open_adj;
+    for (const auto& [e, cnt] : edge_count) {
+        if (cnt != 1) continue;
+        open_adj[e.first].push_back(e.second);
+        open_adj[e.second].push_back(e.first);
+    }
+
+    if (open_adj.empty()) return;
+
+    std::unordered_set<int> visited;
+    std::vector<std::vector<int>> loops;
+
+    for (const auto& [start, _] : open_adj) {
+        if (visited.count(start)) continue;
+        std::vector<int> loop;
+        int cur = start, prev = -1;
+        while (!visited.count(cur)) {
+            visited.insert(cur);
+            loop.push_back(cur);
+            int next = -1;
+            for (int nb : open_adj[cur])
+                if (nb != prev && !visited.count(nb)) { next = nb; break; }
+            if (next == -1) break;
+            prev = cur; cur = next;
+        }
+        if ((int)loop.size() >= 3) loops.push_back(std::move(loop));
+    }
+
+    spdlog::info("  [loop repair] {} open boundary loop(s), avg_tri_area={:.3e} ({} tris), "
+                 "ref_area={:.3e} (min(avg, 0.5*min_edge^2))",
+                 loops.size(), avg_tri_area, total_tri_count, ref_area);
+
+    // -- Phase 4: classify and fix each loop ----------------------------------
+    std::unordered_set<size_t> meshes_to_rebuild;
+
+    for (auto& loop : loops) {
+        int N = (int)loop.size();
+
+        // Polygon area via fan from centroid
+        double cx = 0, cy = 0, cz = 0;
+        for (int id : loop) { cx += pos[id][0]; cy += pos[id][1]; cz += pos[id][2]; }
+        cx /= N; cy /= N; cz /= N;
+
+        double loop_area = 0.0;
+        for (int i = 0; i < N; i++) {
+            const auto& a = pos[loop[i]], &b = pos[loop[(i+1)%N]];
+            double ax=a[0]-cx, ay=a[1]-cy, az=a[2]-cz;
+            double bx=b[0]-cx, by=b[1]-cy, bz=b[2]-cz;
+            double xc=ay*bz-az*by, yc=az*bx-ax*bz, zc=ax*by-ay*bx;
+            loop_area += 0.5 * std::sqrt(xc*xc + yc*yc + zc*zc);
+        }
+
+        // Shortest and longest edge in the loop.
+        // min/max ratio characterises degeneracy within the loop itself -- no external
+        // reference needed.  A loop with one very short edge (near-zero-span BREP artifact)
+        // has ratio << 1; a loop representing genuine missing geometry has roughly
+        // uniform edges and ratio near 1.
+        double min_edge_len = std::numeric_limits<double>::max();
+        double max_edge_len = 0.0;
+        int snap_from = -1, snap_to = -1;
+        for (int i = 0; i < N; i++) {
+            int a = loop[i], b = loop[(i+1)%N];
+            const auto& pa = pos[a]; const auto& pb = pos[b];
+            double dx=pb[0]-pa[0], dy=pb[1]-pa[1], dz=pb[2]-pa[2];
+            double len = std::sqrt(dx*dx+dy*dy+dz*dz);
+            if (len < min_edge_len) { min_edge_len = len; snap_from = a; snap_to = b; }
+            if (len > max_edge_len) max_edge_len = len;
+        }
+        spdlog::info("  [loop repair] {} vertices, area={:.3e}, min_edge={:.3e}, "
+                     "max_edge={:.3e}, area/ref={:.3e}",
+                     N, loop_area, min_edge_len, max_edge_len,
+                     loop_area / ref_area);
+
+        if (loop_area < ref_area * collapse_area_ratio) {
+            // Collapse: snap snap_from -> snap_to across all meshes
+            spdlog::info("    -> collapse: ({:.5f},{:.5f},{:.5f}) -> ({:.5f},{:.5f},{:.5f})",
+                         pos[snap_from][0], pos[snap_from][1], pos[snap_from][2],
+                         pos[snap_to][0],   pos[snap_to][1],   pos[snap_to][2]);
+            K::Point_3 target(pos[snap_to][0], pos[snap_to][1], pos[snap_to][2]);
+            int snaps = 0;
+            for (auto& [si, v] : id_to_verts[snap_from]) {
+                tessellation[si].first.point(v) = target;
+                meshes_to_rebuild.insert(si);
+                snaps++;
+            }
+            spdlog::info("    snapped {} vertices", snaps);
+        } else {
+            // Fill: fan-triangulate from loop[0], add to the segment that owns most loop verts
+            spdlog::info("    -> fill: fan-triangulating {} vertices", N);
+            std::map<size_t, int> seg_votes;
+            for (int id : loop)
+                for (auto& [si, v] : id_to_verts[id])
+                    seg_votes[si]++;
+            size_t best_si = 0;
+            int best_votes = -1;
+            for (auto& [si, votes] : seg_votes)
+                if (votes > best_votes) { best_votes = votes; best_si = si; }
+
+            Mesh& tmesh = tessellation[best_si].first;
+            std::vector<Mesh::Vertex_index> hverts;
+            for (int id : loop) {
+                Mesh::Vertex_index hv = Mesh::null_vertex();
+                for (auto& [si, v] : id_to_verts[id])
+                    if (si == best_si) { hv = v; break; }
+                if (hv == Mesh::null_vertex())
+                    hv = tmesh.add_vertex(K::Point_3(pos[id][0], pos[id][1], pos[id][2]));
+                hverts.push_back(hv);
+            }
+            // The loop tracing gives an arbitrary vertex ordering.  add_face requires
+            // that the directed halfedges v0->v1, v1->v2, v2->v0 are all free boundary
+            // halfedges in the mesh.  If the natural order fails, the reverse winding
+            // will succeed because one of the two orientations must match the free side.
+            int added = 0;
+            for (int i = 1; i < N - 1; i++) {
+                auto fh = tmesh.add_face(hverts[0], hverts[i], hverts[i+1]);
+                if (fh == Mesh::null_face())
+                    fh = tmesh.add_face(hverts[0], hverts[i+1], hverts[i]);
+                if (fh != Mesh::null_face())
+                    added++;
+            }
+            spdlog::info("    added {} fill triangles to seg {}", added, best_si);
+            meshes_to_rebuild.insert(best_si);
+        }
+    }
+
+    // -- Phase 5: rebuild affected meshes via repair_polygon_soup --------------
+    for (size_t si : meshes_to_rebuild) {
+        Mesh& mesh = tessellation[si].first;
+        std::vector<Point> vbuf;
+        std::vector<std::vector<size_t>> fbuf;
+        std::unordered_map<size_t, size_t> vmap;
+
+        for (auto v : mesh.vertices()) {
+            vmap[v.idx()] = vbuf.size();
+            auto p = mesh.point(v);
+            vbuf.push_back({CGAL::to_double(p.x()), CGAL::to_double(p.y()), CGAL::to_double(p.z())});
+        }
+        for (auto f : mesh.faces()) {
+            std::vector<size_t> face;
+            int k = 0;
+            for (auto v : mesh.vertices_around_face(mesh.halfedge(f))) {
+                face.push_back(vmap.at(v.idx())); k++;
+            }
+            if (k == 3) fbuf.push_back(face);
+        }
+
+        PMP::repair_polygon_soup(vbuf, fbuf, CGAL::parameters::geom_traits(PointArray_traits()));
+
+        mesh = Mesh{};
+        std::vector<Mesh::Vertex_index> new_verts;
+        for (const auto& v : vbuf)
+            new_verts.push_back(mesh.add_vertex(K::Point_3(v[0], v[1], v[2])));
+        for (const auto& f : fbuf)
+            if (f.size() == 3) mesh.add_face(new_verts[f[0]], new_verts[f[1]], new_verts[f[2]]);
+    }
+}
 
 bool save_shape_as_step(const std::string& path, const TopoDS_Shape& shape) {
     STEPControl_Writer writer;
