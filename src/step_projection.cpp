@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <deque>
 #include <limits>
+#include <set>
 #include <unordered_set>
 
 #include <spdlog/spdlog.h>
@@ -15,11 +16,15 @@
 
 #include <BRep_Builder.hxx>
 #include <BRep_Tool.hxx>
+#include <BRepAdaptor_Curve.hxx>
 #include <BRepBuilderAPI_MakeVertex.hxx>
 #include <BRepBuilderAPI_MakeWire.hxx>
+#include <BRepTools_WireExplorer.hxx>
 #include <gp_Pnt.hxx>
 #include <TopoDS.hxx>
 #include <TopoDS_Edge.hxx>
+#include <TopoDS_Vertex.hxx>
+#include <TopoDS_Wire.hxx>
 #include <TopExp.hxx>
 #include <TopExp_Explorer.hxx>
 #include <TopTools_ListOfShape.hxx>
@@ -97,11 +102,11 @@ TopoDS_Wire get_border_loop_wire(
             if (faces.Size() == 1) {
                 auto single_face = TopoDS::Face(faces.First());
                 // Seam edges belong to only one face but are parametric artifacts with no
-                // physical boundary — skip them.
+                // physical boundary -- skip them.
                 if (BRep_Tool::IsClosed(TopoDS::Edge(e), single_face)) {
                     continue;
                 }
-                // Degenerate edges (e.g. cone apex) have zero length — skip them.
+                // Degenerate edges (e.g. cone apex) have zero length -- skip them.
                 if (BRep_Tool::Degenerated(TopoDS::Edge(e))) {
                     continue;
                 }
@@ -356,11 +361,11 @@ TessellationValidation validate_tessellation(const std::vector<Mesh>& meshes,
 
     const size_t n = std::min(meshes.size(), segments.size());
 
-    // Per-segment partials (one slot each → no races); mean_surface_error holds the sum.
+    // Per-segment partials (one slot each -> no races); mean_surface_error holds the sum.
     std::vector<TessellationValidation> partials(n);
 
     // Each segment is independent and builds its own BRepExtrema instances (OCCT is safe
-    // per-instance), so segments validate in parallel — same pattern as remesh_and_project.
+    // per-instance), so segments validate in parallel -- same pattern as remesh_and_project.
     tbb::parallel_for(tbb::blocked_range<size_t>(0, n), [&](const tbb::blocked_range<size_t>& rng) {
         for (size_t m = rng.begin(); m != rng.end(); ++m) {
             const Mesh& mesh = meshes[m];
@@ -369,7 +374,7 @@ TessellationValidation validate_tessellation(const std::vector<Mesh>& meshes,
             double err_sum = 0.0;
 
             // Validate against the ORIGINAL face's REAL edges, excluding the periodic seam
-            // (a seam is interior to the continuous surface, not a part boundary) — and NOT
+            // (a seam is interior to the continuous surface, not a part boundary) -- and NOT
             // against the segment's mesh border, which also includes subdivision cuts.  When
             // there was no subdivision, edge_faces[m] == segments[m].
             const TopoDS_Face& edge_face = (m < edge_faces.size()) ? edge_faces[m] : face;
@@ -378,7 +383,7 @@ TessellationValidation validate_tessellation(const std::vector<Mesh>& meshes,
             builder.MakeCompound(edge_comp);
             for (TopExp_Explorer ee(edge_face, TopAbs_EDGE); ee.More(); ee.Next()) {
                 const TopoDS_Edge& e = TopoDS::Edge(ee.Current());
-                if (BRep_Tool::IsClosed(e, edge_face)) continue;   // seam edge — not a boundary
+                if (BRep_Tool::IsClosed(e, edge_face)) continue;   // seam edge -- not a boundary
                 builder.Add(edge_comp, e);
             }
             BRepExtrema_DistShapeShape edge_ext;
@@ -410,7 +415,7 @@ TessellationValidation validate_tessellation(const std::vector<Mesh>& meshes,
             }
 
             // Surface error: sample triangle interiors (centroid, + edge midpoints) and
-            // measure to the BREP face — captures chord deviation between vertices.
+            // measure to the BREP face -- captures chord deviation between vertices.
             for (auto f : mesh.faces()) {
                 p.total_tris++;
                 auto h0 = mesh.halfedge(f);
@@ -509,6 +514,122 @@ TessellationValidation validate_tessellation(const std::vector<Mesh>& meshes,
     }
     if (non_manifold_edges)
         spdlog::warn("    non-manifold edges (incident>2): {}", non_manifold_edges);
+
+    // Exact local-topology dump for sliver/needle open edges (len < tolerance).  For each such
+    // corner, list EVERY triangle (across all segment meshes) that touches it, with its TRUE
+    // owning segment id (read from the mesh, not position-matched) and each vertex's distance to
+    // its segment's nearest BREP corner (d2c).  Resolves whether near-duplicate corner reps sit
+    // within one face (a within-face needle) or split across faces.
+    std::vector<std::array<double,3>> sliver_corners;
+    for (const auto& kv : edge_count) {
+        if (kv.second != 1) continue;
+        const auto& A = pos[kv.first.first]; const auto& B = pos[kv.first.second];
+        double dx=B[0]-A[0], dy=B[1]-A[1], dz=B[2]-A[2];
+        if (dx*dx+dy*dy+dz*dz >= tolerance*tolerance) continue;     // not a needle
+        std::array<double,3> P = {(A[0]+B[0])*0.5, (A[1]+B[1])*0.5, (A[2]+B[2])*0.5};
+        bool dup = false;
+        for (const auto& q : sliver_corners) {
+            double qx=q[0]-P[0], qy=q[1]-P[1], qz=q[2]-P[2];
+            if (qx*qx+qy*qy+qz*qz <= tolerance*tolerance) { dup = true; break; }
+        }
+        if (!dup) sliver_corners.push_back(P);
+    }
+    for (const auto& P : sliver_corners) {
+        spdlog::info("  [slivercheck] corner ({:.7f},{:.7f},{:.7f}) -- triangles touching it:",
+                     P[0], P[1], P[2]);
+        std::set<size_t> sliver_segs;
+        for (size_t m = 0; m < n; m++) {
+            const Mesh& mesh = meshes[m];
+            std::vector<std::array<double,3>> corners;
+            const TopoDS_Face& ef = (m < edge_faces.size()) ? edge_faces[m] : segments[m];
+            for (TopExp_Explorer ve(ef, TopAbs_VERTEX); ve.More(); ve.Next()) {
+                gp_Pnt cp = BRep_Tool::Pnt(TopoDS::Vertex(ve.Current()));
+                corners.push_back({cp.X(), cp.Y(), cp.Z()});
+            }
+            auto d2c = [&](const std::array<double,3>& v) -> double {
+                double best = -1.0;
+                for (const auto& c : corners) {
+                    double d = std::sqrt((c[0]-v[0])*(c[0]-v[0])+(c[1]-v[1])*(c[1]-v[1])+(c[2]-v[2])*(c[2]-v[2]));
+                    if (best < 0 || d < best) best = d;
+                }
+                return best;
+            };
+            for (auto f : mesh.faces()) {
+                std::array<std::array<double,3>,3> vc;
+                int k = 0; bool touches = false;
+                for (auto v : mesh.vertices_around_face(mesh.halfedge(f))) {
+                    if (k >= 3) { k++; break; }
+                    auto pt = mesh.point(v);
+                    vc[k] = {CGAL::to_double(pt.x()), CGAL::to_double(pt.y()), CGAL::to_double(pt.z())};
+                    double tx=vc[k][0]-P[0], ty=vc[k][1]-P[1], tz=vc[k][2]-P[2];
+                    if (tx*tx+ty*ty+tz*tz <= tolerance*tolerance) touches = true;
+                    k++;
+                }
+                if (k != 3 || !touches) continue;
+                sliver_segs.insert(m);
+                spdlog::info("    seg {} tri: ({:.7f},{:.7f},{:.7f})[d2c={:.2e}] "
+                             "({:.7f},{:.7f},{:.7f})[d2c={:.2e}] ({:.7f},{:.7f},{:.7f})[d2c={:.2e}]",
+                             m, vc[0][0],vc[0][1],vc[0][2], d2c(vc[0]),
+                             vc[1][0],vc[1][1],vc[1][2], d2c(vc[1]),
+                             vc[2][0],vc[2][1],vc[2][2], d2c(vc[2]));
+            }
+        }
+
+        // BREP topology dump for the faces at this sliver corner.
+        // Build a vertex identity table: assign each unique BREP vertex object (by IsSame)
+        // a local id, then report which segments share each object and its 3D position.
+        // This directly reveals whether positions A and B at the hole are the same BREP
+        // vertex (pcurve evaluation issue) or distinct vertex objects (BREP defect).
+        std::vector<TopoDS_Vertex> uniq;
+        auto vid = [&](const TopoDS_Vertex& v) -> int {
+            for (int i = 0; i < (int)uniq.size(); i++)
+                if (uniq[i].IsSame(v)) return i;
+            uniq.push_back(v); return (int)uniq.size() - 1;
+        };
+        std::map<int, std::vector<size_t>> vid_segs;
+        for (size_t m : sliver_segs) {
+            for (TopExp_Explorer ve(segments[m], TopAbs_VERTEX); ve.More(); ve.Next()) {
+                int id = vid(TopoDS::Vertex(ve.Current()));
+                if (vid_segs[id].empty() || vid_segs[id].back() != m)
+                    vid_segs[id].push_back(m);
+            }
+        }
+        spdlog::info("  [brep-topology] vertex identity across sliver segs:");
+        for (auto& [id, segs] : vid_segs) {
+            gp_Pnt p = BRep_Tool::Pnt(uniq[id]);
+            std::string ss; for (auto s : segs) ss += " " + std::to_string(s);
+            spdlog::info("    V{}: ({:.7f},{:.7f},{:.7f}) in segs{}", id, p.X(), p.Y(), p.Z(), ss);
+        }
+
+        spdlog::info("  [brep-topology] wire edges per sliver seg:");
+        for (size_t m : sliver_segs) {
+            const TopoDS_Face& face = segments[m];
+            spdlog::info("    seg {}:", m);
+            for (TopExp_Explorer we(face, TopAbs_WIRE); we.More(); we.Next()) {
+                for (BRepTools_WireExplorer ee(TopoDS::Wire(we.Current()), face); ee.More(); ee.Next()) {
+                    const TopoDS_Edge& e = ee.Current();
+                    TopoDS_Vertex ev1 = ee.CurrentVertex();
+                    TopoDS_Vertex ev2 = TopExp::LastVertex(e, Standard_True);
+                    Standard_Real f = 0, l = 0;
+                    bool has_curve = !BRep_Tool::Curve(e, f, l).IsNull();
+                    bool degen = BRep_Tool::Degenerated(e);
+                    std::string ctype = "null";
+                    if (has_curve) {
+                        BRepAdaptor_Curve ac(e);
+                        switch (ac.GetType()) {
+                            case GeomAbs_Line:         ctype = "line";    break;
+                            case GeomAbs_Circle:       ctype = "circle";  break;
+                            case GeomAbs_BSplineCurve: ctype = "bspline"; break;
+                            default:                   ctype = "other";   break;
+                        }
+                    }
+                    spdlog::info("      {} V{}->V{} {} degen={} [{:.17g},{:.17g}] span={:.3e}",
+                                 ee.Orientation() == TopAbs_FORWARD ? "FWD" : "REV",
+                                 vid(ev1), vid(ev2), ctype, degen, f, l, l - f);
+                }
+            }
+        }
+    }
 
     return r;
 }

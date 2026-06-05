@@ -4,6 +4,8 @@
 #include <cmath>
 #include <vector>
 
+#include <spdlog/spdlog.h>
+
 #include <BRep_Tool.hxx>
 #include <BRepAdaptor_Curve.hxx>
 #include <GCPnts_TangentialDeflection.hxx>
@@ -24,9 +26,11 @@
 #include <GeomAbs_SurfaceType.hxx>
 #include <GProp_GProps.hxx>
 #include <TopoDS.hxx>
+#include <TopExp.hxx>
 #include <TopExp_Explorer.hxx>
+#include <TopTools_IndexedDataMapOfShapeListOfShape.hxx>
 
-// ── sample_face_wire ─────────────────────────────────────────────────────────
+// -- sample_face_wire --------------------------------------------------------
 
 std::vector<float> sample_face_wire(const TopoDS_Face& face, double deflection) {
     std::vector<float> xyz;
@@ -55,7 +59,46 @@ std::vector<float> sample_face_wire(const TopoDS_Face& face, double deflection) 
     return xyz;
 }
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
+// -- sample_free_edges --------------------------------------------------------
+
+std::vector<float> sample_free_edges(const TopoDS_Shape& shape, double deflection) {
+    std::vector<float> xyz;
+    TopTools_IndexedDataMapOfShapeListOfShape edge_faces;
+    TopExp::MapShapesAndAncestors(shape, TopAbs_EDGE, TopAbs_FACE, edge_faces);
+
+    int n_null_curve = 0, n_degenerate = 0, n_sampled = 0;
+    for (int i = 1; i <= edge_faces.Extent(); i++) {
+        const TopTools_ListOfShape& faces = edge_faces.FindFromIndex(i);
+        if (faces.Extent() >= 2) continue;                       // shared -- not a free edge
+        TopoDS_Edge edge = TopoDS::Edge(edge_faces.FindKey(i));
+        if (faces.Extent() >= 1 &&
+            BRep_Tool::IsClosed(edge, TopoDS::Face(faces.First()))) continue;   // periodic seam
+
+        Standard_Real first, last;
+        if (BRep_Tool::Curve(edge, first, last).IsNull()) { n_null_curve++; continue; }
+        if (last - first < 1e-15) { n_degenerate++; continue; }
+
+        BRepAdaptor_Curve curve(edge);
+        GCPnts_TangentialDeflection sampler(curve, 0.2, deflection, 2, 1.0e-9);
+        int n = sampler.NbPoints();
+        if (n < 2) { n_degenerate++; continue; }
+
+        n_sampled++;
+        gp_Pnt prev = sampler.Value(1);
+        for (int j = 2; j <= n; j++) {
+            gp_Pnt curr = sampler.Value(j);
+            xyz.push_back((float)prev.X()); xyz.push_back((float)prev.Y()); xyz.push_back((float)prev.Z());
+            xyz.push_back((float)curr.X()); xyz.push_back((float)curr.Y()); xyz.push_back((float)curr.Z());
+            prev = curr;
+        }
+    }
+    if (n_null_curve || n_degenerate)
+        spdlog::debug("    free-edge sampling: {} rendered, {} skipped (null curve), {} skipped (degenerate/short)",
+                      n_sampled, n_null_curve, n_degenerate);
+    return xyz;
+}
+
+// -- Helpers ------------------------------------------------------------------
 
 static std::string fmt_g(double v, int sig = 4) {
     char buf[64];
@@ -79,7 +122,7 @@ static std::string curve_type_name(const Handle(Geom_Curve)& c) {
     }
 }
 
-// ── Public API ────────────────────────────────────────────────────────────────
+// -- Public API ----------------------------------------------------------------
 
 std::vector<TopoDS_Face> get_faces(const TopoDS_Shape& shape) {
     std::vector<TopoDS_Face> faces;
@@ -137,7 +180,7 @@ std::string get_face_description(const TopoDS_Face& face) {
         case GeomAbs_Cone: {
             auto cone = a.Cone();
             return "Cone  half-angle=" + fmt_g(cone.SemiAngle() * 180.0 / M_PI, 3)
-                   + "°  r=" + fmt_g(cone.RefRadius());
+                   + " deg  r=" + fmt_g(cone.RefRadius());
         }
 
         case GeomAbs_Sphere:
@@ -152,17 +195,17 @@ std::string get_face_description(const TopoDS_Face& face) {
         case GeomAbs_BezierSurface: {
             auto b = a.Bezier();
             return "Bezier  deg=" + std::to_string(b->UDegree())
-                   + "×" + std::to_string(b->VDegree())
+                   + "x" + std::to_string(b->VDegree())
                    + "  " + std::to_string(b->NbUPoles())
-                   + "×" + std::to_string(b->NbVPoles()) + " poles";
+                   + "x" + std::to_string(b->NbVPoles()) + " poles";
         }
 
         case GeomAbs_BSplineSurface: {
             auto b = a.BSpline();
             std::string s = "BSpline  deg=" + std::to_string(b->UDegree())
-                            + "×" + std::to_string(b->VDegree())
+                            + "x" + std::to_string(b->VDegree())
                             + "  " + std::to_string(b->NbUPoles())
-                            + "×" + std::to_string(b->NbVPoles()) + " poles";
+                            + "x" + std::to_string(b->NbVPoles()) + " poles";
             if (b->IsURational() || b->IsVRational()) s += "  rational";
             return s;
         }

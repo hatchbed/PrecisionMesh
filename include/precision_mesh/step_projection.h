@@ -36,7 +36,7 @@ struct StepBorderProjector {
     BRepExtrema_DistShapeShape extrema;
 };
 
-// Per-face map from STEP vertex hash → wire projector, shared across all segments.
+// Per-face map from STEP vertex hash -> wire projector, shared across all segments.
 using WireProjectorCachePtr =
     std::shared_ptr<std::unordered_map<int, std::unordered_map<int, StepProjector>>>;
 
@@ -73,11 +73,11 @@ struct TessellationValidation {
     size_t total_tris      = 0;
     size_t border_verts    = 0;   // mesh-border vertices (edge-origin)
     size_t interior_verts  = 0;   // mesh-interior vertices (surface-origin)
-    double max_border_edge_dist    = 0.0;  // worst border vertex → nearest STEP edge
-    double max_interior_face_dist  = 0.0;  // worst interior vertex → its STEP face
+    double max_border_edge_dist    = 0.0;  // worst border vertex -> nearest STEP edge
+    double max_interior_face_dist  = 0.0;  // worst interior vertex -> its STEP face
     size_t misclassified_border    = 0;    // border verts farther than tol from any edge
     size_t misclassified_interior  = 0;    // interior verts farther than tol from face
-    double max_surface_error  = 0.0;  // worst triangle-interior sample → BREP face
+    double max_surface_error  = 0.0;  // worst triangle-interior sample -> BREP face
     double mean_surface_error = 0.0;  // mean over all samples
     size_t surface_samples    = 0;
     size_t open_boundary_edges = 0;   // border edges of the merged mesh (cracks / true boundary)
@@ -87,11 +87,11 @@ struct TessellationValidation {
 // on a STEP edge and interior vertices on the STEP face (invariants 2 & 3); sample each
 // triangle's interior (centroid; + edge midpoints if samples_per_tri >= 4) and measure the
 // surface error to the BREP face; and count open boundary edges of the merged mesh
-// (watertightness).  Intended as an opt-in validation pass — BRep distance queries make it
+// (watertightness).  Intended as an opt-in validation pass -- BRep distance queries make it
 // slow on large meshes.
 // `edge_faces` is parallel to `segments`: the ORIGINAL (pre-subdivision) face each segment
-// came from.  Vertices are classified against that face's REAL edges (seam edges excluded) —
-// not the segment mesh's border — so periodic seams and subdivision cuts (which are interior
+// came from.  Vertices are classified against that face's REAL edges (seam edges excluded) --
+// not the segment mesh's border -- so periodic seams and subdivision cuts (which are interior
 // to the continuous surface, not true part boundaries) are validated against the surface, not
 // against a boundary.  Pass `segments` itself when there was no subdivision.
 TessellationValidation validate_tessellation(const std::vector<Mesh>& meshes,
