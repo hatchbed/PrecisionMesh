@@ -35,8 +35,15 @@ public:
     // Called from the worker thread — non-blocking.  Converts meshes to flat
     // GPU data and posts to a pending slot.  The render loop uploads it on the
     // next frame.
+    // `free_brep_edges` are GL_LINES xyz pairs for the input shape's free boundary edges
+    // (drawn bold yellow).  Open edges of the merged triangle soup (the real cracks) are
+    // computed from the segment meshes and drawn bold magenta.  `healed_edges` are
+    // GL_LINES xyz pairs for edges that were open before loop repair and are now closed
+    // (drawn bold green).
     void update(const std::vector<ViewerSegment>& segments,
-                const std::string& stage_label);
+                const std::string& stage_label,
+                const std::vector<float>& free_brep_edges = {},
+                const std::vector<float>& healed_edges = {});
 
     // Called by the worker thread when all processing is complete.  After this,
     // the next window-close event exits the event loop normally.

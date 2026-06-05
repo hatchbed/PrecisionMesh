@@ -48,9 +48,12 @@
 #include <TDF_LabelSequence.hxx>
 #include <TDocStd_Document.hxx>
 #include <TopoDS.hxx>
+#include <Precision.hxx>
 #include <TopoDS_Face.hxx>
 #include <TopoDS_Shape.hxx>
+#include <TopoDS_Vertex.hxx>
 #include <TopExp.hxx>
+#include <TopTools_IndexedMapOfShape.hxx>
 #include <TopExp_Explorer.hxx>
 #include <TopTools_IndexedDataMapOfShapeListOfShape.hxx>
 #include <XCAFApp_Application.hxx>
@@ -85,7 +88,9 @@ static void push_to_viewer(Viewer* viewer,
                             const std::unordered_map<size_t, int>& component_map,
                             bool is_step,
                             const std::string& label,
-                            double wire_deflection)
+                            double wire_deflection,
+                            const std::vector<float>& free_edge_lines = {},
+                            const std::vector<float>& healed_edge_lines = {})
 {
     if (!viewer) return;
 
@@ -126,7 +131,7 @@ static void push_to_viewer(Viewer* viewer,
         vsegs.push_back({&meshes[i], ft, (int)i, orig_idx, sdivs, area, desc,
                          std::move(subseg_wire), std::move(orig_face_wire)});
     }
-    viewer->update(vsegs, label);
+    viewer->update(vsegs, label, free_edge_lines, healed_edge_lines);
 }
 #endif
 
@@ -584,6 +589,8 @@ int main(int argc, char **argv) {
     std::vector<TopoDS_Face> segments;
     std::vector<TopoDS_Face> original_faces;
     std::unordered_map<size_t, int> component_map;
+    [[maybe_unused]] std::vector<float> free_edge_lines;    // input BREP free boundary edges, for the viewer (yellow)
+    [[maybe_unused]] std::vector<float> healed_edge_lines; // pre-repair open edges, for the viewer (green)
 
     min_edge_length /= conversion_scale;
     max_edge_length /= conversion_scale;
@@ -594,38 +601,141 @@ int main(int argc, char **argv) {
 
         if (max_surface_error_from_default) {
             double max_surface_error_auto = find_surface_error_param(selected_component->shape,
-                                                                           min_edge_length, 10, 
+                                                                           min_edge_length, 10,
                                                                            conversion_scale);
             max_surface_error = max_surface_error_auto;
         }
 
         original_faces = get_faces(selected_component->shape);
 
-        // DEBUG: report non-conformal topology in the INPUT shape — edges adjacent to !=2
+        // DEBUG: report non-conformal topology in the INPUT shape -- edges adjacent to !=2
         // faces are free (open shell / un-stitched import) and tessellate to cracks that no
-        // amount of meshing can stitch.
+        // amount of meshing can stitch.  Periodic SEAM edges (closed on their face) belong to
+        // one face but are NOT boundaries -- exclude them so the count reflects real free edges.
         {
             TopTools_IndexedDataMapOfShapeListOfShape edge_faces;
             TopExp::MapShapesAndAncestors(selected_component->shape, TopAbs_EDGE, TopAbs_FACE, edge_faces);
-            int free_edges = 0, nonmanifold = 0, shown = 0;
+            int free_edges = 0, free_degenerate = 0, seam_edges = 0, nonmanifold = 0, shown = 0;
             for (int i = 1; i <= edge_faces.Extent(); i++) {
-                int nf = edge_faces.FindFromIndex(i).Extent();
+                const TopTools_ListOfShape& faces = edge_faces.FindFromIndex(i);
+                int nf = faces.Extent();
                 if (nf == 2) continue;
-                if (nf < 2) free_edges++; else nonmanifold++;
+                const TopoDS_Edge& e = TopoDS::Edge(edge_faces.FindKey(i));
+                if (nf >= 1 && BRep_Tool::IsClosed(e, TopoDS::Face(faces.First()))) { seam_edges++; continue; }
+                if (nf >= 2) { nonmanifold++; continue; }
+                Standard_Real f, l; Handle(Geom_Curve) c = BRep_Tool::Curve(e, f, l);
+                if (c.IsNull() || l - f < 1e-15) { free_degenerate++; continue; }
+                free_edges++;
                 if (shown < 12) {
-                    const TopoDS_Edge& e = TopoDS::Edge(edge_faces.FindKey(i));
-                    Standard_Real f, l; Handle(Geom_Curve) c = BRep_Tool::Curve(e, f, l);
-                    if (!c.IsNull()) {
-                        gp_Pnt a = c->Value(f), b = c->Value(l);
-                        spdlog::debug("    [freeedge] nfaces={} ({:.4f},{:.4f},{:.4f})->({:.4f},{:.4f},{:.4f})",
-                                      nf, a.X(),a.Y(),a.Z(), b.X(),b.Y(),b.Z());
-                        shown++;
-                    }
+                    gp_Pnt a = c->Value(f), b = c->Value(l);
+                    spdlog::debug("    [freeedge] nfaces={} ({:.4f},{:.4f},{:.4f})->({:.4f},{:.4f},{:.4f})",
+                                  nf, a.X(),a.Y(),a.Z(), b.X(),b.Y(),b.Z());
+                    shown++;
                 }
             }
-            spdlog::info("    input topology: {} edges, {} free (nfaces<2), {} non-manifold (nfaces>2)",
-                         edge_faces.Extent(), free_edges, nonmanifold);
+            spdlog::info("    OCCT precision: Confusion={:.3e} PConfusion={:.3e}",
+                         Precision::Confusion(), Precision::PConfusion());
+            if (free_degenerate)
+                spdlog::info("    input topology: {} edges, {} free (real boundary), {} degenerate free (no 3D curve), {} seam, {} non-manifold",
+                             edge_faces.Extent(), free_edges, free_degenerate, seam_edges, nonmanifold);
+            else
+                spdlog::info("    input topology: {} edges, {} free (real boundary), {} seam, {} non-manifold",
+                             edge_faces.Extent(), free_edges, seam_edges, nonmanifold);
+
+            // A degenerate-free edge (null curve, 1 face) is only valid as a surface pole,
+            // where it loops back to itself (FirstVertex == LastVertex, same object).  If the
+            // two endpoint vertices are distinct objects the edge is not a pole -- it connects
+            // two different BREP vertices along a single face with no matching opposite face.
+            // That face's tessellation will have an open boundary edge there with nothing to
+            // stitch against: the BREP is the cause of the tessellation gap.
+            for (int i = 1; i <= edge_faces.Extent(); i++) {
+                const TopTools_ListOfShape& faces = edge_faces.FindFromIndex(i);
+                if (faces.Extent() != 1) continue;
+                const TopoDS_Edge& e = TopoDS::Edge(edge_faces.FindKey(i));
+                Standard_Real f, l;
+                if (!BRep_Tool::Curve(e, f, l).IsNull()) continue;  // not degenerate-free
+                TopoDS_Vertex v1 = TopExp::FirstVertex(e);
+                TopoDS_Vertex v2 = TopExp::LastVertex(e);
+                if (v1.IsNull() || v2.IsNull() || v1.IsSame(v2)) continue;  // proper pole
+                gp_Pnt p1 = BRep_Tool::Pnt(v1), p2 = BRep_Tool::Pnt(v2);
+                spdlog::warn("    [degenerate-free edge, distinct vertices] "
+                             "({:.6f},{:.6f},{:.6f}) vs ({:.6f},{:.6f},{:.6f}) dist={:.3e} -- "
+                             "not a pole; will produce open tessellation boundary",
+                             p1.X(),p1.Y(),p1.Z(), p2.X(),p2.Y(),p2.Z(), p1.Distance(p2));
+            }
         }
+
+        // A degenerate BREP edge (BRep_Tool::Degenerated) collapses to a point -- its two
+        // endpoint vertices must be the same topological object (v1.IsSame(v2)).  If they are
+        // not, the BREP has a provable inconsistency with no geometric tolerance involved: the
+        // topology declares the edge a point but assigns two distinct vertex identities to its
+        // endpoints.  In a topologically closed BREP this is the only way a watertight topology
+        // can produce a non-watertight tessellation, because BRepMesh evaluates each face's
+        // pcurves independently and the two vertex positions will not agree exactly.
+        {
+            TopTools_IndexedMapOfShape edge_map;
+            TopExp::MapShapes(selected_component->shape, TopAbs_EDGE, edge_map);
+            int inconsistent = 0;
+            for (int i = 1; i <= edge_map.Extent(); i++) {
+                const TopoDS_Edge& e = TopoDS::Edge(edge_map.FindKey(i));
+                if (!BRep_Tool::Degenerated(e)) continue;
+                TopoDS_Vertex v1 = TopExp::FirstVertex(e);
+                TopoDS_Vertex v2 = TopExp::LastVertex(e);
+                if (v1.IsNull() || v2.IsNull() || v1.IsSame(v2)) continue;
+                gp_Pnt p1 = BRep_Tool::Pnt(v1), p2 = BRep_Tool::Pnt(v2);
+                spdlog::warn("    [degenerate edge, distinct vertices] ({:.6f},{:.6f},{:.6f}) vs "
+                             "({:.6f},{:.6f},{:.6f}) dist={:.3e} -- will cause tessellation gap",
+                             p1.X(),p1.Y(),p1.Z(), p2.X(),p2.Y(),p2.Z(),
+                             p1.Distance(p2));
+                inconsistent++;
+            }
+            if (inconsistent > 0)
+                spdlog::warn("    {} degenerate edge(s) with distinct endpoint vertices",
+                             inconsistent);
+        }
+
+        // For each edge with a non-null 3D curve, check that the chord from curve(f) to
+        // curve(l) bridges the vertex-to-vertex gap within the combined vertex tolerance.
+        // Shortfalls beyond tolerance indicate the stored parameter range doesn't correctly
+        // connect the edge's bounding vertices.  Diagnostic only -- no shape modification.
+        {
+            TopTools_IndexedMapOfShape emap;
+            TopExp::MapShapes(selected_component->shape, TopAbs_EDGE, emap);
+            int inconsistent = 0;
+            for (int i = 1; i <= emap.Extent(); i++) {
+                const TopoDS_Edge& e = TopoDS::Edge(emap.FindKey(i));
+                Standard_Real f, l;
+                Handle(Geom_Curve) c = BRep_Tool::Curve(e, f, l);
+                if (c.IsNull()) continue;
+                TopoDS_Vertex v1 = TopExp::FirstVertex(e);
+                TopoDS_Vertex v2 = TopExp::LastVertex(e);
+                if (v1.IsNull() || v2.IsNull()) continue;
+                gp_Pnt pf = c->Value(f), pl = c->Value(l);
+                gp_Pnt q1 = BRep_Tool::Pnt(v1), q2 = BRep_Tool::Pnt(v2);
+                double chord    = pf.Distance(pl);
+                double vgap     = q1.Distance(q2);
+                double tol1     = BRep_Tool::Tolerance(v1), tol2 = BRep_Tool::Tolerance(v2);
+                double shortfall = vgap - chord;
+                if (shortfall <= tol1 + tol2) continue;
+                inconsistent++;
+                spdlog::warn("    [edge-vertex mismatch] chord={:.3e} vertex-gap={:.3e} "
+                             "shortfall={:.3e} (tol sum={:.3e}) -- "
+                             "V1=({:.5f},{:.5f},{:.5f}) V2=({:.5f},{:.5f},{:.5f})",
+                             chord, vgap, shortfall, tol1 + tol2,
+                             q1.X(),q1.Y(),q1.Z(), q2.X(),q2.Y(),q2.Z());
+            }
+            if (inconsistent > 0) {
+                spdlog::warn("    {} edge(s) with chord-vertex mismatch beyond tolerance",
+                             inconsistent);
+            }
+        }
+
+#ifdef PRECISION_MESH_HAS_VIEWER
+        // Sample the input's free boundary edges once (pre-subdivision) for the viewer overlay.
+        free_edge_lines = sample_free_edges(selected_component->shape, max_surface_error);
+        spdlog::info("    free-edge overlay: {} GL_LINES segments (0 = no renderable free edges)",
+                     free_edge_lines.size() / 6);
+#endif
 
         FaceMap face_map;
         if (!no_subdivision && !raw_step_mesh) {
@@ -642,6 +752,44 @@ int main(int argc, char **argv) {
         auto tessellation = boundary_mesh_mode
             ? boundary_meshes(selected_component->shape)
             : tessellate_shape(selected_component->shape, max_surface_error, !no_tess_repair);
+
+        if (is_step && !boundary_mesh_mode) {
+#ifdef PRECISION_MESH_HAS_VIEWER
+            // Capture open boundary edges before repair so they can be shown in green.
+            if (viewer_ptr) {
+                std::map<std::tuple<double,double,double>, int> pid;
+                std::vector<std::array<double,3>> pos;
+                std::map<std::pair<int,int>, int> ecnt;
+                auto id_of = [&](const Mesh::Point& p) {
+                    double x=CGAL::to_double(p.x()), y=CGAL::to_double(p.y()), z=CGAL::to_double(p.z());
+                    auto key = std::make_tuple(x,y,z);
+                    auto it = pid.find(key);
+                    if (it != pid.end()) return it->second;
+                    int id = (int)pos.size(); pid[key]=id; pos.push_back({x,y,z}); return id;
+                };
+                for (const auto& [mesh, face] : tessellation) {
+                    for (auto f : mesh.faces()) {
+                        int ids[3]; int k=0;
+                        for (auto v : mesh.vertices_around_face(mesh.halfedge(f)))
+                            if (k<3) ids[k++] = id_of(mesh.point(v));
+                        if (k!=3) continue;
+                        for (int e=0;e<3;e++) {
+                            int a=ids[e],b=ids[(e+1)%3]; if(a>b)std::swap(a,b);
+                            ecnt[{a,b}]++;
+                        }
+                    }
+                }
+                for (const auto& [e, cnt] : ecnt) {
+                    if (cnt != 1) continue;
+                    const auto& A = pos[e.first]; const auto& B = pos[e.second];
+                    healed_edge_lines.push_back((float)A[0]); healed_edge_lines.push_back((float)A[1]); healed_edge_lines.push_back((float)A[2]);
+                    healed_edge_lines.push_back((float)B[0]); healed_edge_lines.push_back((float)B[1]); healed_edge_lines.push_back((float)B[2]);
+                }
+            }
+#endif
+            repair_open_boundary_loops(tessellation, min_edge_length);
+        }
+
         size_t total_faces = 0;
         for (const auto& [mesh, face]: tessellation) {
             meshes.push_back(mesh);
@@ -652,7 +800,7 @@ int main(int argc, char **argv) {
         spdlog::info("  tessellated component into {} faces over {} segments.", total_faces, meshes.size());
 #ifdef PRECISION_MESH_HAS_VIEWER
         push_to_viewer(viewer_ptr, meshes, segments, original_faces, component_map, is_step,
-                       "After Tessellation", max_surface_error);
+                       "After Tessellation", max_surface_error, free_edge_lines, healed_edge_lines);
 #endif
 
         // Create mapping of subdivided components to the original components prior to subdivision
@@ -685,7 +833,7 @@ int main(int argc, char **argv) {
 
 #ifdef PRECISION_MESH_HAS_VIEWER
         push_to_viewer(viewer_ptr, meshes, segments, original_faces, component_map, is_step,
-                       "After Border Splitting", max_surface_error);
+                       "After Border Splitting", max_surface_error, free_edge_lines, healed_edge_lines);
 #endif
 
         spdlog::info("  adaptive isotropic remeshing ...");
@@ -714,7 +862,7 @@ int main(int argc, char **argv) {
                 push_to_viewer(viewer_ptr, meshes, segments, original_faces, component_map, is_step,
                                "Iteration " + std::to_string(iter) +
                                "/" + std::to_string(iterations),
-                               max_surface_error);
+                               max_surface_error, free_edge_lines, healed_edge_lines);
             };
         }
 #endif
@@ -726,7 +874,7 @@ int main(int argc, char **argv) {
 
 #ifdef PRECISION_MESH_HAS_VIEWER
     push_to_viewer(viewer_ptr, meshes, segments, original_faces, component_map, is_step,
-                   "Final Result", max_surface_error);
+                   "Final Result", max_surface_error, free_edge_lines, healed_edge_lines);
     if (viewer_ptr) viewer_ptr->notify_done();
 #endif
 

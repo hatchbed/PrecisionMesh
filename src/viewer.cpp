@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <map>
@@ -17,8 +18,10 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #ifdef __unix__
@@ -215,6 +218,15 @@ struct Viewer::Impl {
     GLuint border_vao = 0, border_vbo = 0;
     GLsizei border_vert_count = 0;
 
+    // Free BREP boundary edges (bold yellow), open triangle-soup edges (bold magenta),
+    // and healed edges -- previously-open edges closed by loop repair (bold green).
+    GLuint free_edge_vao = 0, free_edge_vbo = 0;
+    GLsizei free_edge_vert_count = 0;
+    GLuint open_edge_vao = 0, open_edge_vbo = 0;
+    GLsizei open_edge_vert_count = 0;
+    GLuint healed_edge_vao = 0, healed_edge_vbo = 0;
+    GLsizei healed_edge_vert_count = 0;
+
     // ── Per-triangle metadata (one entry per face) ───────────────────────────
     struct TriangleMeta {
         int         face_type;
@@ -230,6 +242,9 @@ struct Viewer::Impl {
         std::vector<GpuVertex>    verts;
         std::vector<TriangleMeta> meta;      // parallel to verts/3 (one per triangle)
         std::vector<float>        border_xyz;  // x,y,z triples
+        std::vector<float>        free_edge_xyz;   // free BREP boundary edges (yellow)
+        std::vector<float>        open_edge_xyz;   // open triangle-soup edges (magenta)
+        std::vector<float>        healed_edge_xyz; // loop-repaired edges (green)
         // segment_index → all border edges (for hover red wire)
         std::unordered_map<int, std::vector<float>> seg_borders;
         // original_face_index → CAD-boundary border edges (for hover green wire)
@@ -294,7 +309,10 @@ struct Viewer::Impl {
     // ── UI state ─────────────────────────────────────────────────────────────
     int  display_mode  = 2;     // 0=solid 1=wireframe 2=solid+edges
     int  color_mode    = 1;     // 0=uniform 1=face_type 2=segment
-    bool show_borders  = true;
+    bool show_borders    = true;
+    bool show_free_edges   = true;  // yellow: input BREP free boundary edges
+    bool show_open_edges   = true;  // magenta: open triangle-soup edges (cracks)
+    bool show_healed_edges = true;  // green: edges closed by loop repair
 
     // ── Camera state ─────────────────────────────────────────────────────────
     bool camera_fitted = false;  // auto-fit only on the first upload
@@ -497,6 +515,31 @@ Viewer::Viewer(int width, int height, const std::string& title)
     glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), nullptr);
     glBindVertexArray(0);
 
+    // Free BREP boundary edges (yellow) and open soup edges (magenta)
+    glGenVertexArrays(1, &impl_->free_edge_vao);
+    glGenBuffers(1, &impl_->free_edge_vbo);
+    glBindVertexArray(impl_->free_edge_vao);
+    glBindBuffer(GL_ARRAY_BUFFER, impl_->free_edge_vbo);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), nullptr);
+    glBindVertexArray(0);
+
+    glGenVertexArrays(1, &impl_->open_edge_vao);
+    glGenBuffers(1, &impl_->open_edge_vbo);
+    glBindVertexArray(impl_->open_edge_vao);
+    glBindBuffer(GL_ARRAY_BUFFER, impl_->open_edge_vbo);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), nullptr);
+    glBindVertexArray(0);
+
+    glGenVertexArrays(1, &impl_->healed_edge_vao);
+    glGenBuffers(1, &impl_->healed_edge_vbo);
+    glBindVertexArray(impl_->healed_edge_vao);
+    glBindBuffer(GL_ARRAY_BUFFER, impl_->healed_edge_vbo);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), nullptr);
+    glBindVertexArray(0);
+
     // Hover subsegment border (red)
     glGenVertexArrays(1, &impl_->hover_subseg_vao);
     glGenBuffers(1, &impl_->hover_subseg_vbo);
@@ -536,6 +579,12 @@ Viewer::~Viewer() {
     glDeleteBuffers(1, &impl_->tri_vbo);
     glDeleteVertexArrays(1, &impl_->border_vao);
     glDeleteBuffers(1, &impl_->border_vbo);
+    glDeleteVertexArrays(1, &impl_->free_edge_vao);
+    glDeleteBuffers(1, &impl_->free_edge_vbo);
+    glDeleteVertexArrays(1, &impl_->open_edge_vao);
+    glDeleteBuffers(1, &impl_->open_edge_vbo);
+    glDeleteVertexArrays(1, &impl_->healed_edge_vao);
+    glDeleteBuffers(1, &impl_->healed_edge_vbo);
     glDeleteVertexArrays(1, &impl_->hover_subseg_vao);
     glDeleteBuffers(1, &impl_->hover_subseg_vbo);
     glDeleteVertexArrays(1, &impl_->hover_face_vao);
@@ -549,7 +598,9 @@ Viewer::~Viewer() {
 
 // ── Viewer::update (worker thread) ───────────────────────────────────────────
 void Viewer::update(const std::vector<ViewerSegment>& segments,
-                    const std::string& label)
+                    const std::string& label,
+                    const std::vector<float>& free_brep_edges,
+                    const std::vector<float>& healed_edges)
 {
     if (!impl_->window) return;
 
@@ -557,6 +608,40 @@ void Viewer::update(const std::vector<ViewerSegment>& segments,
     snap.label     = label;
     snap.seg_count = segments.size();
     snap.valid     = true;
+    snap.free_edge_xyz   = free_brep_edges; // bold yellow: input BREP free boundary edges
+    snap.healed_edge_xyz = healed_edges;   // bold green: edges closed by loop repair
+
+    // Open triangle-soup edges (bold magenta): undirected edges incident to exactly one
+    // triangle across ALL segment meshes, merged by exact position — the real cracks (this
+    // matches the validator's watertightness measure, not per-mesh is_border).
+    {
+        std::map<std::tuple<double,double,double>, int> pid;
+        std::vector<std::array<double,3>> pos;
+        auto id_of = [&](const Mesh::Point& p) {
+            double x=(double)p.x(), y=(double)p.y(), z=(double)p.z();
+            auto key = std::make_tuple(x,y,z);
+            auto it = pid.find(key);
+            if (it != pid.end()) return it->second;
+            int id = (int)pos.size(); pid[key]=id; pos.push_back({x,y,z}); return id;
+        };
+        std::map<std::pair<int,int>, int> ecount;
+        for (const auto& seg : segments) {
+            if (!seg.mesh) continue;
+            const Mesh& m = *seg.mesh;
+            for (auto f : m.faces()) {
+                int ids[3]; int k = 0;
+                for (auto v : m.vertices_around_face(m.halfedge(f))) { if (k<3) ids[k]=id_of(m.point(v)); k++; }
+                if (k != 3) continue;
+                for (int e=0;e<3;e++){ int a=ids[e],b=ids[(e+1)%3]; if(a>b) std::swap(a,b); ecount[{a,b}]++; }
+            }
+        }
+        for (const auto& kv : ecount) {
+            if (kv.second != 1) continue;
+            const auto& A = pos[kv.first.first]; const auto& B = pos[kv.first.second];
+            snap.open_edge_xyz.push_back((float)A[0]); snap.open_edge_xyz.push_back((float)A[1]); snap.open_edge_xyz.push_back((float)A[2]);
+            snap.open_edge_xyz.push_back((float)B[0]); snap.open_edge_xyz.push_back((float)B[1]); snap.open_edge_xyz.push_back((float)B[2]);
+        }
+    }
 
     float bmin[3] = {1e30f, 1e30f, 1e30f};
     float bmax[3] = {-1e30f,-1e30f,-1e30f};
@@ -702,6 +787,36 @@ static void upload_snapshot(Viewer::Impl& impl, const Viewer::Impl::Snapshot& s)
     }
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     impl.border_vert_count = (GLsizei)(s.border_xyz.size() / 3);
+
+    // Free BREP boundary edges (yellow)
+    glBindBuffer(GL_ARRAY_BUFFER, impl.free_edge_vbo);
+    if (!s.free_edge_xyz.empty())
+        glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(s.free_edge_xyz.size() * sizeof(float)),
+                     s.free_edge_xyz.data(), GL_DYNAMIC_DRAW);
+    else
+        glBufferData(GL_ARRAY_BUFFER, 0, nullptr, GL_DYNAMIC_DRAW);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    impl.free_edge_vert_count = (GLsizei)(s.free_edge_xyz.size() / 3);
+
+    // Open triangle-soup edges (magenta)
+    glBindBuffer(GL_ARRAY_BUFFER, impl.open_edge_vbo);
+    if (!s.open_edge_xyz.empty())
+        glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(s.open_edge_xyz.size() * sizeof(float)),
+                     s.open_edge_xyz.data(), GL_DYNAMIC_DRAW);
+    else
+        glBufferData(GL_ARRAY_BUFFER, 0, nullptr, GL_DYNAMIC_DRAW);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    impl.open_edge_vert_count = (GLsizei)(s.open_edge_xyz.size() / 3);
+
+    // Healed edges (green)
+    glBindBuffer(GL_ARRAY_BUFFER, impl.healed_edge_vbo);
+    if (!s.healed_edge_xyz.empty())
+        glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(s.healed_edge_xyz.size() * sizeof(float)),
+                     s.healed_edge_xyz.data(), GL_DYNAMIC_DRAW);
+    else
+        glBufferData(GL_ARRAY_BUFFER, 0, nullptr, GL_DYNAMIC_DRAW);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    impl.healed_edge_vert_count = (GLsizei)(s.healed_edge_xyz.size() / 3);
 
     impl.current_label = s.label;
     impl.current_tris  = s.tri_count;
@@ -955,6 +1070,49 @@ static void render_frame(Viewer::Impl& impl) {
             glLineWidth(1.0f);
         }
 
+        // Free BREP boundary edges (bold yellow) — drawn on top, depth-test off so they're
+        // always visible.
+        if (impl.show_free_edges && impl.free_edge_vert_count > 0) {
+            glUseProgram(impl.line_prog);
+            glUniformMatrix4fv(glGetUniformLocation(impl.line_prog, "u_mvp"), 1, GL_FALSE, mvp.data());
+            glUniform4f(glGetUniformLocation(impl.line_prog, "u_color"), 1.0f, 0.92f, 0.0f, 1.0f);
+            glLineWidth(4.0f);
+            glDisable(GL_DEPTH_TEST);
+            glBindVertexArray(impl.free_edge_vao);
+            glDrawArrays(GL_LINES, 0, impl.free_edge_vert_count);
+            glBindVertexArray(0);
+            glEnable(GL_DEPTH_TEST);
+            glLineWidth(1.0f);
+        }
+
+        // Healed edges (bold green) -- previously-open edges closed by loop repair.
+        if (impl.show_healed_edges && impl.healed_edge_vert_count > 0) {
+            glUseProgram(impl.line_prog);
+            glUniformMatrix4fv(glGetUniformLocation(impl.line_prog, "u_mvp"), 1, GL_FALSE, mvp.data());
+            glUniform4f(glGetUniformLocation(impl.line_prog, "u_color"), 0.0f, 0.9f, 0.2f, 1.0f);
+            glLineWidth(4.0f);
+            glDisable(GL_DEPTH_TEST);
+            glBindVertexArray(impl.healed_edge_vao);
+            glDrawArrays(GL_LINES, 0, impl.healed_edge_vert_count);
+            glBindVertexArray(0);
+            glEnable(GL_DEPTH_TEST);
+            glLineWidth(1.0f);
+        }
+
+        // Open triangle-soup edges (bold magenta) -- remaining cracks; drawn last so they win.
+        if (impl.show_open_edges && impl.open_edge_vert_count > 0) {
+            glUseProgram(impl.line_prog);
+            glUniformMatrix4fv(glGetUniformLocation(impl.line_prog, "u_mvp"), 1, GL_FALSE, mvp.data());
+            glUniform4f(glGetUniformLocation(impl.line_prog, "u_color"), 1.0f, 0.0f, 1.0f, 1.0f);
+            glLineWidth(4.0f);
+            glDisable(GL_DEPTH_TEST);
+            glBindVertexArray(impl.open_edge_vao);
+            glDrawArrays(GL_LINES, 0, impl.open_edge_vert_count);
+            glBindVertexArray(0);
+            glEnable(GL_DEPTH_TEST);
+            glLineWidth(1.0f);
+        }
+
         // Hover original-face border (green) — drawn before subseg so red is on top
         if (impl.hover_face_vert_count > 0) {
             glUseProgram(impl.line_prog);
@@ -1022,6 +1180,9 @@ static void render_frame(Viewer::Impl& impl) {
     ImGui::Separator();
 
     ImGui::Checkbox("CAD Boundaries", &impl.show_borders);
+    ImGui::Checkbox("Free Edges (yellow)", &impl.show_free_edges);
+    ImGui::Checkbox("Open Edges (magenta)", &impl.show_open_edges);
+    ImGui::Checkbox("Healed Edges (green)", &impl.show_healed_edges);
     ImGui::Separator();
 
     ImGui::TextDisabled("Segments:  %zu", impl.current_segs);
