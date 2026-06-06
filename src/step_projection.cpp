@@ -402,6 +402,18 @@ void project_to_step(const TopoDS_Face& face, Mesh& mesh,
     if (has_real_edges) edge_classifier.LoadS1(edge_comp);
     const double edge_tol = 1e-3;  // matches get_border_vertex_projector_map default
 
+    // Border-locked flag.  remesh_and_project sets v:border_locked=true on every border
+    // vertex before the first iteration — both original BRepMesh placements and chord
+    // midpoints inserted by split_border_edges.  Using this as an identity gate is strictly
+    // better than a distance threshold: it requires no OCCT distance calls, needs no
+    // tolerance tuning, and locks exactly the set of vertices the isotropic remesher already
+    // treats as immutable constraints.  add_property_map is used here so that the call is
+    // safe even when project_to_step is invoked outside the normal remesh loop (in that
+    // case the map doesn't exist yet and add_property_map creates it with all-false defaults,
+    // falling through to the distance-based on_real_edge check below).
+    const auto border_locked = mesh.add_property_map<Mesh::Vertex_index, bool>(
+        "v:border_locked", false).first;
+
     // UV-seeded local surface projection.  Constructed once per face; Perform() is called
     // per interior vertex using the stored "v:uv" as initial guess.  This eliminates the
     // wrong-local-minimum failure of the global BRepExtrema search on complex B-spline faces.
@@ -411,6 +423,20 @@ void project_to_step(const TopoDS_Face& face, Mesh& mesh,
         "v:uv", {kNaN_uv, kNaN_uv}).first;
     BRepAdaptor_Surface adaptor(face);
     Extrema_GenLocateExtPS local_ext(adaptor, 1e-7, 1e-7);
+
+    // Period-normalization constants for this face.  ShapeAnalysis_Surface::ValueOfUV
+    // (used to fill UV seeds for remesher-inserted vertices) returns U/V in the
+    // surface's NATURAL range (e.g. [0, 2π]) regardless of the face's actual parameter
+    // range (e.g. [π, 3π] for a cylinder whose seam is not at U=0).  If the Newton
+    // search starts outside the face's period the algorithm converges to the wrong
+    // local minimum — on the OPPOSITE side of the cylinder.  We normalize the seed
+    // to [face_umin, face_umin + period) before every Perform() call.
+    const bool u_periodic = adaptor.IsUPeriodic();
+    const bool v_periodic = adaptor.IsVPeriodic();
+    const double u_period = u_periodic ? adaptor.UPeriod() : 0.0;
+    const double v_period = v_periodic ? adaptor.VPeriod() : 0.0;
+    const double u_seed_min = u_periodic ? adaptor.FirstUParameter() : 0.0;
+    const double v_seed_min = v_periodic ? adaptor.FirstVParameter() : 0.0;
 
     ProjectionStats stats;
 
@@ -431,9 +457,20 @@ void project_to_step(const TopoDS_Face& face, Mesh& mesh,
         double px = CGAL::to_double(input.x()), py = CGAL::to_double(input.y()),
                pz = CGAL::to_double(input.z());
 
-        // Use mesh.is_border as a cheap pre-filter (interior vertices are never on a
-        // real boundary), then confirm geometrically so seam vertices are classified
-        // as surface rather than edge.
+        // All vertices that were on the mesh border when remesh_and_project set up the
+        // constraint maps are immutable: exact BRepMesh placements, consistent chord
+        // midpoints from split_border_edges, or subdivision-cut boundary vertices.
+        // Projecting them independently per segment causes adjacent segments to diverge.
+        // This is a fast identity check — no OCCT distance queries needed.
+        if (border_locked[v]) {
+            stats.n_border_skipped++;
+            continue;
+        }
+
+        // Fallback for the case where v:border_locked was not pre-populated (e.g. if
+        // project_to_step is called outside the normal remesh loop).  Use mesh.is_border
+        // as a cheap pre-filter, then confirm geometrically so seam vertices (which are
+        // mesh-interior) are classified as surface rather than edge.
         bool on_real_edge = false;
         double edge_check_dist = -1.0;
         if (has_real_edges && mesh.is_border(v)) {
@@ -446,11 +483,6 @@ void project_to_step(const TopoDS_Face& face, Mesh& mesh,
                 on_real_edge = edge_check_dist <= edge_tol;
             }
         }
-
-        // Border vertices are static: they come from BRepMesh (exact BREP placement) or
-        // split_border_edges (chord midpoint, close enough).  Projecting them independently
-        // per segment causes adjacent segments to diverge by small floating-point amounts,
-        // breaking the soup-based watertightness check.  Skip them entirely.
         if (on_real_edge) {
             stats.n_border_skipped++;
             continue;
@@ -462,14 +494,36 @@ void project_to_step(const TopoDS_Face& face, Mesh& mesh,
             // Try UV-seeded local Newton search first (avoids wrong-local-minimum on B-splines).
             const auto& stored_uv = uv_map[v];
             if (!std::isnan(stored_uv.first)) {
-                local_ext.Perform(gp_Pnt(px, py, pz), stored_uv.first, stored_uv.second);
+                // Normalize UV seed into the face's parameter period before the Newton
+                // search so it starts on the correct sheet of the surface.
+                double u_seed = stored_uv.first, v_seed = stored_uv.second;
+                if (u_periodic && u_period > 0.0) {
+                    const double u_max = u_seed_min + u_period;
+                    while (u_seed < u_seed_min) u_seed += u_period;
+                    while (u_seed > u_max)      u_seed -= u_period;
+                }
+                if (v_periodic && v_period > 0.0) {
+                    const double v_max = v_seed_min + v_period;
+                    while (v_seed < v_seed_min) v_seed += v_period;
+                    while (v_seed > v_max)      v_seed -= v_period;
+                }
+
+                local_ext.Perform(gp_Pnt(px, py, pz), u_seed, v_seed);
                 if (local_ext.IsDone()) {
                     const gp_Pnt& lp = local_ext.Point().Value();
-                    projected = Mesh::Point(lp.X(), lp.Y(), lp.Z());
-                    double ru, rv;
-                    local_ext.Point().Parameter(ru, rv);
-                    uv_map[v] = {ru, rv};
-                    used_local_uv = true;
+                    // Guard: if the Newton result is implausibly far away (e.g. it
+                    // converged to the opposite side of a cylinder despite the seed
+                    // normalization), reject and fall back to global BRepExtrema.
+                    double uv_delta = gp_Pnt(px, py, pz).Distance(lp);
+                    if (max_projection_delta > 0.0 && uv_delta > max_projection_delta) {
+                        uv_map[v] = {kNaN_uv, kNaN_uv};  // discard bad seed
+                    } else {
+                        projected = Mesh::Point(lp.X(), lp.Y(), lp.Z());
+                        double ru, rv;
+                        local_ext.Point().Parameter(ru, rv);
+                        uv_map[v] = {ru, rv};
+                        used_local_uv = true;
+                    }
                 }
             }
             if (!used_local_uv) {

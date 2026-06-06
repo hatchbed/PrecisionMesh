@@ -831,6 +831,10 @@ int main(int argc, char **argv) {
             split_crease_edges(meshes, crease_angle, max_edge_length);
         }
 
+        if (is_step) {
+            snap_border_midpoints_to_brep(meshes, segments, max_edge_length);
+        }
+
 #ifdef PRECISION_MESH_HAS_VIEWER
         push_to_viewer(viewer_ptr, meshes, segments, original_faces, component_map, is_step,
                        "After Border Splitting", max_surface_error, free_edge_lines, healed_edge_lines);

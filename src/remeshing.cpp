@@ -28,10 +28,17 @@
 #include <boost/iterator/function_output_iterator.hpp>
 
 #include <BRep_Tool.hxx>
+#include <BRepBuilderAPI_MakeVertex.hxx>
+#include <BRepTools.hxx>
+#include <Geom_Curve.hxx>
 #include <Geom_Surface.hxx>
+#include <GeomAPI_ProjectPointOnCurve.hxx>
 #include <gp_Pnt.hxx>
 #include <gp_Pnt2d.hxx>
 #include <ShapeAnalysis_Surface.hxx>
+#include <TopoDS.hxx>
+#include <TopoDS_Edge.hxx>
+#include <TopExp_Explorer.hxx>
 
 namespace PMP = CGAL::Polygon_mesh_processing;
 
@@ -123,6 +130,142 @@ void split_crease_edges(std::vector<Mesh>& meshes, double crease_angle, double m
 
     spdlog::info("    crease edges: {} -> {}", crease_num_before, crease_num_after);
     spdlog::info("    faces: {} -> {}", faces_before, faces_after);
+}
+
+void snap_border_midpoints_to_brep(std::vector<Mesh>& meshes,
+                                   const std::vector<TopoDS_Face>& segments,
+                                   double max_edge_length)
+{
+    if (segments.empty()) return;
+
+    // Build a global position map: exact double-tuple → all (seg, vertex) instances.
+    // Border vertices that are bit-identical across adjacent meshes collapse to the same
+    // key, so every copy of a chord midpoint receives the same canonical snapped position.
+    using PosKey = std::tuple<double,double,double>;
+    struct Ref { size_t seg; Mesh::Vertex_index v; };
+    std::map<PosKey, std::vector<Ref>> by_pos;
+
+    for (size_t m = 0; m < meshes.size(); m++)
+        for (auto v : meshes[m].vertices()) {
+            if (!meshes[m].is_border(v)) continue;
+            auto p = meshes[m].point(v);
+            by_pos[{CGAL::to_double(p.x()),
+                    CGAL::to_double(p.y()),
+                    CGAL::to_double(p.z())}].push_back({m, v});
+        }
+
+    // Per-segment list of non-seam BREP edges with their curves and parameter ranges.
+    struct CurveInfo { TopoDS_Edge edge; Standard_Real f, l; Handle(Geom_Curve) crv; };
+    std::vector<std::vector<CurveInfo>> seg_curves(meshes.size());
+    for (size_t m = 0; m < segments.size() && m < meshes.size(); m++)
+        for (TopExp_Explorer ee(segments[m], TopAbs_EDGE); ee.More(); ee.Next()) {
+            TopoDS_Edge e = TopoDS::Edge(ee.Current());
+            if (BRep_Tool::IsClosed(e, segments[m])) continue;
+            Standard_Real f, l;
+            Handle(Geom_Curve) crv = BRep_Tool::Curve(e, f, l);
+            if (crv.IsNull()) continue;
+            if (f > l) std::swap(f, l);
+            seg_curves[m].push_back({e, f, l, crv});
+        }
+
+    // Classification by the chord midpoint's own distance to BREP edges in ref0's segment.
+    //
+    // Straight-edge (generator line, U-cut) chord midpoints: the midpoint of a straight
+    // chord lies exactly ON the line → distance ≈ 0 ≤ edge_tol → skip (already correct).
+    //
+    // Curved-edge (circle arc, V-cut circle) chord midpoints: sagitta = distance from
+    // chord midpoint to the arc.  For any circle of any radius, sagitta < chord/2
+    // ≤ max_edge_length/2, so snap_tol = max_edge_length * 0.5 catches all of them.
+    //
+    // This approach is robust to corner-vertex ambiguity: the chord midpoint is at a
+    // unique position (inside the arc) that is unambiguously classified by its own
+    // distance, independent of which edge its endpoints also belong to.
+    const double edge_tol  = 1e-3;
+    const double snap_tol  = max_edge_length * 0.5;
+
+    // Cache (seg, PosKey) → (nearest_edge_idx, distance).
+    std::map<std::pair<size_t,PosKey>, std::pair<int,double>> dist_cache;
+    auto nearest_edge_for = [&](size_t seg, const PosKey& key) -> std::pair<int,double> {
+        auto cache_key = std::make_pair(seg, key);
+        auto it = dist_cache.find(cache_key);
+        if (it != dist_cache.end()) return it->second;
+        if (seg >= seg_curves.size()) { dist_cache[cache_key]={-1,1e300}; return {-1,1e300}; }
+
+        TopoDS_Vertex vs = BRepBuilderAPI_MakeVertex(
+            gp_Pnt(std::get<0>(key), std::get<1>(key), std::get<2>(key)));
+        int best = -1; double best_d = 1e300;
+        for (int i = 0; i < (int)seg_curves[seg].size(); i++) {
+            BRepExtrema_DistShapeShape ext;
+            ext.LoadS1(seg_curves[seg][i].edge);
+            ext.LoadS2(vs); ext.Perform();
+            if (ext.IsDone() && ext.Value() < best_d) { best_d = ext.Value(); best = i; }
+        }
+        dist_cache[cache_key] = {best, best_d};
+        return {best, best_d};
+    };
+
+    int total_snapped = 0;
+
+    for (auto& [pos, refs] : by_pos) {
+        if (refs.empty()) continue;
+        const auto& ref0 = refs[0];
+
+        // Step 1: classify by the chord midpoint's own distance to the nearest BREP edge.
+        auto [e_idx, e_dist] = nearest_edge_for(ref0.seg, pos);
+        if (e_idx < 0 || e_dist <= edge_tol || e_dist > snap_tol) continue;
+
+        // Step 2: neighbor verification — both border neighbors must be within edge_tol
+        // of the IDENTIFIED edge (e_idx).  This prevents snapping chord midpoints of
+        // vertical edges (U-cuts, seam) that happen to be near a circle: for a vertical
+        // edge, one neighbor is on the top circle and the other on the bottom circle, so
+        // they can't both be on the same edge that the chord midpoint is closest to.
+        const Mesh& mesh0 = meshes[ref0.seg];
+        auto v0 = ref0.v;
+        if (mesh0.halfedge(v0) == mesh0.null_halfedge()) continue;
+
+        HalfEdgeDescriptor bord_he = mesh0.null_halfedge();
+        for (auto h : CGAL::halfedges_around_target(mesh0.halfedge(v0), mesh0))
+            if (mesh0.is_border(h)) { bord_he = h; break; }
+        if (bord_he == mesh0.null_halfedge()) continue;
+
+        auto n1p = mesh0.point(mesh0.source(bord_he));
+        auto n2p = mesh0.point(mesh0.target(mesh0.next(bord_he)));
+
+        // Check each neighbor's distance to the specific candidate edge (not nearest-overall).
+        auto dist_to_edge = [&](const Mesh::Point& p, int ei) -> double {
+            TopoDS_Vertex vs = BRepBuilderAPI_MakeVertex(
+                gp_Pnt(CGAL::to_double(p.x()), CGAL::to_double(p.y()), CGAL::to_double(p.z())));
+            BRepExtrema_DistShapeShape ext;
+            ext.LoadS1(seg_curves[ref0.seg][ei].edge);
+            ext.LoadS2(vs); ext.Perform();
+            return ext.IsDone() ? ext.Value() : 1e300;
+        };
+
+        double d_n1 = dist_to_edge(n1p, e_idx);
+        double d_n2 = dist_to_edge(n2p, e_idx);
+        if (d_n1 > edge_tol || d_n2 > edge_tol) continue;
+
+        // Both neighbors are on edge e_idx: this is a true arc chord midpoint.
+        // Project onto the identified curve — NearestPoint() is always on the correct
+        // side since the chord midpoint is geometrically inside the arc.
+        const auto& ci = seg_curves[ref0.seg][e_idx];
+        GeomAPI_ProjectPointOnCurve proj(
+            gp_Pnt(std::get<0>(pos), std::get<1>(pos), std::get<2>(pos)),
+            ci.crv, ci.f, ci.l);
+        if (proj.NbPoints() == 0) continue;
+
+        gp_Pnt q = proj.NearestPoint();
+        Mesh::Point snapped(q.X(), q.Y(), q.Z());
+
+        // Apply the same canonical position to every copy of this chord midpoint.
+        for (auto& ref : refs)
+            meshes[ref.seg].point(ref.v) = snapped;
+        total_snapped++;
+    }
+
+    if (total_snapped > 0)
+        spdlog::info("  snapped {} border midpoints onto BREP curves (chord→arc correction)",
+                     total_snapped);
 }
 
 void remesh_and_project(
@@ -434,6 +577,19 @@ void remesh_and_project(
                         Handle(Geom_Surface) surf = BRep_Tool::Surface(segments[m]);
                         if (surf.IsNull()) continue;
                         ShapeAnalysis_Surface sa(surf);
+
+                        // Period-normalization for the UV seeds we're about to fill.
+                        // ValueOfUV returns UV in the surface's natural range (e.g. [0,2π])
+                        // which may differ from the face's actual parameter range (e.g. [π,3π]).
+                        // Normalize so project_to_step's Newton search starts on the right sheet.
+                        const bool u_per = surf->IsUPeriodic();
+                        const bool v_per = surf->IsVPeriodic();
+                        const double u_T  = u_per ? surf->UPeriod() : 0.0;
+                        const double v_T  = v_per ? surf->VPeriod() : 0.0;
+                        Standard_Real umin_f=0, umax_f=0, vmin_f=0, vmax_f=0;
+                        if (u_per || v_per)
+                            BRepTools::UVBounds(segments[m], umin_f, umax_f, vmin_f, vmax_f);
+
                         for (auto v : mesh.vertices()) {
                             if (mesh.halfedge(v) == mesh.null_halfedge()) continue;
                             auto& uv = uv_map[v];
@@ -443,7 +599,16 @@ void remesh_and_project(
                                      CGAL::to_double(pt.y()),
                                      CGAL::to_double(pt.z()));
                             gp_Pnt2d uv2 = sa.ValueOfUV(p, 1e-7);
-                            uv = {uv2.X(), uv2.Y()};
+                            double uu = uv2.X(), vv = uv2.Y();
+                            if (u_per && u_T > 0.0) {
+                                while (uu < umin_f) uu += u_T;
+                                while (uu > umin_f + u_T) uu -= u_T;
+                            }
+                            if (v_per && v_T > 0.0) {
+                                while (vv < vmin_f) vv += v_T;
+                                while (vv > vmin_f + v_T) vv -= v_T;
+                            }
+                            uv = {uu, vv};
                         }
                     }
                 });
