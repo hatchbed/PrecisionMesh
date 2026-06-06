@@ -78,7 +78,7 @@ struct ProjectionStats {
 
     size_t n_total             = 0;
     size_t n_skipped_null      = 0;
-    size_t n_edge_projected    = 0;
+    size_t n_border_skipped    = 0;  // border vertices: static, not projected
     size_t n_surface_projected = 0;
     double sum_delta           = 0.0;
     double min_delta           = std::numeric_limits<double>::max();

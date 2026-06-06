@@ -1,5 +1,5 @@
 [wrap-git]
 url = https://github.com/CGAL/cgal.git
-revision = eb07187e7d078ced0af7190fcca82bb5719f52d6
+revision = 91996858c2c9b6ca50ec8f43cdbcd47d5f20b008
 depth = 1
 patch_directory = cgal

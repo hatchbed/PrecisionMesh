@@ -347,7 +347,7 @@ void ProjectionStats::merge(const ProjectionStats& other)
 {
     n_total             += other.n_total;
     n_skipped_null      += other.n_skipped_null;
-    n_edge_projected    += other.n_edge_projected;
+    n_border_skipped    += other.n_border_skipped;
     n_surface_projected += other.n_surface_projected;
     sum_delta           += other.sum_delta;
     min_delta            = std::min(min_delta, other.min_delta);
@@ -447,21 +447,18 @@ void project_to_step(const TopoDS_Face& face, Mesh& mesh,
             }
         }
 
+        // Border vertices are static: they come from BRepMesh (exact BREP placement) or
+        // split_border_edges (chord midpoint, close enough).  Projecting them independently
+        // per segment causes adjacent segments to diverge by small floating-point amounts,
+        // breaking the soup-based watertightness check.  Skip them entirely.
+        if (on_real_edge) {
+            stats.n_border_skipped++;
+            continue;
+        }
+
         Mesh::Point projected;
         bool used_local_uv = false;
-        if (on_real_edge) {
-            stats.n_edge_projected++;
-            auto wire_projector_it = border_vertex_projector_map.find(v);
-            if (wire_projector_it != border_vertex_projector_map.end()) {
-                projected = wire_projector_it->second(input);
-            } else {
-                // On a real edge but no wire projector found — safe fallback to surface
-                // rather than snapping to the nearest wire (which may be wrong).
-                spdlog::warn("Failed to find projector for real-edge vertex. seg={} face={}",
-                             segment_index, face_code);
-                projected = surface_projector(input);
-            }
-        } else {
+        {
             // Try UV-seeded local Newton search first (avoids wrong-local-minimum on B-splines).
             const auto& stored_uv = uv_map[v];
             if (!std::isnan(stored_uv.first)) {
@@ -487,7 +484,7 @@ void project_to_step(const TopoDS_Face& face, Mesh& mesh,
         // Guard against OCCT extrema converging to the wrong local minimum: only applies to
         // the global-search fallback path (used_local_uv=false).  With stored UV, local Newton
         // covers the vast majority of interior vertices and never triggers this false-minimum.
-        if (!on_real_edge && !used_local_uv &&
+        if (!used_local_uv &&
             max_projection_delta > 0.0 &&
             delta > max_projection_delta &&
             surface_projector.extrema.IsDone() &&
@@ -499,7 +496,7 @@ void project_to_step(const TopoDS_Face& face, Mesh& mesh,
             continue;
         }
 
-        if (!on_real_edge) stats.n_surface_projected++;
+        stats.n_surface_projected++;
 
         stats.sum_delta += delta;
         if (delta < stats.min_delta) stats.min_delta = delta;

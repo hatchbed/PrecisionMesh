@@ -20,6 +20,7 @@
 #include <cmath>
 #include <limits>
 #include <mutex>
+#include <unordered_map>
 
 #include <spdlog/spdlog.h>
 #include <tbb/parallel_for.h>
@@ -47,12 +48,12 @@ void split_border_edges(std::vector<Mesh>& meshes, double max_edge_length) {
 
     for (auto& mesh: meshes) {
         std::vector<EdgeDescriptor> border_edges;
-        PMP::border_halfedges(faces(mesh), mesh, boost::make_function_output_iterator(
+        CGAL::border_halfedges(faces(mesh), mesh, boost::make_function_output_iterator(
             HalfEdge2Edge(mesh, border_edges)));
         border_num_before += border_edges.size();
         PMP::split_long_edges(border_edges, max_edge_length, mesh);
         border_edges.clear();
-        PMP::border_halfedges(faces(mesh), mesh, boost::make_function_output_iterator(
+        CGAL::border_halfedges(faces(mesh), mesh, boost::make_function_output_iterator(
             HalfEdge2Edge(mesh, border_edges)));
         border_num_after += border_edges.size();
     }
@@ -135,9 +136,69 @@ void remesh_and_project(
     double max_remeshing_surface_error =
         std::min(params.max_surface_error, params.min_edge_length * 0.1);
 
+    // Lock all border vertices before remeshing begins.  vertex_is_constrained_map prevents
+    // border vertices from being moved by tangential relaxation.  Built once from the
+    // pre-remeshing border (which includes any midpoints from split_border_edges).
+    // The edge constraint map is rebuilt per-call inside the iteration loop because CGAL
+    // writes to it during remeshing (sub-edges of split constrained edges are marked
+    // constrained), leaving stale values that would corrupt subsequent iterations.
+    if (params.is_step) {
+        for (auto& mesh : meshes) {
+            auto vcmap = mesh.add_property_map<Mesh::Vertex_index, bool>(
+                "v:border_locked", false).first;
+            for (auto v : mesh.vertices())
+                if (mesh.is_border(v))
+                    vcmap[v] = true;
+        }
+    }
+
+    // Count total border halfedges across all meshes by scanning halfedge flags directly.
+    // Does not depend on vertex back-pointer state — reliable at any point in the pipeline.
+    auto count_border_halfedges = [&]() -> size_t {
+        size_t n = 0;
+        for (const auto& mesh : meshes)
+            for (auto h : mesh.halfedges())
+                if (mesh.is_border(h)) n++;
+        return n;
+    };
+
     for (int i = 0; i < params.iterations; i++) {
         spdlog::info("    iteration {}", i + 1);
         spdlog::info("      remeshing ...");
+
+        // Per-segment border halfedge counts — populated unconditionally so the post-remesh
+        // border topology restore can use them regardless of log level.
+        std::vector<size_t> border_before(meshes.size(), 0);
+        for (size_t m = 0; m < meshes.size(); m++)
+            for (auto h : meshes[m].halfedges())
+                if (meshes[m].is_border(h)) border_before[m]++;
+        spdlog::debug("      [border] before remesh: {} border halfedges",
+                      count_border_halfedges());
+
+        // Save border vertex positions per segment so that any border vertices incorrectly
+        // collapsed by isotropic_remeshing can be re-inserted afterward.
+        std::vector<std::vector<Mesh::Point>> saved_bverts(meshes.size());
+        if (params.is_step) {
+            for (size_t m = 0; m < meshes.size(); m++)
+                for (auto h : meshes[m].halfedges())
+                    if (meshes[m].is_border(h))
+                        saved_bverts[m].push_back(meshes[m].point(meshes[m].target(h)));
+        }
+
+        // Snapshot border vertex positions before remeshing.  isotropic_remeshing honours
+        // protect_constraints and the constraint maps, but we restore positions explicitly
+        // as a belt-and-suspenders guarantee of exact position agreement between adjacent
+        // segments on their shared boundary edges.
+        std::vector<std::unordered_map<size_t, Mesh::Point>> saved_border(meshes.size());
+        if (params.is_step) {
+            for (size_t m = 0; m < meshes.size(); m++) {
+                const Mesh& mesh = meshes[m];
+                for (auto v : mesh.vertices())
+                    if (mesh.is_border(v))
+                        saved_border[m][v.idx()] = mesh.point(v);
+            }
+        }
+
         tbb::parallel_for(
             tbb::blocked_range<size_t>(0, meshes.size()), [&](const tbb::blocked_range<size_t>& r) {
                 for (size_t m = r.begin(); m != r.end(); ++m) {
@@ -147,10 +208,22 @@ void remesh_and_project(
                                                                   edge_min_max, faces(mesh), mesh);
                     try {
                         if (params.is_step) {
+                            auto vcmap = lookup_property_map<Mesh::Vertex_index, bool>(
+                                mesh, "v:border_locked");
+                            // Rebuild the edge constraint map immediately before each call so
+                            // it reflects the current border state.  CGAL writes to this map
+                            // during remeshing (marking sub-edges of split constrained edges),
+                            // so a map built in a previous iteration would have stale values.
+                            auto ecmap = mesh.add_property_map<Mesh::Edge_index, bool>(
+                                "e:border_locked", false).first;
+                            for (auto e : mesh.edges())
+                                ecmap[e] = mesh.is_border(e);
                             PMP::isotropic_remeshing(faces(mesh), sizing_field, mesh,
                                 CGAL::parameters::number_of_iterations(1)
                                                  .number_of_relaxation_steps(3)
-                                                 .protect_constraints(true));
+                                                 .protect_constraints(true)
+                                                 .edge_is_constrained_map(ecmap)
+                                                 .vertex_is_constrained_map(vcmap));
                         }
                         else {
                             auto crease_map =
@@ -167,33 +240,184 @@ void remesh_and_project(
                     }
                 }});
 
+        if (spdlog::should_log(spdlog::level::debug)) {
+            size_t total_after = 0;
+            for (size_t m = 0; m < meshes.size(); m++) {
+                const Mesh& mesh = meshes[m];
+                size_t n = 0;
+                double min_len = std::numeric_limits<double>::max();
+                for (auto h : mesh.halfedges()) {
+                    if (!mesh.is_border(h)) continue;
+                    n++;
+                    auto a = mesh.point(mesh.source(h));
+                    auto b = mesh.point(mesh.target(h));
+                    double dx = CGAL::to_double(b.x()-a.x()),
+                           dy = CGAL::to_double(b.y()-a.y()),
+                           dz = CGAL::to_double(b.z()-a.z());
+                    min_len = std::min(min_len, std::sqrt(dx*dx+dy*dy+dz*dz));
+                }
+                total_after += n;
+                if (n != border_before[m])
+                    spdlog::debug("      [border-change] seg {} {} -> {} halfedges, min_border_edge={:.6f}",
+                                  m, border_before[m], n, min_len);
+            }
+            spdlog::debug("      [border] after remesh:  {} border halfedges", total_after);
+        }
+
+        // Restore border vertex positions to their pre-remeshing values.
+        if (params.is_step) {
+            std::atomic<size_t> total_restored{0};
+            tbb::parallel_for(
+                tbb::blocked_range<size_t>(0, meshes.size()), [&](const tbb::blocked_range<size_t>& r) {
+                    for (size_t m = r.begin(); m != r.end(); ++m) {
+                        Mesh& mesh = meshes[m];
+                        size_t restored = 0;
+                        for (auto v : mesh.vertices()) {
+                            auto it = saved_border[m].find(v.idx());
+                            if (it != saved_border[m].end()) {
+                                if (mesh.point(v) != it->second) {
+                                    mesh.point(v) = it->second;
+                                    restored++;
+                                }
+                            }
+                        }
+                        total_restored += restored;
+                    }
+                });
+            if (total_restored)
+                spdlog::debug("      restored {} border vertex positions after remeshing",
+                              total_restored.load());
+        }
+        spdlog::debug("      [border] after pos-restore: {} border halfedges", count_border_halfedges());
+
+        // Restore border vertices collapsed by isotropic_remeshing despite the constraint maps.
+        // For each segment whose border halfedge count dropped, scan for saved border vertex
+        // positions that are no longer on the border, find the spanning border edge, and re-split
+        // it.  Position-restore has already run, so the two remaining endpoints (A, C) are at
+        // their exact pre-remesh positions — split_long_edges places the new vertex at their
+        // midpoint, which equals the saved position for the midpoint-insertion case.  For the
+        // general (non-midpoint) case we relocate the new vertex explicitly afterward.
+        if (params.is_step) {
+            size_t total_restored_bv = 0;
+            for (size_t m = 0; m < meshes.size(); m++) {
+                Mesh& mesh = meshes[m];
+                size_t cur_bhe = 0;
+                for (auto h : mesh.halfedges()) if (mesh.is_border(h)) cur_bhe++;
+                if (cur_bhe >= border_before[m]) continue;
+
+                auto vcmap = lookup_property_map<Mesh::Vertex_index, bool>(mesh, "v:border_locked");
+                size_t restored = 0;
+
+                for (const auto& saved_pt : saved_bverts[m]) {
+                    double px = CGAL::to_double(saved_pt.x()),
+                           py = CGAL::to_double(saved_pt.y()),
+                           pz = CGAL::to_double(saved_pt.z());
+                    // Check whether this position still exists on the border.
+                    bool found = false;
+                    for (auto h : mesh.halfedges()) {
+                        if (!mesh.is_border(h)) continue;
+                        auto p = mesh.point(mesh.target(h));
+                        if (CGAL::to_double(p.x()) == px &&
+                            CGAL::to_double(p.y()) == py &&
+                            CGAL::to_double(p.z()) == pz) { found = true; break; }
+                    }
+                    if (found) continue;
+
+                    // Find the border halfedge whose source/target bracket saved_pt.
+                    HalfEdgeDescriptor span_he = mesh.null_halfedge();
+                    for (auto h : mesh.halfedges()) {
+                        if (!mesh.is_border(h)) continue;
+                        auto a = mesh.point(mesh.source(h));
+                        auto c = mesh.point(mesh.target(h));
+                        double ax = CGAL::to_double(a.x()), ay = CGAL::to_double(a.y()), az = CGAL::to_double(a.z());
+                        double cx = CGAL::to_double(c.x()), cy = CGAL::to_double(c.y()), cz = CGAL::to_double(c.z());
+                        double dx = cx-ax, dy = cy-ay, dz = cz-az;
+                        double len2 = dx*dx+dy*dy+dz*dz;
+                        if (len2 < 1e-20) continue;
+                        double t = ((px-ax)*dx + (py-ay)*dy + (pz-az)*dz) / len2;
+                        if (t < 1e-6 || t > 1.0-1e-6) continue;
+                        double ex = ax+t*dx-px, ey = ay+t*dy-py, ez = az+t*dz-pz;
+                        if (ex*ex+ey*ey+ez*ez > 1e-10) continue;
+                        span_he = h;
+                        break;
+                    }
+                    if (span_he == mesh.null_halfedge()) {
+                        spdlog::warn("      [restore-border] seg {} no span found for ({:.6f},{:.6f},{:.6f})",
+                                     m, px, py, pz);
+                        continue;
+                    }
+
+                    // Split the spanning border edge. split_long_edges inserts the new vertex at
+                    // the midpoint; we then relocate it to the exact saved position if needed.
+                    auto a_pt = mesh.point(mesh.source(span_he));
+                    auto c_pt = mesh.point(mesh.target(span_he));
+                    double elen = std::sqrt(
+                        CGAL::to_double((c_pt.x()-a_pt.x())*(c_pt.x()-a_pt.x()) +
+                                        (c_pt.y()-a_pt.y())*(c_pt.y()-a_pt.y()) +
+                                        (c_pt.z()-a_pt.z())*(c_pt.z()-a_pt.z())));
+                    std::vector<EdgeDescriptor> to_split = {mesh.edge(span_he)};
+                    PMP::split_long_edges(to_split, elen * 0.5, mesh);
+                    // The new vertex has vcmap=false (default).  Find it and lock it.
+                    for (auto v : mesh.vertices()) {
+                        if (!mesh.is_border(v) || vcmap[v]) continue;
+                        mesh.point(v) = saved_pt;  // relocate to exact saved position
+                        vcmap[v] = true;
+                        break;
+                    }
+                    restored++;
+                }
+                if (restored) {
+                    spdlog::info("      [restore-border] seg {} restored {} collapsed border vertices",
+                                 m, restored);
+                    total_restored_bv += restored;
+                }
+            }
+            if (total_restored_bv)
+                spdlog::debug("      [border] after border-restore: {} border halfedges", count_border_halfedges());
+        }
+
         // Repair vertices whose halfedge back-pointer was nulled by the remesher while
-        // some halfedges still reference them as a target.  Restore the back-pointer by
-        // scanning all halfedges.  Vertices with null back-pointers that have NO valid
-        // halfedge referencing them (truly isolated) are left in place — they are harmless
-        // (no incident faces) and safe to skip during projection.  We do NOT call
-        // collect_garbage() here because the remesher may leave removed-but-not-yet-
-        // compacted halfedges that still reference these vertices; triggering compaction
-        // would remap those halfedge targets to the wrong vertices.
+        // some halfedges still reference them as a target.  Use two passes so that border
+        // halfedges are preferred: a border vertex assigned an interior back-pointer will
+        // be misclassified by mesh.is_border(v) in the next iteration's snapshot and by
+        // CGAL's internal border checks.  Vertices with null back-pointers that have NO
+        // valid halfedge referencing them (truly isolated) are left in place — they are
+        // harmless and safe to skip during projection.  We do NOT call collect_garbage()
+        // here because the remesher may leave removed-but-not-yet-compacted halfedges that
+        // still reference these vertices; triggering compaction would remap those halfedge
+        // targets to the wrong vertices.
         std::atomic<size_t> total_repaired{0};
+        std::atomic<size_t> total_border_repaired{0};
         tbb::parallel_for(
             tbb::blocked_range<size_t>(0, meshes.size()), [&](const tbb::blocked_range<size_t>& r) {
                 for (size_t m = r.begin(); m != r.end(); ++m) {
                     Mesh& mesh = meshes[m];
-                    size_t repaired = 0;
+                    size_t repaired = 0, border_repaired = 0;
+                    // Pass 1: for each null-halfedge vertex, collect the best halfedge
+                    // candidate, upgrading to a border halfedge whenever one is found.
+                    std::unordered_map<size_t, HalfEdgeDescriptor> best;
                     for (auto h : mesh.halfedges()) {
                         auto v = mesh.target(h);
-                        if (mesh.halfedge(v) == mesh.null_halfedge()) {
-                            mesh.set_halfedge(v, h);
-                            repaired++;
-                        }
+                        if (mesh.halfedge(v) != mesh.null_halfedge()) continue;
+                        auto [it, inserted] = best.emplace(v.idx(), h);
+                        if (!inserted && mesh.is_border(h))
+                            it->second = h;  // upgrade to border halfedge
+                    }
+                    // Pass 2: apply back-pointers.
+                    for (auto& [vidx, h] : best) {
+                        mesh.set_halfedge(Mesh::Vertex_index(vidx), h);
+                        repaired++;
+                        if (mesh.is_border(h)) border_repaired++;
                     }
                     total_repaired += repaired;
+                    total_border_repaired += border_repaired;
                 }
             });
         if (total_repaired) {
-            spdlog::info("      repaired {} null-halfedge vertices", total_repaired.load());
+            spdlog::info("      repaired {} null-halfedge vertices ({} restored as border)",
+                         total_repaired.load(), total_border_repaired.load());
         }
+        spdlog::debug("      [border] after null-he repair: {} border halfedges", count_border_halfedges());
 
         // Fill UV for vertices inserted by the remesher (they have NaN from the "v:uv" default).
         // ShapeAnalysis_Surface::ValueOfUV is used rather than BRepExtrema global search because
@@ -250,11 +474,11 @@ void remesh_and_project(
             size_t n_projected = global.n_total - global.n_skipped_null;
             double mean_delta  = n_projected > 0 ? global.sum_delta / n_projected : 0.0;
 
-            spdlog::info("      {} verts ({} edge, {} surface, {} occt-skip, {} null-he skipped) "
+            spdlog::info("      {} verts ({} border-skip, {} surface, {} occt-skip, {} null-he skipped) "
                          "weight={:.3f} delta min={:.2e} mean={:.2e} max={:.2e} "
                          ">1e-3:{} >1e-2:{} >1e-1:{}",
                          n_projected,
-                         global.n_edge_projected, global.n_surface_projected,
+                         global.n_border_skipped, global.n_surface_projected,
                          global.n_occt_skip, global.n_skipped_null,
                          weight,
                          global.min_delta, mean_delta, global.max_delta,
@@ -271,6 +495,8 @@ void remesh_and_project(
                              r.px, r.py, r.pz, r.qx, r.qy, r.qz);
             }
         }
+
+        spdlog::debug("      [border] after projection: {} border halfedges", count_border_halfedges());
 
         if (params.on_iteration_done)
             params.on_iteration_done(i + 1);

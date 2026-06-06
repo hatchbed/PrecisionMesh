@@ -26,42 +26,27 @@ cgal_modules = ['AABB_tree', 'Algebraic_foundations', 'Arithmetic_kernel', 'BGL'
                 'Filtered_kernel', 'Generator', 'HalfedgeDS', 'Hash_map', 'Homogeneous_kernel',
                 'Installation', 'Intersections_2', 'Intersections_3', 'Interval_support',
                 'Kernel_23', 'Kernel_d', 'Modifier', 'Modular_arithmetic', 'Number_types',
-                'Polygon_mesh_processing', 'Polyhedron', 'Profiling_tools', 'Property_map',
-                'Random_numbers', 'Spatial_searching', 'Surface_mesh', 'STL_Extension',
-                'Stream_support', 'Union_find']
+                'PMP_Mesh_repair', 'PMP_Remeshing', 'Polygon_mesh_processing',
+                'Polyhedron', 'Profiling_tools', 'Property_map',
+                'Random_numbers', 'Spatial_searching', 'Spatial_sorting', 'Surface_mesh',
+                'STL_Extension', 'Stream_support', 'TDS_2', 'Triangulation_2', 'Union_find']
 
 cpp = meson.get_compiler('cpp')
-_cgal_ver = run_command('sh', '-c',
-  'find /usr /usr/local -name version.h -path "*/CGAL/version.h" 2>/dev/null' +
-  ' | head -1 | xargs grep -oP "(?<=#define CGAL_VERSION )\\S+" 2>/dev/null || echo ""',
-  check: false).stdout().strip()
-cgal_dep = dependency('', required: false)
-if cpp.compiles('''
-    #include <CGAL/version.h>
-    #if CGAL_VERSION_MAJOR < 5 || (CGAL_VERSION_MAJOR == 5 && CGAL_VERSION_MINOR < 5)
-    #error "CGAL version too old (need >= 5.5)"
-    #endif
-    int main() { return 0; }
-  ''', name: 'CGAL ' + (_cgal_ver != '' ? _cgal_ver : '>= 5.5'))
-  cgal_dep = declare_dependency()
-endif
-if not cgal_dep.found()
-  cgal_opts = cmake.subproject_options()
-  cgal_opts.add_cmake_defines({
-    'CMAKE_BUILD_TYPE': _cmake_build_type,
-    'WITH_examples': false,
-    'WITH_tests': false,
-    'WITH_demos': false,
-    'WITH_doc': false,
-    'WITH_CGAL_Qt5': false,
-    'WITH_CGAL_ImageIO': false})
-  cmake.subproject('cgal', options: cgal_opts)
-  _cgal_include_dirs = []
-  foreach module : cgal_modules
-    _cgal_include_dirs += include_directories('subprojects/cgal/' + module + '/include')
-  endforeach
-  cgal_dep = declare_dependency(include_directories: _cgal_include_dirs)
-endif
+cgal_opts = cmake.subproject_options()
+cgal_opts.add_cmake_defines({
+  'CMAKE_BUILD_TYPE': _cmake_build_type,
+  'WITH_examples': false,
+  'WITH_tests': false,
+  'WITH_demos': false,
+  'WITH_doc': false,
+  'WITH_CGAL_Qt5': false,
+  'WITH_CGAL_ImageIO': false})
+cmake.subproject('cgal', options: cgal_opts)
+_cgal_include_dirs = []
+foreach module : cgal_modules
+  _cgal_include_dirs += include_directories('subprojects/cgal/' + module + '/include')
+endforeach
+cgal_dep = declare_dependency(include_directories: _cgal_include_dirs)
 
 occt_targets = ['TKBO', 'TKBRep', 'TKCAF', 'TKCDF', 'TKG2d', 'TKG3d', 'TKGeomAlgo', 'TKGeomBase',
                 'TKernel', 'TKHLR', 'TKLCAF', 'TKMath', 'TKMesh', 'TKService', 'TKShHealing',
