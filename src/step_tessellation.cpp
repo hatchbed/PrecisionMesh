@@ -414,6 +414,17 @@ std::vector<std::pair<Mesh, TopoDS_Face>> tessellate_shape(const TopoDS_Shape& s
             vertex_buffer.push_back({point.X(), point.Y(), point.Z()});
         }
 
+        // Capture UV parameters for each BRepMesh node while Poly_Triangulation data is live.
+        // These seed the local-Newton projection in step_projection.cpp.  Dropped-corner
+        // vertices created by cr_boundary_segments get NaN and are filled in remeshing.cpp.
+        std::unordered_map<size_t, std::pair<double,double>> vertex_uv_buffer;
+        if (triangulation->HasUVNodes()) {
+            for (const auto& kv : vertex_map) {
+                gp_Pnt2d uv = triangulation->UVNode(kv.first);
+                vertex_uv_buffer[kv.second] = {uv.X(), uv.Y()};
+            }
+        }
+
         const TopAbs_Orientation orientation = iter.Current().Orientation();
         for (int i = 1; i <= num_triangles_total; i++) {
             auto triangle = triangulation->Triangle(i);
@@ -616,6 +627,22 @@ std::vector<std::pair<Mesh, TopoDS_Face>> tessellate_shape(const TopoDS_Shape& s
 
         if (mesh.number_of_faces() == 0) {
             continue;
+        }
+
+        // Populate "v:uv" property map for UV-seeded projection.  vertex_indices[i] is the
+        // Mesh::Vertex_index for vertex_buffer[i]; vertex_uv_buffer holds UV for the original
+        // BRepMesh nodes (by vertex_buffer index).  New vertices appended by cr_boundary_segments
+        // (dropped corners) are absent from vertex_uv_buffer and keep the NaN default.
+        {
+            const double kNaN = std::numeric_limits<double>::quiet_NaN();
+            auto uv_prop = mesh.add_property_map<Mesh::Vertex_index,
+                                                  std::pair<double,double>>(
+                "v:uv", {kNaN, kNaN}).first;
+            for (size_t i = 0; i < vertex_indices.size(); i++) {
+                auto uit = vertex_uv_buffer.find(i);
+                if (uit != vertex_uv_buffer.end())
+                    uv_prop[vertex_indices[i]] = uit->second;
+            }
         }
 
         tessellation.push_back(std::make_pair(mesh, face));
@@ -948,6 +975,12 @@ void repair_open_boundary_loops(std::vector<std::pair<Mesh, TopoDS_Face>>& tesse
             new_verts.push_back(mesh.add_vertex(K::Point_3(v[0], v[1], v[2])));
         for (const auto& f : fbuf)
             if (f.size() == 3) mesh.add_face(new_verts[f[0]], new_verts[f[1]], new_verts[f[2]]);
+
+        // Rebuilt mesh has no UV data; add NaN-filled "v:uv" so the UV fill pass in
+        // remeshing.cpp will populate all vertices via ShapeAnalysis_Surface::ValueOfUV.
+        const double kNaN = std::numeric_limits<double>::quiet_NaN();
+        mesh.add_property_map<Mesh::Vertex_index, std::pair<double,double>>(
+            "v:uv", {kNaN, kNaN});
     }
 }
 

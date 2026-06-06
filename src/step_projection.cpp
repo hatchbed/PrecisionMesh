@@ -6,6 +6,7 @@
 #include <precision_mesh/step_projection.h>
 
 #include <algorithm>
+#include <cmath>
 #include <deque>
 #include <limits>
 #include <set>
@@ -17,6 +18,9 @@
 #include <BRep_Builder.hxx>
 #include <BRep_Tool.hxx>
 #include <BRepAdaptor_Curve.hxx>
+#include <BRepAdaptor_Surface.hxx>
+#include <Extrema_GenLocateExtPS.hxx>
+#include <Extrema_POnSurf.hxx>
 #include <BRepBuilderAPI_MakeVertex.hxx>
 #include <BRepBuilderAPI_MakeWire.hxx>
 #include <BRepTools_WireExplorer.hxx>
@@ -214,6 +218,11 @@ get_border_vertex_projector_map(const TopoDS_Face& face, Mesh& mesh,
         if (!mesh.is_border(v)) {
             continue;
         }
+        // Null-halfedge vertices are isolated (repaired or removed upstream); skip them
+        // here so they are not queued as unresolvable border vertices.
+        if (mesh.halfedge(v) == mesh.null_halfedge()) {
+            continue;
+        }
 
         auto p = mesh.point(v);
         auto point = gp_Pnt(p[0], p[1], p[2]);
@@ -291,42 +300,229 @@ get_border_vertex_projector_map(const TopoDS_Face& face, Mesh& mesh,
         std::swap(remaining, vertex_queue);
 
         if (!made_progress && !vertex_queue.empty()) {
-            spdlog::warn("Failed to associate {} border vertices with face boundary.",
-                         vertex_queue.size());
+            spdlog::warn("Failed to associate {} border vertices with face boundary. face_code={}",
+                         vertex_queue.size(), face_code);
+            for (auto unresolved_v : vertex_queue) {
+                auto p = mesh.point(unresolved_v);
+                double px = CGAL::to_double(p.x());
+                double py = CGAL::to_double(p.y());
+                double pz = CGAL::to_double(p.z());
+                TopoDS_Vertex vshape = BRepBuilderAPI_MakeVertex(gp_Pnt(px, py, pz));
+
+                double min_dist = std::numeric_limits<double>::max();
+                size_t nearest_idx = 0;
+                for (size_t i = 0; i < edge_extremas.size(); i++) {
+                    edge_extremas[i].LoadS2(vshape);
+                    edge_extremas[i].Perform();
+                    if (edge_extremas[i].IsDone() && edge_extremas[i].Value() < min_dist) {
+                        min_dist = edge_extremas[i].Value();
+                        nearest_idx = i;
+                    }
+                }
+                bool nearest_is_seam = !edges.empty() &&
+                    BRep_Tool::IsClosed(edges[nearest_idx], face);
+
+                int border_he = 0, total_he = 0;
+                for (auto h : CGAL::halfedges_around_target(
+                        mesh.halfedge(unresolved_v), mesh)) {
+                    total_he++;
+                    if (mesh.is_border(h)) border_he++;
+                }
+
+                spdlog::warn("  unresolved vertex ({:.6f},{:.6f},{:.6f}): "
+                             "nearest_edge_dist={:.6f} edge={} ({}), "
+                             "border_halfedges={}/{}",
+                             px, py, pz,
+                             min_dist, nearest_idx,
+                             nearest_is_seam ? "seam" : "real",
+                             border_he, total_he);
+            }
         }
     }
 
     return border_vertex_projector_map;
 }
 
+void ProjectionStats::merge(const ProjectionStats& other)
+{
+    n_total             += other.n_total;
+    n_skipped_null      += other.n_skipped_null;
+    n_edge_projected    += other.n_edge_projected;
+    n_surface_projected += other.n_surface_projected;
+    sum_delta           += other.sum_delta;
+    min_delta            = std::min(min_delta, other.min_delta);
+    max_delta            = std::max(max_delta, other.max_delta);
+    n_above_1em3        += other.n_above_1em3;
+    n_above_1em2        += other.n_above_1em2;
+    n_above_1em1        += other.n_above_1em1;
+    n_occt_skip         += other.n_occt_skip;
+    for (const auto& r : other.top_records) {
+        auto pos = std::lower_bound(top_records.begin(), top_records.end(), r,
+            [](const Record& a, const Record& b) { return a.delta > b.delta; });
+        top_records.insert(pos, r);
+        if (top_records.size() > TOP_N) top_records.pop_back();
+    }
+}
+
 void project_to_step(const TopoDS_Face& face, Mesh& mesh,
                      WireProjectorCachePtr wire_projectors,
                      StepProjector& surface_projector,
                      StepBorderProjector& border_projector,
-                     double weight)
+                     double weight,
+                     size_t segment_index,
+                     ProjectionStats* stats_out,
+                     double max_projection_delta)
 {
     double w1 = std::max(0.0, std::min(1.0, weight));
     double w2 = 1.0 - w1;
 
+    int face_code = shapeHashCode(face);
+
     auto border_vertex_projector_map =
         get_border_vertex_projector_map(face, mesh, wire_projectors);
 
-    for (auto v: mesh.vertices()) {
-        auto input = mesh.point(v);
+    // Build a compound of real (non-seam) BREP edges for geometry-based vertex
+    // classification — same pattern as validate_tessellation.  mesh.is_border(v)
+    // conflates two classes: true BREP boundary / subdivision cut (→ wire) and
+    // periodic seam (interior to the surface → surface).  Seam vertices routed
+    // to the wire fallback drift to the wrong edge over iterations.
+    // Subdivision cut edges are intentional boundaries and are deliberately included.
+    BRep_Builder ec_builder;
+    TopoDS_Compound edge_comp;
+    ec_builder.MakeCompound(edge_comp);
+    bool has_real_edges = false;
+    for (TopExp_Explorer ee(face, TopAbs_EDGE); ee.More(); ee.Next()) {
+        const TopoDS_Edge& e = TopoDS::Edge(ee.Current());
+        if (!BRep_Tool::IsClosed(e, face)) {
+            ec_builder.Add(edge_comp, e);
+            has_real_edges = true;
+        }
+    }
+    BRepExtrema_DistShapeShape edge_classifier;
+    if (has_real_edges) edge_classifier.LoadS1(edge_comp);
+    const double edge_tol = 1e-3;  // matches get_border_vertex_projector_map default
 
-        Mesh::Point projected;
-        if (mesh.is_border(v)) {
-            auto wire_projector_it = border_vertex_projector_map.find(v);
-            if (wire_projector_it == border_vertex_projector_map.end()) {
-                spdlog::warn("Failed to find projector corresponding to mesh border vertex.");
-                projected = border_projector(input);
-            }
-            else {
-                projected = wire_projector_it->second(input);
+    // UV-seeded local surface projection.  Constructed once per face; Perform() is called
+    // per interior vertex using the stored "v:uv" as initial guess.  This eliminates the
+    // wrong-local-minimum failure of the global BRepExtrema search on complex B-spline faces.
+    // Falls back to surface_projector (global) if UV is unavailable or Newton diverges.
+    const double kNaN_uv = std::numeric_limits<double>::quiet_NaN();
+    auto uv_map = mesh.add_property_map<Mesh::Vertex_index, std::pair<double,double>>(
+        "v:uv", {kNaN_uv, kNaN_uv}).first;
+    BRepAdaptor_Surface adaptor(face);
+    Extrema_GenLocateExtPS local_ext(adaptor, 1e-7, 1e-7);
+
+    ProjectionStats stats;
+
+    for (auto v: mesh.vertices()) {
+        stats.n_total++;
+
+        // Vertices repaired upstream (remesh_and_project restores null halfedge back-
+        // pointers after each remesh iteration).  Truly isolated ones that could not be
+        // repaired (no valid halfedge references them) are skipped here: they have no
+        // incident faces so projection has no visible effect, and routing them through the
+        // wire projector path would be wrong.
+        if (mesh.halfedge(v) == mesh.null_halfedge()) {
+            stats.n_skipped_null++;
+            continue;
+        }
+
+        auto input = mesh.point(v);
+        double px = CGAL::to_double(input.x()), py = CGAL::to_double(input.y()),
+               pz = CGAL::to_double(input.z());
+
+        // Use mesh.is_border as a cheap pre-filter (interior vertices are never on a
+        // real boundary), then confirm geometrically so seam vertices are classified
+        // as surface rather than edge.
+        bool on_real_edge = false;
+        double edge_check_dist = -1.0;
+        if (has_real_edges && mesh.is_border(v)) {
+            TopoDS_Vertex vshape = BRepBuilderAPI_MakeVertex(
+                gp_Pnt(input.x(), input.y(), input.z()));
+            edge_classifier.LoadS2(vshape);
+            edge_classifier.Perform();
+            if (edge_classifier.IsDone()) {
+                edge_check_dist = edge_classifier.Value();
+                on_real_edge = edge_check_dist <= edge_tol;
             }
         }
-        else {
-            projected = surface_projector(input);
+
+        Mesh::Point projected;
+        bool used_local_uv = false;
+        if (on_real_edge) {
+            stats.n_edge_projected++;
+            auto wire_projector_it = border_vertex_projector_map.find(v);
+            if (wire_projector_it != border_vertex_projector_map.end()) {
+                projected = wire_projector_it->second(input);
+            } else {
+                // On a real edge but no wire projector found — safe fallback to surface
+                // rather than snapping to the nearest wire (which may be wrong).
+                spdlog::warn("Failed to find projector for real-edge vertex. seg={} face={}",
+                             segment_index, face_code);
+                projected = surface_projector(input);
+            }
+        } else {
+            // Try UV-seeded local Newton search first (avoids wrong-local-minimum on B-splines).
+            const auto& stored_uv = uv_map[v];
+            if (!std::isnan(stored_uv.first)) {
+                local_ext.Perform(gp_Pnt(px, py, pz), stored_uv.first, stored_uv.second);
+                if (local_ext.IsDone()) {
+                    const gp_Pnt& lp = local_ext.Point().Value();
+                    projected = Mesh::Point(lp.X(), lp.Y(), lp.Z());
+                    double ru, rv;
+                    local_ext.Point().Parameter(ru, rv);
+                    uv_map[v] = {ru, rv};
+                    used_local_uv = true;
+                }
+            }
+            if (!used_local_uv) {
+                projected = surface_projector(input);
+            }
+        }
+
+        double qx = CGAL::to_double(projected.x()), qy = CGAL::to_double(projected.y()),
+               qz = CGAL::to_double(projected.z());
+        double delta = gp_Pnt(px, py, pz).Distance(gp_Pnt(qx, qy, qz));
+
+        // Guard against OCCT extrema converging to the wrong local minimum: only applies to
+        // the global-search fallback path (used_local_uv=false).  With stored UV, local Newton
+        // covers the vast majority of interior vertices and never triggers this false-minimum.
+        if (!on_real_edge && !used_local_uv &&
+            max_projection_delta > 0.0 &&
+            delta > max_projection_delta &&
+            surface_projector.extrema.IsDone() &&
+            surface_projector.extrema.NbSolution() > 0 &&
+            surface_projector.extrema.SupportTypeShape1(1) != BRepExtrema_IsInFace) {
+            stats.n_occt_skip++;
+            spdlog::debug("      occt-guard skip (global fallback): seg={} face={} vert={} delta={:.4f}",
+                          segment_index, face_code, v.idx(), delta);
+            continue;
+        }
+
+        if (!on_real_edge) stats.n_surface_projected++;
+
+        stats.sum_delta += delta;
+        if (delta < stats.min_delta) stats.min_delta = delta;
+        if (delta > stats.max_delta) stats.max_delta = delta;
+        if (delta > 1e-3) stats.n_above_1em3++;
+        if (delta > 1e-2) stats.n_above_1em2++;
+        if (delta > 1e-1) stats.n_above_1em1++;
+
+        if (stats_out &&
+            (stats.top_records.size() < ProjectionStats::TOP_N ||
+             delta > stats.top_records.back().delta)) {
+            ProjectionStats::Record rec{delta, px, py, pz, qx, qy, qz,
+                                        mesh.is_border(v),
+                                        mesh.halfedge(v) == mesh.null_halfedge(),
+                                        on_real_edge, edge_check_dist,
+                                        v.idx(), segment_index, face_code};
+            auto pos = std::lower_bound(stats.top_records.begin(), stats.top_records.end(),
+                rec, [](const ProjectionStats::Record& a, const ProjectionStats::Record& b) {
+                    return a.delta > b.delta;
+                });
+            stats.top_records.insert(pos, rec);
+            if (stats.top_records.size() > ProjectionStats::TOP_N)
+                stats.top_records.pop_back();
         }
 
         mesh.point(v) = Mesh::Point(
@@ -334,6 +530,8 @@ void project_to_step(const TopoDS_Face& face, Mesh& mesh,
             w1 * projected.y() + w2 * input.y(),
             w1 * projected.z() + w2 * input.z());
     }
+
+    if (stats_out) *stats_out = std::move(stats);
 }
 
 double get_distance_to_face(const TopoDS_Face& face, double x, double y, double z) {

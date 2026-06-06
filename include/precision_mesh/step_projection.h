@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstddef>
+#include <limits>
 #include <memory>
 #include <unordered_map>
 #include <vector>
@@ -57,12 +59,53 @@ get_border_vertex_projector_map(const TopoDS_Face& face, Mesh& mesh,
                                 WireProjectorCachePtr wire_projectors,
                                 double tolerance = 1e-3);
 
+// Per-call statistics collected by project_to_step; merge across segments with merge().
+struct ProjectionStats {
+    struct Record {
+        double delta        = 0.0;
+        double px = 0, py = 0, pz = 0;   // input position
+        double qx = 0, qy = 0, qz = 0;   // projected position
+        bool   is_border    = false;
+        bool   null_he      = false;
+        bool   on_real_edge = false;
+        double edge_dist    = -1.0;
+        size_t vert_idx     = 0;
+        size_t segment_index = 0;
+        int    face_code    = 0;
+    };
+
+    static constexpr size_t TOP_N = 20;
+
+    size_t n_total             = 0;
+    size_t n_skipped_null      = 0;
+    size_t n_edge_projected    = 0;
+    size_t n_surface_projected = 0;
+    double sum_delta           = 0.0;
+    double min_delta           = std::numeric_limits<double>::max();
+    double max_delta           = 0.0;
+    size_t n_above_1em3        = 0;  // delta > 1e-3
+    size_t n_above_1em2        = 0;  // delta > 1e-2
+    size_t n_above_1em1        = 0;  // delta > 1e-1
+    size_t n_occt_skip         = 0;  // surface projector returned a face-boundary point (skipped)
+    std::vector<Record> top_records;  // sorted descending by delta, capped at TOP_N
+
+    void merge(const ProjectionStats& other);
+};
+
 // Project all mesh vertices toward the STEP surface, blending by weight [0,1].
+// If stats_out is non-null, per-vertex statistics are written there (no printing).
+// segment_index is stored in records for identification after merging.
+// max_projection_delta: if > 0, surface-projected vertices whose nearest point on the
+// face is a trimming-boundary edge/vertex AND whose displacement exceeds this threshold
+// are skipped (OCCT extrema wrong-local-minimum guard).  Pass params.max_edge_length.
 void project_to_step(const TopoDS_Face& face, Mesh& mesh,
                      WireProjectorCachePtr wire_projectors,
                      StepProjector& surface_projector,
                      StepBorderProjector& border_projector,
-                     double weight = 1.0);
+                     double weight = 1.0,
+                     size_t segment_index = 0,
+                     ProjectionStats* stats_out = nullptr,
+                     double max_projection_delta = 0.0);
 
 // Returns the distance from point (x,y,z) to the nearest point on face, or -1 on failure.
 double get_distance_to_face(const TopoDS_Face& face, double x, double y, double z);

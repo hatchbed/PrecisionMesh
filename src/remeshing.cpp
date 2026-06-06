@@ -16,12 +16,21 @@
 #include <precision_mesh/remeshing.h>
 
 #include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <limits>
 #include <mutex>
 
 #include <spdlog/spdlog.h>
 #include <tbb/parallel_for.h>
 
 #include <boost/iterator/function_output_iterator.hpp>
+
+#include <BRep_Tool.hxx>
+#include <Geom_Surface.hxx>
+#include <gp_Pnt.hxx>
+#include <gp_Pnt2d.hxx>
+#include <ShapeAnalysis_Surface.hxx>
 
 namespace PMP = CGAL::Polygon_mesh_processing;
 
@@ -158,19 +167,109 @@ void remesh_and_project(
                     }
                 }});
 
+        // Repair vertices whose halfedge back-pointer was nulled by the remesher while
+        // some halfedges still reference them as a target.  Restore the back-pointer by
+        // scanning all halfedges.  Vertices with null back-pointers that have NO valid
+        // halfedge referencing them (truly isolated) are left in place — they are harmless
+        // (no incident faces) and safe to skip during projection.  We do NOT call
+        // collect_garbage() here because the remesher may leave removed-but-not-yet-
+        // compacted halfedges that still reference these vertices; triggering compaction
+        // would remap those halfedge targets to the wrong vertices.
+        std::atomic<size_t> total_repaired{0};
+        tbb::parallel_for(
+            tbb::blocked_range<size_t>(0, meshes.size()), [&](const tbb::blocked_range<size_t>& r) {
+                for (size_t m = r.begin(); m != r.end(); ++m) {
+                    Mesh& mesh = meshes[m];
+                    size_t repaired = 0;
+                    for (auto h : mesh.halfedges()) {
+                        auto v = mesh.target(h);
+                        if (mesh.halfedge(v) == mesh.null_halfedge()) {
+                            mesh.set_halfedge(v, h);
+                            repaired++;
+                        }
+                    }
+                    total_repaired += repaired;
+                }
+            });
+        if (total_repaired) {
+            spdlog::info("      repaired {} null-halfedge vertices", total_repaired.load());
+        }
+
+        // Fill UV for vertices inserted by the remesher (they have NaN from the "v:uv" default).
+        // ShapeAnalysis_Surface::ValueOfUV is used rather than BRepExtrema global search because
+        // it handles periodicity correctly and is immune to the trimming-boundary false-minimum.
+        if (params.is_step) {
+            tbb::parallel_for(
+                tbb::blocked_range<size_t>(0, meshes.size()), [&](const tbb::blocked_range<size_t>& r) {
+                    for (size_t m = r.begin(); m != r.end(); ++m) {
+                        Mesh& mesh = meshes[m];
+                        const double kNaN = std::numeric_limits<double>::quiet_NaN();
+                        auto uv_map = mesh.add_property_map<Mesh::Vertex_index,
+                                                             std::pair<double,double>>(
+                            "v:uv", {kNaN, kNaN}).first;
+                        Handle(Geom_Surface) surf = BRep_Tool::Surface(segments[m]);
+                        if (surf.IsNull()) continue;
+                        ShapeAnalysis_Surface sa(surf);
+                        for (auto v : mesh.vertices()) {
+                            if (mesh.halfedge(v) == mesh.null_halfedge()) continue;
+                            auto& uv = uv_map[v];
+                            if (!std::isnan(uv.first)) continue;
+                            auto pt = mesh.point(v);
+                            gp_Pnt p(CGAL::to_double(pt.x()),
+                                     CGAL::to_double(pt.y()),
+                                     CGAL::to_double(pt.z()));
+                            gp_Pnt2d uv2 = sa.ValueOfUV(p, 1e-7);
+                            uv = {uv2.X(), uv2.Y()};
+                        }
+                    }
+                });
+        }
+
         if (params.is_step && !params.no_projection) {
             spdlog::info("      projecting ...");
             // Weight increases each iteration (1/N, 1/(N-1), ..., 1/1), reaching full
             // projection (weight=1) on the final iteration.  The gradual schedule prevents
             // degenerate faces from aggressively snapping vertices before the mesh topology
             // has had time to adapt.
+            double weight = 1.0 / (params.iterations - i);
+            std::vector<ProjectionStats> seg_stats(meshes.size());
             tbb::parallel_for(
                 tbb::blocked_range<size_t>(0, meshes.size()), [&](const tbb::blocked_range<size_t>& r) {
                     for (size_t m = r.begin(); m != r.end(); ++m) {
-                        double weight = 1.0 / (params.iterations - i);
                         project_to_step(segments[m], meshes[m], wire_projectors,
-                                              *surface_projectors[m], *border_projectors[m], weight);
+                                        *surface_projectors[m], *border_projectors[m],
+                                        weight, m, &seg_stats[m],
+                                        params.max_edge_length);
                     }});
+
+            // Merge per-segment stats and print a single summary for this iteration.
+            ProjectionStats global;
+            for (const auto& s : seg_stats) global.merge(s);
+
+            if (global.min_delta == std::numeric_limits<double>::max()) global.min_delta = 0.0;
+            size_t n_projected = global.n_total - global.n_skipped_null;
+            double mean_delta  = n_projected > 0 ? global.sum_delta / n_projected : 0.0;
+
+            spdlog::info("      {} verts ({} edge, {} surface, {} occt-skip, {} null-he skipped) "
+                         "weight={:.3f} delta min={:.2e} mean={:.2e} max={:.2e} "
+                         ">1e-3:{} >1e-2:{} >1e-1:{}",
+                         n_projected,
+                         global.n_edge_projected, global.n_surface_projected,
+                         global.n_occt_skip, global.n_skipped_null,
+                         weight,
+                         global.min_delta, mean_delta, global.max_delta,
+                         global.n_above_1em3, global.n_above_1em2, global.n_above_1em1);
+
+            for (size_t k = 0; k < global.top_records.size(); k++) {
+                const auto& r = global.top_records[k];
+                if (r.delta < 1e-9) break;
+                spdlog::warn("        top{} delta={:.4f} seg={} face={} vert={} "
+                             "border={} null_he={} on_edge={} edge_dist={:.4f} "
+                             "in=({:.4f},{:.4f},{:.4f}) proj=({:.4f},{:.4f},{:.4f})",
+                             k + 1, r.delta, r.segment_index, r.face_code, r.vert_idx,
+                             r.is_border, r.null_he, r.on_real_edge, r.edge_dist,
+                             r.px, r.py, r.pz, r.qx, r.qy, r.qz);
+            }
         }
 
         if (params.on_iteration_done)
