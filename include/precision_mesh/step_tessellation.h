@@ -31,6 +31,28 @@ double find_surface_error_param(const TopoDS_Shape& shape, double min_edge_lengt
 
 bool save_shape_as_step(const std::string& path, const TopoDS_Shape& shape);
 
+// Generate interior UV grid intersection points for a face.
+// Returns (u_steps-1)*(v_steps-1) points at the parametric grid interior lines.
+// No filtering for trimmed regions — CDT domain marking handles exterior points.
+std::vector<std::pair<double,double>> generate_uv_interior_grid(
+    const TopoDS_Face& face, int u_steps, int v_steps);
+
+// Remesh the interior of `mesh` by temporarily working in a scaled UV coordinate
+// space where equal distances ≈ equal arc lengths on the analytic surface, then
+// projecting new interior vertices back onto `face` via surface evaluation.
+// Border vertices are fixed throughout.  Returns false if the mesh or surface
+// metadata are invalid (mesh unchanged).
+bool uv_remesh(Mesh& mesh, const TopoDS_Face& face,
+               int u_steps, int v_steps, double min_edge_length, size_t face_idx = 0);
+
+// Replace the interior triangulation of `mesh` with a UV-grid CDT tessellation.
+// Border vertices (mesh.is_border(v)) are fixed constraints; interior is filled
+// by Jacobian-corrected Steiner points evaluated on `face` via BRepClass_FaceClassifier.
+// Requires "v:uv" property map to exist on `mesh` (set by tessellate_shape).
+// Returns false (mesh unchanged) if CDT fails or produces no triangles.
+bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int v_steps,
+                          double min_edge_length, size_t face_idx = 0);
+
 // Post-tessellation open boundary loop repair.  Merges the soup by exact vertex
 // position, traces open boundary edges into closed loops, and classifies each by
 // comparing the loop's polygon area to ref_area = min(avg_tri_area, 0.5*min_edge^2):

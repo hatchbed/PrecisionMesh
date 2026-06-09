@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <filesystem>
 #include <limits>
 #include <map>
@@ -835,6 +836,40 @@ int main(int argc, char **argv) {
             snap_border_midpoints_to_brep(meshes, segments, max_edge_length);
         }
 
+        // UV-grid CDT tessellation for regularly-curved STEP faces (cylinder, and later
+        // cone/torus/revolution).  Replaces the BRepMesh interior with a UV-grid CDT
+        // seeded by Jacobian-corrected Steiner points, giving uniform normal distribution.
+        // Runs once (not iterative — the CDT interior is already at the target density).
+        // These faces bypass the standard isotropic remeshing step.
+        struct UvFace { size_t idx; int u_steps, v_steps; };
+        std::vector<UvFace> uv_faces;
+        std::vector<bool> use_uv_tess(meshes.size(), false);
+        if (is_step) {
+            for (size_t i = 0; i < segments.size(); i++) {
+                auto steps = get_face_tessellation_steps(segments[i], min_edge_length,
+                                                         max_edge_length, max_surface_error);
+                bool eligible = (steps.type == CurvedFaceType::Cylinder)
+                                && (steps.u_steps > 1 || steps.v_steps > 1);
+                if (!eligible) continue;
+                uv_faces.push_back({i, steps.u_steps, steps.v_steps});
+                use_uv_tess[i] = true;
+            }
+        }
+        if (!uv_faces.empty()) {
+            spdlog::info("  UV-grid CDT tessellation for {} regularly-curved faces ...",
+                         uv_faces.size());
+            for (auto& f : uv_faces) {
+                if (!uv_grid_retessellate(meshes[f.idx], segments[f.idx],
+                                          f.u_steps, f.v_steps, min_edge_length, f.idx)) {
+                    use_uv_tess[f.idx] = false;
+                    spdlog::warn("  seg {}: uv_grid_retessellate failed, falling back to "
+                                 "isotropic remeshing", f.idx);
+                }
+            }
+            size_t n_ok = std::count(use_uv_tess.begin(), use_uv_tess.end(), true);
+            spdlog::info("  {} segments tessellated via UV-grid CDT", n_ok);
+        }
+
 #ifdef PRECISION_MESH_HAS_VIEWER
         push_to_viewer(viewer_ptr, meshes, segments, original_faces, component_map, is_step,
                        "After Border Splitting", max_surface_error, free_edge_lines, healed_edge_lines);
@@ -871,7 +906,7 @@ int main(int argc, char **argv) {
         }
 #endif
         remesh_and_project(meshes, segments, wire_projectors, surface_projectors, border_projectors,
-                           rparams);
+                           rparams, use_uv_tess);
     } else {
         spdlog::info("  skipping remeshing (--iterations 0).");
     }

@@ -274,7 +274,8 @@ void remesh_and_project(
     WireProjectorCachePtr wire_projectors,
     std::vector<std::unique_ptr<StepProjector>>& surface_projectors,
     std::vector<std::unique_ptr<StepBorderProjector>>& border_projectors,
-    const RemeshParams& params)
+    const RemeshParams& params,
+    const std::vector<bool>& skip_mask)
 {
     double max_remeshing_surface_error =
         std::min(params.max_surface_error, params.min_edge_length * 0.1);
@@ -345,6 +346,7 @@ void remesh_and_project(
         tbb::parallel_for(
             tbb::blocked_range<size_t>(0, meshes.size()), [&](const tbb::blocked_range<size_t>& r) {
                 for (size_t m = r.begin(); m != r.end(); ++m) {
+                    if (!skip_mask.empty() && m < skip_mask.size() && skip_mask[m]) continue;
                     Mesh& mesh = meshes[m];
                     const std::pair edge_min_max{params.min_edge_length, params.max_edge_length};
                     PMP::Adaptive_sizing_field<Mesh> sizing_field(max_remeshing_surface_error,

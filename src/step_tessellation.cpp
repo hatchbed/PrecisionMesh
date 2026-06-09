@@ -2,6 +2,7 @@
 #include <CGAL/Exact_predicates_inexact_constructions_kernel.h>
 #include <CGAL/Constrained_Delaunay_triangulation_2.h>
 #include <CGAL/Constrained_triangulation_face_base_2.h>
+#include <CGAL/Polygon_mesh_processing/remesh.h>
 #include <CGAL/Polygon_mesh_processing/repair_polygon_soup.h>
 #include <CGAL/Simple_cartesian.h>
 #include <CGAL/Surface_mesh.h>
@@ -14,6 +15,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <fstream>
 #include <limits>
 #include <list>
 #include <map>
@@ -24,6 +26,8 @@
 #include <spdlog/spdlog.h>
 
 #include <BRep_Tool.hxx>
+#include <BRepAdaptor_Surface.hxx>
+#include <BRepClass_FaceClassifier.hxx>
 #include <BRepGProp.hxx>
 #include <BRepMesh_IncrementalMesh.hxx>
 #include <BRepTools.hxx>
@@ -37,6 +41,7 @@
 #include <gp_Vec.hxx>
 #include <IMeshTools_Parameters.hxx>
 #include <Poly_Triangulation.hxx>
+#include <ShapeAnalysis_Surface.hxx>
 #include <STEPControl_Writer.hxx>
 #include <TopExp.hxx>
 #include <TopExp_Explorer.hxx>
@@ -755,6 +760,725 @@ std::vector<std::pair<Mesh, TopoDS_Face>> boundary_meshes(const TopoDS_Shape& sh
     return result;
 }
 
+
+// -- UV-grid CDT tessellation (Phase C2/C3) -----------------------------------
+// For analytic curved surfaces (cylinder, cone, torus, ...) the interior of each
+// face mesh is replaced by a uniform UV-parameter grid triangulated with CGAL CDT,
+// seeded by the fixed border vertices already established by BRepMesh + split/snap.
+
+std::vector<std::pair<double,double>> generate_uv_interior_grid(
+    const TopoDS_Face& face, int u_steps, int v_steps)
+{
+    BRepAdaptor_Surface surf(face);
+    double u_min = surf.FirstUParameter(), u_max = surf.LastUParameter();
+    double v_min = surf.FirstVParameter(), v_max = surf.LastVParameter();
+    double u_step = (u_max - u_min) / u_steps;
+    double v_step = (v_max - v_min) / v_steps;
+
+    std::vector<std::pair<double,double>> pts;
+    pts.reserve((u_steps > 1 ? u_steps - 1 : 0) * (v_steps > 1 ? v_steps - 1 : 0));
+    for (int i = 1; i < u_steps; i++)
+        for (int j = 1; j < v_steps; j++)
+            pts.push_back({u_min + i * u_step, v_min + j * v_step});
+    return pts;
+}
+
+bool uv_remesh(Mesh& mesh, const TopoDS_Face& face,
+               int u_steps, int v_steps, double min_edge_length, size_t face_idx)
+{
+    // Get UV property map (populated by tessellate_shape).
+    auto uv_opt = mesh.property_map<Mesh::Vertex_index, std::pair<double,double>>("v:uv");
+    if (!uv_opt.has_value()) {
+        spdlog::warn("uv_remesh [face {}]: no v:uv property map", face_idx);
+        return false;
+    }
+    auto uv_map = uv_opt.value();
+
+    BRepAdaptor_Surface surf(face);
+
+    // Sample first-order partial derivatives at the UV domain centre.
+    // Scaling u→(u_scale*u) and v→(v_scale*v) makes the flat working space
+    // approximately isometric with the analytic surface, so equal edge lengths
+    // in that space correspond to equal arc lengths in 3D.
+    double u_mid = (surf.FirstUParameter() + surf.LastUParameter()) / 2.0;
+    double v_mid = (surf.FirstVParameter() + surf.LastVParameter()) / 2.0;
+    gp_Pnt cp; gp_Vec d1, d2;
+    surf.D1(u_mid, v_mid, cp, d1, d2);
+    double u_scale = d1.Magnitude();
+    double v_scale = d2.Magnitude();
+    if (u_scale < 1e-10 || v_scale < 1e-10) {
+        spdlog::warn("uv_remesh [face {}]: degenerate surface metric (u_scale={:.4f} v_scale={:.4f})",
+                     face_idx, u_scale, v_scale);
+        return false;
+    }
+
+    // Derive the target edge length from the desired step counts and the actual
+    // arc lengths in the scaled UV space.  This gives the right density regardless
+    // of how coarse the initial BRepMesh triangulation was.
+    double u_arc = (surf.LastUParameter() - surf.FirstUParameter()) * u_scale;
+    double v_arc = (surf.LastVParameter() - surf.FirstVParameter()) * v_scale;
+    double target_u = u_steps > 1 ? u_arc / u_steps : u_arc;
+    double target_v = v_steps > 1 ? v_arc / v_steps : v_arc;
+    double target_edge_length = std::max(std::min(target_u, target_v), min_edge_length);
+
+    spdlog::debug("uv_remesh [face {}]: u_scale={:.4f} v_scale={:.4f} "
+                  "target={:.4f} (u_step={:.4f} v_step={:.4f}) "
+                  "verts_in={} faces_in={}",
+                  face_idx, u_scale, v_scale, target_edge_length, target_u, target_v,
+                  mesh.number_of_vertices(), mesh.number_of_faces());
+
+    // Snapshot the exact 3D positions of border vertices before overwriting them.
+    std::unordered_map<size_t, Mesh::Point> border_pos;
+    for (auto v : mesh.vertices())
+        if (mesh.is_border(v))
+            border_pos[v.idx()] = mesh.point(v);
+
+    // Replace every vertex position with (u_scale*u, v_scale*v, 0) so that the
+    // remeshing operates in a flat, arc-length-accurate 2D space.
+    for (auto v : mesh.vertices()) {
+        auto [u, vp] = uv_map[v];
+        mesh.point(v) = Mesh::Point(u_scale * u, v_scale * vp, 0.0);
+    }
+
+    // Diagnostics: edge-length distribution in UV-scaled space before remeshing.
+    {
+        double emin = 1e18, emax = 0.0, esum = 0.0;
+        int ecnt = 0, border_ecnt = 0, interior_ecnt = 0;
+        int border_vcnt = 0, interior_vcnt = 0;
+        for (auto v : mesh.vertices()) {
+            if (mesh.is_border(v)) border_vcnt++; else interior_vcnt++;
+        }
+        for (auto e : mesh.edges()) {
+            auto h = mesh.halfedge(e);
+            auto p0 = mesh.point(mesh.source(h));
+            auto p1 = mesh.point(mesh.target(h));
+            double len = std::sqrt(CGAL::to_double(CGAL::squared_distance(p0, p1)));
+            emin = std::min(emin, len); emax = std::max(emax, len); esum += len; ecnt++;
+            if (mesh.is_border(e)) border_ecnt++; else interior_ecnt++;
+        }
+        spdlog::debug("uv_remesh [face {}]: pre-remesh verts border={} interior={} "
+                      "edges border={} interior={} len=[{:.3f},{:.3f}] avg={:.3f}",
+                      face_idx, border_vcnt, interior_vcnt, border_ecnt, interior_ecnt,
+                      emin, emax, ecnt > 0 ? esum/ecnt : 0.0);
+    }
+
+    // Mark border edges and vertices as constrained so they won't move.
+    auto vcmap = mesh.add_property_map<Mesh::Vertex_index, bool>("v:uv_remesh_c", false).first;
+    auto ecmap = mesh.add_property_map<Mesh::Edge_index,   bool>("e:uv_remesh_c", false).first;
+    for (auto v : mesh.vertices()) if (mesh.is_border(v)) vcmap[v] = true;
+    for (auto e : mesh.edges())   if (mesh.is_border(e)) ecmap[e] = true;
+
+    bool ok = true;
+    try {
+        PMP::isotropic_remeshing(faces(mesh), target_edge_length, mesh,
+            CGAL::parameters::number_of_iterations(5)
+                             .number_of_relaxation_steps(3)
+                             .protect_constraints(true)
+                             .vertex_is_constrained_map(vcmap)
+                             .edge_is_constrained_map(ecmap));
+    } catch (const std::exception& e) {
+        spdlog::warn("uv_remesh [face {}]: remeshing exception: {}", face_idx, e.what());
+        ok = false;
+    } catch (...) {
+        spdlog::warn("uv_remesh [face {}]: unknown remeshing exception", face_idx);
+        ok = false;
+    }
+
+    mesh.remove_property_map(vcmap);
+    mesh.remove_property_map(ecmap);
+
+    if (!ok) {
+        for (auto v : mesh.vertices()) {
+            auto it = border_pos.find(v.idx());
+            if (it != border_pos.end()) mesh.point(v) = it->second;
+        }
+        return false;
+    }
+
+    // Diagnostics: edge-length distribution in UV-scaled space immediately after remeshing,
+    // before back-projection.  Verifies convergence: edges should be within
+    // [4/5*target, 4/3*target] if CGAL considers the mesh done.
+    {
+        double emin = 1e18, emax = 0.0, esum = 0.0;
+        int ecnt = 0, n_short = 0, n_long = 0;
+        int border_vcnt = 0, interior_vcnt = 0;
+        for (auto v : mesh.vertices()) {
+            if (mesh.is_border(v)) border_vcnt++; else interior_vcnt++;
+        }
+        for (auto e : mesh.edges()) {
+            auto h = mesh.halfedge(e);
+            auto p0 = mesh.point(mesh.source(h));
+            auto p1 = mesh.point(mesh.target(h));
+            double len = std::sqrt(CGAL::to_double(CGAL::squared_distance(p0, p1)));
+            emin = std::min(emin, len); emax = std::max(emax, len); esum += len; ecnt++;
+            if (len < 0.8 * target_edge_length) n_short++;
+            if (len > (4.0/3.0) * target_edge_length) n_long++;
+        }
+        spdlog::debug("uv_remesh [face {}]: post-remesh UV space: verts border={} interior={} "
+                      "len=[{:.3f},{:.3f}] avg={:.3f} thresh=[{:.3f},{:.3f}] "
+                      "n_short={} n_long={}",
+                      face_idx, border_vcnt, interior_vcnt,
+                      emin, emax, ecnt > 0 ? esum/ecnt : 0.0,
+                      0.8*target_edge_length, (4.0/3.0)*target_edge_length,
+                      n_short, n_long);
+    }
+
+    // Map all vertices back to 3D.
+    // Border vertices: restore the exact snapped position.
+    // Interior vertices: their position (u_scale*u, v_scale*v, 0) encodes the UV
+    // after remeshing; evaluate the analytic surface to get the exact 3D point.
+    for (auto v : mesh.vertices()) {
+        auto it = border_pos.find(v.idx());
+        if (it != border_pos.end()) {
+            mesh.point(v) = it->second;
+        } else {
+            auto p = mesh.point(v);
+            double u  = p.x() / u_scale;
+            double vp = p.y() / v_scale;
+            uv_map[v] = {u, vp};
+            gp_Pnt p3d = surf.Value(u, vp);
+            mesh.point(v) = Mesh::Point(p3d.X(), p3d.Y(), p3d.Z());
+        }
+    }
+
+    // Diagnostics: 3D edge-length distribution after back-projection.
+    {
+        double emin = 1e18, emax = 0.0, esum = 0.0;
+        int ecnt = 0, border_vcnt = 0, interior_vcnt = 0;
+        for (auto v : mesh.vertices()) {
+            if (mesh.is_border(v)) border_vcnt++; else interior_vcnt++;
+        }
+        for (auto e : mesh.edges()) {
+            auto h = mesh.halfedge(e);
+            auto p0 = mesh.point(mesh.source(h));
+            auto p1 = mesh.point(mesh.target(h));
+            double len = std::sqrt(CGAL::to_double(CGAL::squared_distance(p0, p1)));
+            emin = std::min(emin, len); emax = std::max(emax, len); esum += len; ecnt++;
+        }
+        spdlog::debug("uv_remesh [face {}]: post-project 3D space: verts border={} interior={} "
+                      "len=[{:.3f},{:.3f}] avg={:.3f}",
+                      face_idx, border_vcnt, interior_vcnt,
+                      emin, emax, ecnt > 0 ? esum/ecnt : 0.0);
+    }
+
+    spdlog::debug("uv_remesh [face {}]: {} verts {} faces after remesh",
+                  face_idx, mesh.number_of_vertices(), mesh.number_of_faces());
+    return true;
+}
+
+bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int v_steps,
+                          double min_edge_length, size_t face_idx)
+{
+    const double kNaNuv = std::numeric_limits<double>::quiet_NaN();
+    auto uv_map = mesh.add_property_map<Mesh::Vertex_index, std::pair<double,double>>(
+        "v:uv", {kNaNuv, kNaNuv}).first;
+    // Verify at least one border vertex has a valid (non-NaN) UV — proxy for map existence.
+    bool uv_ok = false;
+    for (auto v : mesh.vertices()) {
+        if (mesh.is_border(v) && !std::isnan(uv_map[v].first)) { uv_ok = true; break; }
+    }
+    if (!uv_ok) {
+        spdlog::warn("uv_grid_retessellate: mesh has no valid v:uv values on border vertices");
+        return false;
+    }
+
+    // Fill NaN UV values for border vertices added after tessellate_shape (e.g., split_border_edges
+    // midpoints). Those vertices have no UV in the property map; project their 3D positions onto
+    // the surface to recover UV. This must run before building the CDT — inserting NaN coordinates
+    // into CGAL produces undefined predicate results and degenerates the triangulation.
+    {
+        Handle(Geom_Surface) geom_surf = BRep_Tool::Surface(face);
+        ShapeAnalysis_Surface sa(geom_surf);
+        for (auto v : mesh.vertices()) {
+            if (!mesh.is_border(v)) continue;
+            auto& uv = uv_map[v];
+            if (!std::isnan(uv.first) && !std::isnan(uv.second)) continue;
+            auto p = mesh.point(v);
+            gp_Pnt p3d(CGAL::to_double(p.x()), CGAL::to_double(p.y()), CGAL::to_double(p.z()));
+            gp_Pnt2d uv2d = sa.ValueOfUV(p3d, 1e-7);
+            uv = {uv2d.X(), uv2d.Y()};
+        }
+    }
+
+    BRepAdaptor_Surface surf(face);
+
+    // Jacobian-corrected UV step sizes: uv_du_step/uv_dv_step give ~target arc length in 3D.
+    double uv_u_scale, uv_v_scale, uv_du_step, uv_dv_step;
+    {
+        double u_mid = (surf.FirstUParameter() + surf.LastUParameter()) / 2.0;
+        double v_mid = (surf.FirstVParameter() + surf.LastVParameter()) / 2.0;
+        gp_Pnt cp; gp_Vec d_du, d_dv;
+        surf.D1(u_mid, v_mid, cp, d_du, d_dv);
+        uv_u_scale = std::max(d_du.Magnitude(), 1e-10);
+        uv_v_scale = std::max(d_dv.Magnitude(), 1e-10);
+        double u_arc = (surf.LastUParameter() - surf.FirstUParameter()) * uv_u_scale;
+        double v_arc = (surf.LastVParameter() - surf.FirstVParameter()) * uv_v_scale;
+        double target_u = u_steps > 1 ? u_arc / u_steps : u_arc;
+        double target_v = v_steps > 1 ? v_arc / v_steps : v_arc;
+        double target   = std::max(std::min(target_u, target_v), min_edge_length);
+        uv_du_step = target / uv_u_scale;
+        uv_dv_step = target / uv_v_scale;
+    }
+
+    // 1. Extract ordered border loops by walking border halfedges.
+    std::unordered_set<size_t> visited_hes;
+    std::vector<std::vector<Mesh::Vertex_index>> loops;
+    for (auto h : mesh.halfedges()) {
+        if (!mesh.is_border(h)) continue;
+        if (visited_hes.count(h.idx())) continue;
+        std::vector<Mesh::Vertex_index> loop;
+        auto cur = h;
+        do {
+            visited_hes.insert(cur.idx());
+            loop.push_back(mesh.target(cur));
+            cur = mesh.next(cur);
+        } while (cur != h);
+        if (loop.size() >= 3) loops.push_back(loop);
+    }
+    if (loops.empty()) {
+        spdlog::warn("uv_grid_retessellate: no border loops found");
+        return false;
+    }
+
+    // 2. Build UV arrays for each loop, correcting period-jump discontinuities.
+    bool u_per = surf.IsUPeriodic();  double u_period = u_per ? surf.UPeriod() : 0.0;
+    bool v_per = surf.IsVPeriodic();  double v_period = v_per ? surf.VPeriod() : 0.0;
+
+    std::vector<std::vector<std::pair<double,double>>> loop_uvs(loops.size());
+    for (size_t li = 0; li < loops.size(); li++) {
+        for (auto v : loops[li]) loop_uvs[li].push_back(uv_map[v]);
+        for (size_t i = 1; i < loop_uvs[li].size(); i++) {
+            if (u_per) {
+                double du = loop_uvs[li][i].first - loop_uvs[li][i-1].first;
+                if      (du >  u_period * 0.5) loop_uvs[li][i].first -= u_period;
+                else if (du < -u_period * 0.5) loop_uvs[li][i].first += u_period;
+            }
+            if (v_per) {
+                double dv = loop_uvs[li][i].second - loop_uvs[li][i-1].second;
+                if      (dv >  v_period * 0.5) loop_uvs[li][i].second -= v_period;
+                else if (dv < -v_period * 0.5) loop_uvs[li][i].second += v_period;
+            }
+        }
+    }
+
+    spdlog::debug("uv_grid_retessellate [face {}]: u_scale={:.4f} v_scale={:.4f} "
+                  "du_step={:.4f} dv_step={:.4f} u_per={} loops={}",
+                  face_idx, uv_u_scale, uv_v_scale, uv_du_step, uv_dv_step,
+                  u_per, (int)loops.size());
+
+    // 3. Build CDT. vertex handle → index in unified vertex table.
+    //    Border vertices:  index 0 .. N_border-1  → border_mesh_verts[i]
+    //    Interior Steiner: index N_border .. N-1  → interior_info[i-N_border]
+    std::map<CRCDT::Vertex_handle, size_t> vh_to_idx;
+    std::vector<Mesh::Vertex_index> border_mesh_verts;
+    std::vector<std::pair<gp_Pnt, std::pair<double,double>>> interior_info;
+    int n_interior = 0;
+
+    {
+        CRCDT cdt;
+
+        bool cdt_ok = true;
+        std::vector<std::vector<CRCDT::Vertex_handle>> loop_vhs(loops.size());
+        try {
+            for (size_t li = 0; li < loops.size(); li++) {
+                loop_vhs[li].reserve(loops[li].size());
+                for (size_t vi = 0; vi < loops[li].size(); vi++) {
+                    double u = loop_uvs[li][vi].first, v = loop_uvs[li][vi].second;
+                    auto vh = cdt.insert(CRCDT::Point(u * uv_u_scale, v * uv_v_scale));
+                    if (!vh_to_idx.count(vh)) {
+                        vh_to_idx[vh] = border_mesh_verts.size();
+                        border_mesh_verts.push_back(loops[li][vi]);
+                    }
+                    loop_vhs[li].push_back(vh);
+                }
+            }
+
+            if (cdt.dimension() < 2) {
+                spdlog::warn("uv_grid_retessellate: border UV points are degenerate (dim={})",
+                             cdt.dimension());
+                cdt_ok = false;
+            }
+
+            // Insert constrained edges for each border loop.
+            // Interior grid edges are NOT constrained — Steiner points are unconstrained,
+            // so the Delaunay criterion governs the interior triangulation.  Constrained
+            // interior edges caused CDT failures when wire-cutout boundaries crossed them.
+            size_t n_after_border = cdt.number_of_vertices();
+            for (size_t li = 0; li < loops.size() && cdt_ok; li++) {
+                const auto& vhs = loop_vhs[li];
+                for (size_t i = 0; i < vhs.size() && cdt_ok; i++) {
+                    auto va = vhs[i], vb = vhs[(i + 1) % vhs.size()];
+                    if (va == vb) continue;
+                    auto pa = va->point(), pb = vb->point();
+                    double du = pa.x() - pb.x(), dv = pa.y() - pb.y();
+                    if (du*du + dv*dv < 1e-20) continue;
+                    // For periodic faces the last loop edge is the seam-wrap closing edge
+                    // (Δu ≈ ±u_period).  Skip it — the seam is implicitly enforced by the
+                    // convex hull of the border vertices.
+                    if (u_per && i == vhs.size() - 1) {
+                        double u_period_scaled = u_period * uv_u_scale;
+                        if (std::abs(std::abs(du) - u_period_scaled) < u_period_scaled * 0.01) {
+                            spdlog::debug("  loop {}: skip seam-wrap closing constraint |du|={:.4f}",
+                                          li, std::abs(du));
+                            continue;
+                        }
+                    }
+                    cdt.insert_constraint(va, vb);
+                }
+            }
+            if (cdt.number_of_vertices() != n_after_border) {
+                spdlog::warn("uv_grid_retessellate: border constraints created extra CDT vertices"
+                             " (self-intersecting UV?)");
+                cdt_ok = false;
+            }
+
+            // Generate interior grid points with Jacobian-corrected UV spacing.
+            // BRepClass_FaceClassifier pre-filters points outside the trimmed face
+            // (holes, wire cutouts) before inserting them into the CDT.
+            if (cdt_ok) {
+                double u_min_g, u_max_g;
+                if (u_per && surf.IsUClosed()) {
+                    double u_bmin = std::numeric_limits<double>::infinity();
+                    for (const auto& lp : loop_uvs)
+                        for (const auto& uv : lp)
+                            u_bmin = std::min(u_bmin, uv.first);
+                    u_min_g = u_bmin;
+                    u_max_g = u_bmin + u_period;
+                } else {
+                    u_min_g = surf.FirstUParameter();
+                    u_max_g = surf.LastUParameter();
+                }
+                double v_min_g = surf.FirstVParameter();
+                double v_max_g = surf.LastVParameter();
+
+                size_t N_border_now = border_mesh_verts.size();
+                int n_inserted = 0, n_filtered = 0;
+                double u_first = surf.FirstUParameter();
+
+// For periodic surfaces, pad the grid to include the left AND right seams exactly
+                double start_u = u_min_g + (u_per ? 0.0 : uv_du_step);
+                double end_u   = u_max_g - (u_per ? -1e-6 : uv_du_step * 0.5);
+
+                std::vector<std::pair<CRCDT::Vertex_handle, int>> left_seam, right_seam;
+
+                int i_u = 0;
+                for (double u = start_u; u < end_u; u += uv_du_step, ++i_u) {
+                    int i_v = 0;
+                    bool is_left = (u_per && i_u == 0);
+                    bool is_right = (u_per && u >= u_max_g - uv_du_step * 0.5);
+
+                    for (double v = v_min_g + uv_dv_step; v < v_max_g - uv_dv_step * 0.5; v += uv_dv_step, ++i_v) {
+
+                        // Force the right seam to match the left seam's perturbation parity perfectly
+                        int perturb_u_idx = is_right ? 0 : i_u;
+
+                        // Do NOT perturb vertices lying exactly on the left/right periodic seams.
+                        // Since we already add vertical constraints along the seams, they don't need perturbation
+                        // to prevent Delaunay flips. Setting perturbation to 0 here completely avoids the
+                        // u_cls parameter-wrapping bug, ensuring left/right 3D points evaluate identically.
+                        double pert_u = u;
+                        double pert_v = v;
+                        if (!is_left && !is_right) {
+                            //pert_u += (((perturb_u_idx + i_v) % 2 == 0) ? 1e-5 : -1e-5) * uv_du_step;
+                            //pert_v += ((perturb_u_idx % 2 == 0) ? 1e-5 : -1e-5) * uv_dv_step;
+                        }
+
+                        // Map the perturbed coordinate to canonical UV range
+                        double u_cls = pert_u;
+                        if (u_per) {
+                            while (u_cls >= u_first + u_period) u_cls -= u_period;
+                            while (u_cls < u_first)              u_cls += u_period;
+                        }
+
+                        BRepClass_FaceClassifier clf(face, gp_Pnt2d(u_cls, pert_v), 1e-6);
+                        if (clf.State() != TopAbs_IN && clf.State() != TopAbs_ON) {
+                            ++n_filtered;
+                            continue;
+                        }
+
+                        auto vh = cdt.insert(CRCDT::Point(pert_u * uv_u_scale, pert_v * uv_v_scale));
+
+                        // Collect seam vertices for constraints
+                        if (is_left) left_seam.push_back({vh, i_v});
+                        if (is_right) right_seam.push_back({vh, i_v});
+
+                        if (!vh_to_idx.count(vh)) {
+                            gp_Pnt p3d = surf.Value(u_cls, pert_v); // Unscaled UV
+                            vh_to_idx[vh] = N_border_now + interior_info.size();
+                            interior_info.push_back({p3d, {u_cls, pert_v}});
+                            ++n_inserted;
+                        }
+                    }
+                }
+
+                // Add vertical constraint edges to the seams to enforce perfect symmetry.
+                // We only connect adjacent i_v steps to prevent drawing constraints across cutouts/holes!
+                if (u_per) {
+                    for (size_t i = 1; i < left_seam.size(); i++) {
+                        if (left_seam[i].second == left_seam[i-1].second + 1)
+                            cdt.insert_constraint(left_seam[i-1].first, left_seam[i].first);
+                    }
+                    for (size_t i = 1; i < right_seam.size(); i++) {
+                        if (right_seam[i].second == right_seam[i-1].second + 1)
+                            cdt.insert_constraint(right_seam[i-1].first, right_seam[i].first);
+                    }
+                }
+                spdlog::debug("  grid: {} inserted, {} filtered (BRepClass)", n_inserted, n_filtered);
+
+                // Count inside triangles using BRepClass_FaceClassifier on centroids.
+                for (auto f = cdt.finite_faces_begin(); f != cdt.finite_faces_end(); ++f) {
+                    double cx_scaled = (f->vertex(0)->point().x() + f->vertex(1)->point().x() +
+                                        f->vertex(2)->point().x()) / 3.0;
+                    double cy_scaled = (f->vertex(0)->point().y() + f->vertex(1)->point().y() +
+                                        f->vertex(2)->point().y()) / 3.0;
+                    double cx = cx_scaled / uv_u_scale;
+                    double cy = cy_scaled / uv_v_scale;
+                    double cx_cls = cx;
+                    if (u_per) {
+                        while (cx_cls >= u_first + u_period) cx_cls -= u_period;
+                        while (cx_cls < u_first)              cx_cls += u_period;
+                    }
+
+                    // Calculate a dynamic 2D tolerance (25% of grid step) to absorb the chordal
+                    // deviation of the straight CDT edges curving around concave boundaries
+                    double tol2d = 1e-4;
+                    BRepClass_FaceClassifier clf(face, gp_Pnt2d(cx_cls, cy), tol2d);
+
+                    if (clf.State() == TopAbs_IN || clf.State() == TopAbs_ON) ++n_interior;
+                }
+                spdlog::debug("  cdt: {} finite faces, {} inside",
+                              (int)cdt.number_of_faces(), n_interior);
+            }
+        } catch (const std::exception& e) {
+            spdlog::warn("uv_grid_retessellate: CDT exception: {}", e.what());
+            cdt_ok = false;
+        } catch (...) {
+            spdlog::warn("uv_grid_retessellate: CDT unknown exception");
+            cdt_ok = false;
+        }
+
+        if (!cdt_ok || n_interior == 0) {
+            if (n_interior == 0 && cdt_ok)
+                spdlog::warn("uv_grid_retessellate: CDT produced 0 interior triangles");
+            return false;
+        }
+
+        // Extract interior triangles using BRepClass_FaceClassifier on centroids.
+        struct CdtTri { size_t a, b, c; };
+        std::vector<CdtTri> cdt_tris;
+        cdt_tris.reserve(n_interior);
+        int n_excluded = 0, n_missing = 0;
+        {
+            double u_first = surf.FirstUParameter();
+            for (auto f = cdt.finite_faces_begin(); f != cdt.finite_faces_end(); ++f) {
+                double cx_scaled = (f->vertex(0)->point().x() + f->vertex(1)->point().x() +
+                                    f->vertex(2)->point().x()) / 3.0;
+                double cy_scaled = (f->vertex(0)->point().y() + f->vertex(1)->point().y() +
+                                    f->vertex(2)->point().y()) / 3.0;
+
+                // Unscale back to true UV space for BRep classification
+                double cx = cx_scaled / uv_u_scale;
+                double cy = cy_scaled / uv_v_scale;
+                double cx_cls = cx;
+                if (u_per) {
+                    while (cx_cls >= u_first + u_period) cx_cls -= u_period;
+                    while (cx_cls < u_first)              cx_cls += u_period;
+                }
+                // Calculate a dynamic 2D tolerance (25% of grid step) to absorb the chordal
+                // deviation of the straight CDT edges curving around concave boundaries
+                double tol2d = 1e-4;
+                BRepClass_FaceClassifier clf(face, gp_Pnt2d(cx_cls, cy), tol2d);
+                if (clf.State() != TopAbs_IN && clf.State() != TopAbs_ON) { ++n_excluded; continue; }
+                auto it0 = vh_to_idx.find(f->vertex(0));
+                auto it1 = vh_to_idx.find(f->vertex(1));
+                auto it2 = vh_to_idx.find(f->vertex(2));
+                if (it0 == vh_to_idx.end() || it1 == vh_to_idx.end() || it2 == vh_to_idx.end()) {
+                    ++n_missing; continue;
+                }
+                cdt_tris.push_back({it0->second, it1->second, it2->second});
+            }
+        }
+        if (n_missing > 0)
+            spdlog::warn("uv_grid_retessellate [face {}]: {} triangles skipped (CDT vertex not in map)",
+                         face_idx, n_missing);
+        spdlog::debug("  extraction: {} kept, {} excluded, {} missing",
+                      cdt_tris.size(), n_excluded, n_missing);
+        if (cdt_tris.empty()) {
+            spdlog::warn("uv_grid_retessellate: no mappable interior triangles");
+            return false;
+        }
+
+        // ==========================================
+        // TEMPORARY DIAGNOSTIC: Export 2D CDT to Obj
+        // ==========================================
+        std::ofstream out_obj("Face_" + std::to_string(face_idx) + "_CDT.obj");
+        if (out_obj.is_open()) {
+            for (auto v = cdt.finite_vertices_begin(); v != cdt.finite_vertices_end(); ++v) {
+                out_obj << "v " << v->point().x() << " " << v->point().y() << " 0\n";
+            }
+            std::map<CRCDT::Vertex_handle, int> obj_v_idx;
+            int idx = 1;
+            for (auto v = cdt.finite_vertices_begin(); v != cdt.finite_vertices_end(); ++v) {
+                obj_v_idx[v] = idx++;
+            }
+            double dbg_u_first = surf.FirstUParameter();
+            double dbg_u_period = surf.IsUPeriodic() ? surf.UPeriod() : 0.0;
+            bool dbg_u_per = surf.IsUPeriodic();
+            for (auto f = cdt.finite_faces_begin(); f != cdt.finite_faces_end(); ++f) {
+                double cx_scaled = (f->vertex(0)->point().x() + f->vertex(1)->point().x() + f->vertex(2)->point().x()) / 3.0;
+                double cy_scaled = (f->vertex(0)->point().y() + f->vertex(1)->point().y() + f->vertex(2)->point().y()) / 3.0;
+                double cx = cx_scaled / uv_u_scale;
+                double cy = cy_scaled / uv_v_scale;
+                double cx_cls = cx;
+                if (dbg_u_per) {
+                    while (cx_cls >= dbg_u_first + dbg_u_period) cx_cls -= dbg_u_period;
+                    while (cx_cls < dbg_u_first)              cx_cls += dbg_u_period;
+                }
+                BRepClass_FaceClassifier clf(face, gp_Pnt2d(cx_cls, cy), 1e-4);
+                if (clf.State() == TopAbs_IN || clf.State() == TopAbs_ON) {
+                    out_obj << "f " << obj_v_idx[f->vertex(0)] << " "
+                                    << obj_v_idx[f->vertex(1)] << " "
+                                    << obj_v_idx[f->vertex(2)] << "\n";
+                }
+            }
+            out_obj.close();
+            spdlog::debug("uv_grid_retessellate [face {}]: wrote debug CDT to 'Face_{}_CDT.obj'", face_idx, face_idx);
+        }
+        // ==========================================
+
+        size_t N_border = border_mesh_verts.size();
+
+        // 5. Build new mesh.
+        auto n_out = cr_face_outward_normal(face);
+
+        Mesh new_mesh;
+        auto new_uv = new_mesh.add_property_map<Mesh::Vertex_index, std::pair<double,double>>(
+            "v:uv", {kNaNuv, kNaNuv}).first;
+        auto new_locked = new_mesh.add_property_map<Mesh::Vertex_index, bool>(
+            "v:border_locked", false).first;
+
+        std::vector<Mesh::Vertex_index> vert_new(N_border + interior_info.size(),
+                                                  Mesh::null_vertex());
+        std::unordered_map<size_t, Mesh::Vertex_index> old_idx_to_new;
+
+        // NEW MAP: Deduplicates vertices that evaluate to the exact same 3D location (like periodic seams)
+        std::map<std::tuple<double,double,double>, Mesh::Vertex_index> pos_to_new_v;
+
+        for (size_t i = 0; i < N_border; i++) {
+            auto old_v = border_mesh_verts[i];
+            auto it = old_idx_to_new.find(old_v.idx());
+            Mesh::Vertex_index nv;
+            if (it == old_idx_to_new.end()) {
+                nv = new_mesh.add_vertex(mesh.point(old_v));
+                new_uv[nv] = uv_map[old_v];
+                new_locked[nv] = true;
+                old_idx_to_new[old_v.idx()] = nv;
+            } else {
+                nv = it->second;
+            }
+            vert_new[i] = nv;
+
+            // Log border vertex position in 3D so the interior grid can connect to it
+            auto p = new_mesh.point(nv);
+            double px = std::round(CGAL::to_double(p.x()) * 1e5);
+            double py = std::round(CGAL::to_double(p.y()) * 1e5);
+            double pz = std::round(CGAL::to_double(p.z()) * 1e5);
+            pos_to_new_v[{px, py, pz}] = nv;
+        }
+
+        int seam_merge_count = 0;
+        for (size_t i = 0; i < interior_info.size(); i++) {
+            const auto& p3d = interior_info[i].first;
+            // Round to 5 decimals (approx 1 micron) to cleanly merge periodic seams
+            double px = std::round(p3d.X() * 1e5);
+            double py = std::round(p3d.Y() * 1e5);
+            double pz = std::round(p3d.Z() * 1e5);
+            auto key = std::make_tuple(px, py, pz);
+
+            auto it = pos_to_new_v.find(key);
+            if (it != pos_to_new_v.end()) {
+                // If it hits here, it successfully merged the left and right periodic seam!
+                vert_new[N_border + i] = it->second;
+                seam_merge_count++;
+            } else {
+                auto nv = new_mesh.add_vertex(K::Point_3(p3d.X(), p3d.Y(), p3d.Z()));
+                new_uv[nv] = interior_info[i].second;
+                new_locked[nv] = false;
+                vert_new[N_border + i] = nv;
+                pos_to_new_v[key] = nv;
+            }
+        }
+        spdlog::debug("uv_grid_retessellate [face {}]: successfully merged {} seam/duplicate vertices",
+                      face_idx, seam_merge_count);
+
+        // Seam vertices: for periodic (u_closed) faces the seam physical vertex appears
+        // at both u=FirstU and u=LastU as two distinct CDT handles, both mapping to the
+        // same new-mesh vertex.  CDT triangles adjacent to both handles become identical
+        // mesh faces → pre-filter with a vertex-triple deduplication set.
+        std::set<std::array<size_t, 3>> seen_faces;
+        int added = 0, rejected = 0;
+        for (const auto& tri : cdt_tris) {
+            if (tri.a >= vert_new.size() || tri.b >= vert_new.size() || tri.c >= vert_new.size()) continue;
+            auto va = vert_new[tri.a], vb = vert_new[tri.b], vc = vert_new[tri.c];
+            if (va == Mesh::null_vertex() || vb == Mesh::null_vertex() || vc == Mesh::null_vertex()) continue;
+            if (va == vb || vb == vc || va == vc) continue;
+            std::array<size_t, 3> fkey = {va.idx(), vb.idx(), vc.idx()};
+            std::sort(fkey.begin(), fkey.end());
+            if (!seen_faces.insert(fkey).second) continue;  // seam duplicate
+            auto pa = new_mesh.point(va), pb = new_mesh.point(vb), pc = new_mesh.point(vc);
+            auto cross = CGAL::cross_product(pb - pa, pc - pa);
+            double dot = CGAL::to_double(cross.x()) * n_out[0]
+                       + CGAL::to_double(cross.y()) * n_out[1]
+                       + CGAL::to_double(cross.z()) * n_out[2];
+            if (dot < 0.0) std::swap(vb, vc);
+            if (new_mesh.add_face(va, vb, vc) != Mesh::null_face()) added++;
+            else rejected++;
+        }
+        if (rejected > 0)
+            spdlog::warn("uv_grid_retessellate [face {}]: add_face rejected {} triangles"
+                         " (non-manifold)", face_idx, rejected);
+        if (added == 0) {
+            spdlog::warn("uv_grid_retessellate: 0 faces added");
+            return false;
+        }
+        spdlog::debug("uv_grid_retessellate [face {}]: {} border verts, {} interior Steiner, {} triangles",
+                      face_idx, N_border, interior_info.size(), added);
+        mesh = std::move(new_mesh);
+
+        // Border halfedge audit: actual count must equal the sum of border loop sizes.
+        // A mismatch means the CDT left gaps (open edges that aren't part of the BREP wire).
+        {
+            size_t expected_he = 0;
+            for (const auto& lp : loops) expected_he += lp.size();
+            size_t actual_he = 0;
+            for (auto h : mesh.halfedges())
+                if (mesh.is_border(h)) actual_he++;
+            if (actual_he != expected_he) {
+                spdlog::warn("uv_grid_retessellate [face {}]: border halfedge mismatch — "
+                             "expected {} got {} (tessellation has gaps)",
+                             face_idx, expected_he, actual_he);
+                // Dump UV of every border halfedge so we can locate the holes.
+                auto dump_uv = mesh.property_map<Mesh::Vertex_index,
+                                                  std::pair<double,double>>("v:uv").value();
+                for (auto h : mesh.halfedges()) {
+                    if (!mesh.is_border(h)) continue;
+                    auto s = mesh.source(h), t = mesh.target(h);
+                    auto [su, sv] = dump_uv[s];
+                    auto [tu, tv] = dump_uv[t];
+                    spdlog::debug("  bhe: ({:.4f},{:.4f})→({:.4f},{:.4f}) dU={:.4f} dV={:.4f}",
+                                  su, sv, tu, tv, tu - su, tv - sv);
+                }
+            } else
+                spdlog::debug("uv_grid_retessellate [face {}]: border halfedges OK ({})",
+                              face_idx, actual_he);
+        }
+
+        return true;
+    } // end CDT scope — unreachable: all paths return inside the block above
+    return false;
+}
+
+// -- End UV-grid CDT tessellation ---------------------------------------------
 
 void repair_open_boundary_loops(std::vector<std::pair<Mesh, TopoDS_Face>>& tessellation,
                                  double min_edge_length,
