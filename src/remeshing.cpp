@@ -168,20 +168,22 @@ void snap_border_midpoints_to_brep(std::vector<Mesh>& meshes,
             seg_curves[m].push_back({e, f, l, crv});
         }
 
-    // Classification by the chord midpoint's own distance to BREP edges in ref0's segment.
+    // Classification by a border vertex's own distance to BREP edges in ref0's segment.
     //
-    // Straight-edge (generator line, U-cut) chord midpoints: the midpoint of a straight
-    // chord lies exactly ON the line → distance ≈ 0 ≤ edge_tol → skip (already correct).
+    // A border vertex lies, by construction, on the face's wire.  PMP::split_long_edges
+    // places split vertices on the straight CHORD between an edge's endpoints, so:
     //
-    // Curved-edge (circle arc, V-cut circle) chord midpoints: sagitta = distance from
-    // chord midpoint to the arc.  For any circle of any radius, sagitta < chord/2
-    // ≤ max_edge_length/2, so snap_tol = max_edge_length * 0.5 catches all of them.
+    //   * Straight edges (generator line, U-cut): chord == edge, every split vertex stays
+    //     exactly ON the line → distance ≈ 0 ≤ edge_tol → already correct, skip.
     //
-    // This approach is robust to corner-vertex ambiguity: the chord midpoint is at a
-    // unique position (inside the arc) that is unambiguously classified by its own
-    // distance, independent of which edge its endpoints also belong to.
+    //   * Curved edges (arcs, splines): every split vertex sits off the curve by its local
+    //     sagitta → distance > edge_tol → project it back onto the curve.  This must work
+    //     for ALL split vertices, not just a single midpoint: an edge several times longer
+    //     than max_edge_length is bisected repeatedly, leaving many collinear chord points
+    //     whose sagitta (relative to the full arc) far exceeds max_edge_length.  Hence there
+    //     is NO upper distance bound and NO neighbour check — both wrongly rejected the
+    //     interior chord points and left them on the chord (linear-interpolation artifact).
     const double edge_tol  = 1e-3;
-    const double snap_tol  = max_edge_length * 0.5;
 
     // Cache (seg, PosKey) → (nearest_edge_idx, distance).
     std::map<std::pair<size_t,PosKey>, std::pair<int,double>> dist_cache;
@@ -210,44 +212,15 @@ void snap_border_midpoints_to_brep(std::vector<Mesh>& meshes,
         if (refs.empty()) continue;
         const auto& ref0 = refs[0];
 
-        // Step 1: classify by the chord midpoint's own distance to the nearest BREP edge.
+        // Find the nearest BREP edge to this border vertex.  If it already lies on that
+        // edge (straight-edge split point, or an original wire vertex) leave it alone;
+        // otherwise it is an off-curve chord point and must be projected onto the curve.
         auto [e_idx, e_dist] = nearest_edge_for(ref0.seg, pos);
-        if (e_idx < 0 || e_dist <= edge_tol || e_dist > snap_tol) continue;
+        if (e_idx < 0 || e_dist <= edge_tol) continue;
 
-        // Step 2: neighbor verification — both border neighbors must be within edge_tol
-        // of the IDENTIFIED edge (e_idx).  This prevents snapping chord midpoints of
-        // vertical edges (U-cuts, seam) that happen to be near a circle: for a vertical
-        // edge, one neighbor is on the top circle and the other on the bottom circle, so
-        // they can't both be on the same edge that the chord midpoint is closest to.
-        const Mesh& mesh0 = meshes[ref0.seg];
-        auto v0 = ref0.v;
-        if (mesh0.halfedge(v0) == mesh0.null_halfedge()) continue;
-
-        HalfEdgeDescriptor bord_he = mesh0.null_halfedge();
-        for (auto h : CGAL::halfedges_around_target(mesh0.halfedge(v0), mesh0))
-            if (mesh0.is_border(h)) { bord_he = h; break; }
-        if (bord_he == mesh0.null_halfedge()) continue;
-
-        auto n1p = mesh0.point(mesh0.source(bord_he));
-        auto n2p = mesh0.point(mesh0.target(mesh0.next(bord_he)));
-
-        // Check each neighbor's distance to the specific candidate edge (not nearest-overall).
-        auto dist_to_edge = [&](const Mesh::Point& p, int ei) -> double {
-            TopoDS_Vertex vs = BRepBuilderAPI_MakeVertex(
-                gp_Pnt(CGAL::to_double(p.x()), CGAL::to_double(p.y()), CGAL::to_double(p.z())));
-            BRepExtrema_DistShapeShape ext;
-            ext.LoadS1(seg_curves[ref0.seg][ei].edge);
-            ext.LoadS2(vs); ext.Perform();
-            return ext.IsDone() ? ext.Value() : 1e300;
-        };
-
-        double d_n1 = dist_to_edge(n1p, e_idx);
-        double d_n2 = dist_to_edge(n2p, e_idx);
-        if (d_n1 > edge_tol || d_n2 > edge_tol) continue;
-
-        // Both neighbors are on edge e_idx: this is a true arc chord midpoint.
-        // Project onto the identified curve — NearestPoint() is always on the correct
-        // side since the chord midpoint is geometrically inside the arc.
+        // Project onto the identified curve.  NearestPoint() lands on the correct arc point
+        // for any chord position; for the rare corner-adjacent point whose nearest edge is
+        // ambiguous the projection distance is still minimal, so this is the best snap.
         const auto& ci = seg_curves[ref0.seg][e_idx];
         GeomAPI_ProjectPointOnCurve proj(
             gp_Pnt(std::get<0>(pos), std::get<1>(pos), std::get<2>(pos)),
@@ -274,7 +247,8 @@ void remesh_and_project(
     WireProjectorCachePtr wire_projectors,
     std::vector<std::unique_ptr<StepProjector>>& surface_projectors,
     std::vector<std::unique_ptr<StepBorderProjector>>& border_projectors,
-    const RemeshParams& params)
+    const RemeshParams& params,
+    const std::vector<bool>& skip_mask)
 {
     double max_remeshing_surface_error =
         std::min(params.max_surface_error, params.min_edge_length * 0.1);
@@ -345,6 +319,7 @@ void remesh_and_project(
         tbb::parallel_for(
             tbb::blocked_range<size_t>(0, meshes.size()), [&](const tbb::blocked_range<size_t>& r) {
                 for (size_t m = r.begin(); m != r.end(); ++m) {
+                    if (!skip_mask.empty() && m < skip_mask.size() && skip_mask[m]) continue;
                     Mesh& mesh = meshes[m];
                     const std::pair edge_min_max{params.min_edge_length, params.max_edge_length};
                     PMP::Adaptive_sizing_field<Mesh> sizing_field(max_remeshing_surface_error,

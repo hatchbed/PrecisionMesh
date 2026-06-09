@@ -464,6 +464,38 @@ std::vector<TopoDS_Face> subdivide_face(const TopoDS_Face& face, int u_steps, in
     return subdivs;
 }
 
+FaceTessellationSteps get_face_tessellation_steps(const TopoDS_Face& face,
+                                                   double min_edge_length,
+                                                   double max_edge_length,
+                                                   double max_surface_error)
+{
+    auto surface = BRep_Tool::Surface(face);
+    FaceTessellationSteps result;
+
+    if (auto h = Handle(Geom_CylindricalSurface)::DownCast(surface); !h.IsNull()) {
+        result.type = CurvedFaceType::Cylinder;
+        std::tie(result.u_steps, result.v_steps) = compute_cylinder_steps(*h, face, min_edge_length,
+                                                                           max_edge_length, max_surface_error);
+    } else if (auto h = Handle(Geom_ConicalSurface)::DownCast(surface); !h.IsNull()) {
+        result.type = CurvedFaceType::Cone;
+        std::tie(result.u_steps, result.v_steps) = compute_cone_steps(*h, face, min_edge_length,
+                                                                       max_edge_length, max_surface_error);
+    } else if (auto h = Handle(Geom_SurfaceOfRevolution)::DownCast(surface); !h.IsNull()) {
+        result.type = CurvedFaceType::Revolution;
+        std::tie(result.u_steps, result.v_steps) = compute_revolution_steps(*h, face, min_edge_length,
+                                                                             max_edge_length, max_surface_error);
+    } else if (auto h = Handle(Geom_SurfaceOfLinearExtrusion)::DownCast(surface); !h.IsNull()) {
+        result.type = CurvedFaceType::Extrusion;
+        std::tie(result.u_steps, result.v_steps) = compute_extrusion_steps(*h, face, max_edge_length);
+    } else if (auto h = Handle(Geom_ToroidalSurface)::DownCast(surface); !h.IsNull()) {
+        result.type = CurvedFaceType::Torus;
+        std::tie(result.u_steps, result.v_steps) = compute_torus_steps(*h, face, min_edge_length,
+                                                                        max_edge_length, max_surface_error);
+    }
+
+    return result;
+}
+
 std::tuple<TopoDS_Shape, FaceMap> subdivide_step_shape(TopoDS_Shape& shape,
                                                         double min_edge_length,
                                                         double max_edge_length,
@@ -478,25 +510,16 @@ std::tuple<TopoDS_Shape, FaceMap> subdivide_step_shape(TopoDS_Shape& shape,
     int original_face_id = 0;
     for (TopExp_Explorer iter(shape, TopAbs_FACE); iter.More(); iter.Next()) {
         TopoDS_Face face = TopoDS::Face(iter.Current());
-        auto surface = BRep_Tool::Surface(face);
 
-        int u_steps = 1;
-        int v_steps = 1;
+        auto steps = get_face_tessellation_steps(face, min_edge_length, max_edge_length, max_surface_error);
+        int u_steps = steps.u_steps;
+        int v_steps = steps.v_steps;
 
-        if (auto h = Handle(Geom_CylindricalSurface)::DownCast(surface); !h.IsNull()) {
-            std::tie(u_steps, v_steps) = compute_cylinder_steps(*h, face, min_edge_length,
-                                                                 max_edge_length, max_surface_error);
-        } else if (auto h = Handle(Geom_ConicalSurface)::DownCast(surface); !h.IsNull()) {
-            std::tie(u_steps, v_steps) = compute_cone_steps(*h, face, min_edge_length,
-                                                             max_edge_length, max_surface_error);
-        } else if (auto h = Handle(Geom_SurfaceOfRevolution)::DownCast(surface); !h.IsNull()) {
-            std::tie(u_steps, v_steps) = compute_revolution_steps(*h, face, min_edge_length,
-                                                                   max_edge_length, max_surface_error);
-        } else if (auto h = Handle(Geom_SurfaceOfLinearExtrusion)::DownCast(surface); !h.IsNull()) {
-            std::tie(u_steps, v_steps) = compute_extrusion_steps(*h, face, max_edge_length);
-        } else if (auto h = Handle(Geom_ToroidalSurface)::DownCast(surface); !h.IsNull()) {
-            std::tie(u_steps, v_steps) = compute_torus_steps(*h, face, min_edge_length,
-                                                              max_edge_length, max_surface_error);
+        // CDT-eligible face types bypass the BRepAlgoAPI_Splitter subdivision path.
+        // Their interior is filled by uv_grid_retessellate() after tessellation.
+        if (steps.type == CurvedFaceType::Cylinder) {
+            u_steps = 1;
+            v_steps = 1;
         }
 
         auto subdivs = subdivide_face(face, u_steps, v_steps);

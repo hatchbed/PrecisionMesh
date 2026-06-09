@@ -9,8 +9,26 @@
 #include <Geom_SurfaceOfLinearExtrusion.hxx>
 #include <Geom_SurfaceOfRevolution.hxx>
 #include <Geom_ToroidalSurface.hxx>
+#include <TopoDS_Face.hxx>
 
 #include <precision_mesh/step_types.h>
+
+enum class CurvedFaceType { None, Cylinder, Cone, Torus, Revolution, Extrusion };
+
+struct FaceTessellationSteps {
+    CurvedFaceType type = CurvedFaceType::None;
+    int u_steps = 1;
+    int v_steps = 1;
+};
+
+// Classify a face and return the UV subdivision steps that would be applied.
+// Returns type=None and u=v=1 for non-regularly-curved faces (planes, splines, etc.).
+// CDT-eligible face types (Cylinder, Cone, Torus, Revolution, Extrusion) use this
+// to determine the interior grid density for uv_grid_retessellate().
+FaceTessellationSteps get_face_tessellation_steps(const TopoDS_Face& face,
+                                                   double min_edge_length,
+                                                   double max_edge_length,
+                                                   double max_surface_error);
 
 // Compute the number of U (angular) and V (axial) parametric subdivisions for a
 // cylindrical face such that the resulting sub-faces satisfy edge length and surface

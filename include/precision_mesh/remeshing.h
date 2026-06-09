@@ -43,10 +43,13 @@ void split_crease_edges(std::vector<Mesh>& meshes, double crease_angle, double m
 // Run adaptive isotropic remeshing for the requested number of iterations,
 // optionally projecting vertices back onto the STEP surface after each pass.
 // For non-STEP meshes, pass empty/null projector containers and is_step=false.
+// skip_mask: if non-empty, meshes[i] is skipped when skip_mask[i] is true
+// (used to bypass remeshing for UV-grid CDT-tessellated faces).
 void remesh_and_project(
     std::vector<Mesh>& meshes,
     const std::vector<TopoDS_Face>& segments,
     WireProjectorCachePtr wire_projectors,
     std::vector<std::unique_ptr<StepProjector>>& surface_projectors,
     std::vector<std::unique_ptr<StepBorderProjector>>& border_projectors,
-    const RemeshParams& params);
+    const RemeshParams& params,
+    const std::vector<bool>& skip_mask = {});
