@@ -1089,13 +1089,13 @@ bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int 
             if (i > 0) {
                 double u_prev = loop_uvs[li][i-1].first;
                 double du = u_curr - u_prev;
-                while (du > u_period * 0.5)  { u_curr -= u_period; du = u_curr - u_prev; }
-                while (du < -u_period * 0.5) { u_curr += u_period; du = u_curr - u_prev; }
+                while (u_period > 1e-9 && du > u_period * 0.5)  { u_curr -= u_period; du = u_curr - u_prev; }
+                while (u_period > 1e-9 && du < -u_period * 0.5) { u_curr += u_period; du = u_curr - u_prev; }
 
                 double v_prev = loop_uvs[li][i-1].second;
                 double dv = v_curr - v_prev;
-                while (dv > v_period * 0.5)  { v_curr -= v_period; dv = v_curr - v_prev; }
-                while (dv < -v_period * 0.5) { v_curr += v_period; dv = v_curr - v_prev; }
+                while (v_period > 1e-9 && dv > v_period * 0.5)  { v_curr -= v_period; dv = v_curr - v_prev; }
+                while (v_period > 1e-9 && dv < -v_period * 0.5) { v_curr += v_period; dv = v_curr - v_prev; }
             }
             loop_uvs[li][i] = {u_curr, v_curr};
         }
@@ -1103,7 +1103,7 @@ bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int 
         // --- PERIODIC SEAM DUPLICATION ---
         // Duplicate the first vertex at the end of the unrolled loop to close the 2pi period.
         // This adds the N-th segment to the flat 2D CDT plane.
-        if (u_per) {
+        if (u_per && u_period > 1e-9) {
             double u_curr = loop_uvs[li][0].first;
             double u_prev = loop_uvs[li][N-1].first;
             double du = u_curr - u_prev;
@@ -1126,9 +1126,9 @@ bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int 
             for (const auto& uv : loop_uvs[li]) {
                 min_u = std::min(min_u, uv.first);
             }
-            double shift = 0.0;
-            while (min_u + shift < 0.0)             shift += u_period;
-            while (min_u + shift >= u_period - 1e-5) shift -= u_period;
+            double target_min = std::fmod(min_u, u_period);
+            if (target_min < 0.0) target_min += u_period;
+            double shift = target_min - min_u;
             if (std::abs(shift) > 1e-9) {
                 for (auto& uv : loop_uvs[li]) {
                     uv.first += shift;
@@ -1159,7 +1159,6 @@ bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int 
         }
     }
     // ==============================================================
-
 
     // 3. Build CDT. vertex handle → index in unified vertex table.
     //    Border vertices:  index 0 .. N_border-1  → border_mesh_verts[i]
@@ -1269,9 +1268,11 @@ bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int 
 
                         // Map the perturbed coordinate to canonical UV range
                         double u_cls = pert_u;
-                        if (u_per) {
-                            while (u_cls >= u_first + u_period) u_cls -= u_period;
-                            while (u_cls < u_first)              u_cls += u_period;
+                        if (u_per && u_period > 1e-9) {
+                            double offset = u_cls - u_first;
+                            offset = std::fmod(offset, u_period);
+                            if (offset < 0.0) offset += u_period;
+                            u_cls = u_first + offset;
                         }
 
                         BRepClass_FaceClassifier clf(face, gp_Pnt2d(u_cls, pert_v), 1e-6);
@@ -1296,7 +1297,7 @@ bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int 
                 bool bypass_classifier = (u_per && loops.size() == 1);
                 for (auto f = cdt.finite_faces_begin(); f != cdt.finite_faces_end(); ++f) {
                     if (bypass_classifier) {
-                        ++n_interior; // Just accept everything for simple cylinders
+                        ++n_interior;
                         continue;
                     }
                     double cx_scaled = (f->vertex(0)->point().x() + f->vertex(1)->point().x() +
@@ -1306,9 +1307,11 @@ bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int 
                     double cx = cx_scaled / uv_u_scale;
                     double cy = cy_scaled / uv_v_scale;
                     double cx_cls = cx;
-                    if (u_per) {
-                        while (cx_cls >= u_first + u_period) cx_cls -= u_period;
-                        while (cx_cls < u_first)              cx_cls += u_period;
+                    if (u_per && u_period > 1e-9) {
+                        double offset = cx_cls - u_first;
+                        offset = std::fmod(offset, u_period);
+                        if (offset < 0.0) offset += u_period;
+                        cx_cls = u_first + offset;
                     }
 
                     // Calculate a dynamic 2D tolerance (25% of grid step) to absorb the chordal
@@ -1344,7 +1347,7 @@ bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int 
         {
             double u_first = surf.FirstUParameter();
             for (auto f = cdt.finite_faces_begin(); f != cdt.finite_faces_end(); ++f) {
-                if (!bypass_classifier) { // <-- ONLY CLASSIFY IF NOT BYPASSED
+                if (!bypass_classifier) {
                     double cx_scaled = (f->vertex(0)->point().x() + f->vertex(1)->point().x() +
                                         f->vertex(2)->point().x()) / 3.0;
                     double cy_scaled = (f->vertex(0)->point().y() + f->vertex(1)->point().y() +
@@ -1354,9 +1357,11 @@ bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int 
                     double cx = cx_scaled / uv_u_scale;
                     double cy = cy_scaled / uv_v_scale;
                     double cx_cls = cx;
-                    if (u_per) {
-                        while (cx_cls >= u_first + u_period) cx_cls -= u_period;
-                        while (cx_cls < u_first)              cx_cls += u_period;
+                    if (u_per && u_period > 1e-9) {
+                        double offset = cx_cls - u_first;
+                        offset = std::fmod(offset, u_period);
+                        if (offset < 0.0) offset += u_period;
+                        cx_cls = u_first + offset;
                     }
                     // Calculate a dynamic 2D tolerance (25% of grid step) to absorb the chordal
                     // deviation of the straight CDT edges curving around concave boundaries
@@ -1405,9 +1410,11 @@ bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int 
                 double cx = cx_scaled / uv_u_scale;
                 double cy = cy_scaled / uv_v_scale;
                 double cx_cls = cx;
-                if (dbg_u_per) {
-                    while (cx_cls >= dbg_u_first + dbg_u_period) cx_cls -= dbg_u_period;
-                    while (cx_cls < dbg_u_first)              cx_cls += dbg_u_period;
+                if (dbg_u_per && dbg_u_period > 1e-9) {
+                    double offset = cx_cls - dbg_u_first;
+                    offset = std::fmod(offset, dbg_u_period);
+                    if (offset < 0.0) offset += dbg_u_period;
+                    cx_cls = dbg_u_first + offset;
                 }
                 BRepClass_FaceClassifier clf(face, gp_Pnt2d(cx_cls, cy), 1e-4);
                 if (clf.State() == TopAbs_IN || clf.State() == TopAbs_ON) {
@@ -1506,7 +1513,8 @@ bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int 
             std::array<size_t, 3> fkey = {va.idx(), vb.idx(), vc.idx()};
             std::sort(fkey.begin(), fkey.end());
             if (!seen_faces.insert(fkey).second) continue;  // seam duplicate
-            // Consistently orient the triangles based on the face's topological orientation.
+
+            // Consistently orient the triangles based on the face's orientation.
             // Since CDT finite faces are already guaranteed to have a consistent CCW winding
             // in 2D space, we simply maintain this consistency globally. Calculating a local
             // 3D dot product against a static face-center normal is incorrect for curved
