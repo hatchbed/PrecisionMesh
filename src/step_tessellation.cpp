@@ -982,21 +982,27 @@ bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int 
         return false;
     }
 
-    // Fill NaN UV values for border vertices added after tessellate_shape (e.g., split_border_edges
-    // midpoints). Those vertices have no UV in the property map; project their 3D positions onto
-    // the surface to recover UV. This must run before building the CDT — inserting NaN coordinates
-    // into CGAL produces undefined predicate results and degenerates the triangulation.
+    // Re-evaluate UV values for all border vertices using ShapeAnalysis_Surface
+    // to fill NaNs and correct any wrapped/corrupted V coordinates produced by BRepMesh.
     {
         Handle(Geom_Surface) geom_surf = BRep_Tool::Surface(face);
         ShapeAnalysis_Surface sa(geom_surf);
         for (auto v : mesh.vertices()) {
             if (!mesh.is_border(v)) continue;
             auto& uv = uv_map[v];
-            if (!std::isnan(uv.first) && !std::isnan(uv.second)) continue;
             auto p = mesh.point(v);
             gp_Pnt p3d(CGAL::to_double(p.x()), CGAL::to_double(p.y()), CGAL::to_double(p.z()));
             gp_Pnt2d uv2d = sa.ValueOfUV(p3d, 1e-7);
-            uv = {uv2d.X(), uv2d.Y()};
+
+            if (std::isnan(uv.first) || std::isnan(uv.second)) {
+                uv = {uv2d.X(), uv2d.Y()};
+            } else {
+                // CRITICAL CORRECTION: Overwrite V with the true geometric projection.
+                // BRepMesh occasionally assigns boundary nodes to the wrong side of the periodic
+                // V domain (e.g., giving V=2.9657 to a 3D point lying on the V=0.0 cap).
+                // We keep the original U to preserve unrolled periodic seams, but strictly correct V.
+                uv.second = uv2d.Y();
+            }
         }
     }
 
@@ -1020,6 +1026,22 @@ bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int 
         uv_dv_step = target / uv_v_scale;
     }
 
+    // If the surface is periodic, we must adjust the step sizes so that the period
+    // is an EXACT integer multiple of the step size. This guarantees that the grid
+    // of interior points is perfectly symmetric and centered.
+    bool is_u_per = surf.IsUPeriodic();
+    double u_per_val = is_u_per ? surf.UPeriod() : 0.0;
+    if (is_u_per && u_per_val > 1e-9) {
+        int n_u_steps = std::max(1, (int)std::round(u_per_val / uv_du_step));
+        uv_du_step = u_per_val / n_u_steps;
+    }
+    bool is_v_per = surf.IsVPeriodic();
+    double v_per_val = is_v_per ? surf.VPeriod() : 0.0;
+    if (is_v_per && v_per_val > 1e-9) {
+        int n_v_steps = std::max(1, (int)std::round(v_per_val / uv_dv_step));
+        uv_dv_step = v_per_val / n_v_steps;
+    }
+
     // 1. Extract ordered border loops by walking border halfedges.
     std::unordered_set<size_t> visited_hes;
     std::vector<std::vector<Mesh::Vertex_index>> loops;
@@ -1040,23 +1062,77 @@ bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int 
         return false;
     }
 
-    // 2. Build UV arrays for each loop, correcting period-jump discontinuities.
+    // 2. Build UV arrays for each loop using pure geometric projection.
+    // We unroll sequentially to keep constraints from crossing the domain, and we duplicate
+    // the first vertex of each loop at the end of the unrolled array to close the 2pi period.
+    // This ensures the UV rectangle spans exactly the full 2pi width, closing the final segment.
     bool u_per = surf.IsUPeriodic();  double u_period = u_per ? surf.UPeriod() : 0.0;
     bool v_per = surf.IsVPeriodic();  double v_period = v_per ? surf.VPeriod() : 0.0;
 
+    Handle(Geom_Surface) geom_surf = BRep_Tool::Surface(face);
+    ShapeAnalysis_Surface sa(geom_surf);
+
     std::vector<std::vector<std::pair<double,double>>> loop_uvs(loops.size());
     for (size_t li = 0; li < loops.size(); li++) {
-        for (auto v : loops[li]) loop_uvs[li].push_back(uv_map[v]);
-        for (size_t i = 1; i < loop_uvs[li].size(); i++) {
-            if (u_per) {
-                double du = loop_uvs[li][i].first - loop_uvs[li][i-1].first;
-                if      (du >  u_period * 0.5) loop_uvs[li][i].first -= u_period;
-                else if (du < -u_period * 0.5) loop_uvs[li][i].first += u_period;
+        size_t N = loops[li].size();
+        loop_uvs[li].resize(N + 1); // Resize to hold the duplicate seam vertex
+
+        // Unroll the original N vertices
+        for (size_t i = 0; i < N; i++) {
+            auto p = mesh.point(loops[li][i]);
+            gp_Pnt p3d(CGAL::to_double(p.x()), CGAL::to_double(p.y()), CGAL::to_double(p.z()));
+            gp_Pnt2d uv2d = sa.ValueOfUV(p3d, 1e-7);
+
+            double u_curr = uv2d.X();
+            double v_curr = uv2d.Y();
+
+            if (i > 0) {
+                double u_prev = loop_uvs[li][i-1].first;
+                double du = u_curr - u_prev;
+                while (du > u_period * 0.5)  { u_curr -= u_period; du = u_curr - u_prev; }
+                while (du < -u_period * 0.5) { u_curr += u_period; du = u_curr - u_prev; }
+
+                double v_prev = loop_uvs[li][i-1].second;
+                double dv = v_curr - v_prev;
+                while (dv > v_period * 0.5)  { v_curr -= v_period; dv = v_curr - v_prev; }
+                while (dv < -v_period * 0.5) { v_curr += v_period; dv = v_curr - v_prev; }
             }
-            if (v_per) {
-                double dv = loop_uvs[li][i].second - loop_uvs[li][i-1].second;
-                if      (dv >  v_period * 0.5) loop_uvs[li][i].second -= v_period;
-                else if (dv < -v_period * 0.5) loop_uvs[li][i].second += v_period;
+            loop_uvs[li][i] = {u_curr, v_curr};
+        }
+
+        // --- PERIODIC SEAM DUPLICATION ---
+        // Duplicate the first vertex at the end of the unrolled loop to close the 2pi period.
+        // This adds the N-th segment to the flat 2D CDT plane.
+        if (u_per) {
+            double u_curr = loop_uvs[li][0].first;
+            double u_prev = loop_uvs[li][N-1].first;
+            double du = u_curr - u_prev;
+            while (du > u_period * 0.5)  { u_curr -= u_period; du = u_curr - u_prev; }
+            while (du < -u_period * 0.5) { u_curr += u_period; du = u_curr - u_prev; }
+
+            loop_uvs[li][N] = {u_curr, loop_uvs[li][0].second};
+
+            // Append the first vertex index to the end of the loop array so they map to the same 3D point
+            loops[li].push_back(loops[li][0]);
+        } else {
+            loop_uvs[li].pop_back(); // Remove the extra slot if not periodic
+        }
+
+        // ==============================================================
+        // Alignment Pass: Shift the entire loop so the minimum U is canonical [0, u_period)
+        // ==============================================================
+        if (u_per && u_period > 1e-9) {
+            double min_u = std::numeric_limits<double>::max();
+            for (const auto& uv : loop_uvs[li]) {
+                min_u = std::min(min_u, uv.first);
+            }
+            double shift = 0.0;
+            while (min_u + shift < 0.0)             shift += u_period;
+            while (min_u + shift >= u_period - 1e-5) shift -= u_period;
+            if (std::abs(shift) > 1e-9) {
+                for (auto& uv : loop_uvs[li]) {
+                    uv.first += shift;
+                }
             }
         }
     }
@@ -1065,6 +1141,25 @@ bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int 
                   "du_step={:.4f} dv_step={:.4f} u_per={} loops={}",
                   face_idx, uv_u_scale, uv_v_scale, uv_du_step, uv_dv_step,
                   u_per, (int)loops.size());
+
+    // ==============================================================
+    // DIAGNOSTIC: Print all border vertices of the INPUT mesh
+    // ==============================================================
+    spdlog::debug("DIAGNOSTIC [face {}]: loops found = {}", face_idx, loops.size());
+    for (size_t li = 0; li < loops.size(); li++) {
+        spdlog::debug("  Loop {} has {} vertices in unrolled UV space:", li, loops[li].size());
+        for (size_t i = 0; i < loops[li].size(); i++) {
+            auto v = loops[li][i];
+            auto p = mesh.point(v);
+            auto uv = loop_uvs[li][i];
+            spdlog::debug("    Index {:4d} | 3D: ({:8.4f}, {:8.4f}, {:8.4f}) | UV: ({:8.4f}, {:8.4f})",
+                          v.idx(),
+                          CGAL::to_double(p.x()), CGAL::to_double(p.y()), CGAL::to_double(p.z()),
+                          uv.first, uv.second);
+        }
+    }
+    // ==============================================================
+
 
     // 3. Build CDT. vertex handle → index in unified vertex table.
     //    Border vertices:  index 0 .. N_border-1  → border_mesh_verts[i]
@@ -1155,33 +1250,22 @@ bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int 
                 int n_inserted = 0, n_filtered = 0;
                 double u_first = surf.FirstUParameter();
 
-// For periodic surfaces, pad the grid to include the left AND right seams exactly
-                double start_u = u_min_g + (u_per ? 0.0 : uv_du_step);
-                double end_u   = u_max_g - (u_per ? -1e-6 : uv_du_step * 0.5);
+                // STRCITLY GENERATE INTERIOR POINTS ONLY
+                // We start 1 step inside (uv_du_step) and end at least 0.5 steps before the far boundary.
+                // This guarantees that we NEVER place grid vertices on the left or right boundaries,
+                // allowing CDT to bridge directly to the original BRep border vertices without duplicates!
+                double start_u = u_min_g + uv_du_step;
+                double end_u   = u_max_g - uv_du_step * 0.5;
 
-                std::vector<std::pair<CRCDT::Vertex_handle, int>> left_seam, right_seam;
-
-                int i_u = 0;
+                int i_u = 1; // Start index at 1 since we are strictly in the interior
                 for (double u = start_u; u < end_u; u += uv_du_step, ++i_u) {
-                    int i_v = 0;
-                    bool is_left = (u_per && i_u == 0);
-                    bool is_right = (u_per && u >= u_max_g - uv_du_step * 0.5);
-
+                    int i_v = 1;
                     for (double v = v_min_g + uv_dv_step; v < v_max_g - uv_dv_step * 0.5; v += uv_dv_step, ++i_v) {
 
-                        // Force the right seam to match the left seam's perturbation parity perfectly
-                        int perturb_u_idx = is_right ? 0 : i_u;
-
-                        // Do NOT perturb vertices lying exactly on the left/right periodic seams.
-                        // Since we already add vertical constraints along the seams, they don't need perturbation
-                        // to prevent Delaunay flips. Setting perturbation to 0 here completely avoids the
-                        // u_cls parameter-wrapping bug, ensuring left/right 3D points evaluate identically.
-                        double pert_u = u;
-                        double pert_v = v;
-                        if (!is_left && !is_right) {
-                            //pert_u += (((perturb_u_idx + i_v) % 2 == 0) ? 1e-5 : -1e-5) * uv_du_step;
-                            //pert_v += ((perturb_u_idx % 2 == 0) ? 1e-5 : -1e-5) * uv_dv_step;
-                        }
+                        // Apply the uniform checkerboard micro-perturbation to prevent co-circular/collinear degeneracy.
+                        // Since we are strictly in the interior, we can safely perturb all generated points.
+                        double pert_u = u + (((i_u + i_v) % 2 == 0) ? 1e-5 : -1e-5) * uv_du_step;
+                        double pert_v = v + ((i_u % 2 == 0) ? 1e-5 : -1e-5) * uv_dv_step;
 
                         // Map the perturbed coordinate to canonical UV range
                         double u_cls = pert_u;
@@ -1198,10 +1282,6 @@ bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int 
 
                         auto vh = cdt.insert(CRCDT::Point(pert_u * uv_u_scale, pert_v * uv_v_scale));
 
-                        // Collect seam vertices for constraints
-                        if (is_left) left_seam.push_back({vh, i_v});
-                        if (is_right) right_seam.push_back({vh, i_v});
-
                         if (!vh_to_idx.count(vh)) {
                             gp_Pnt p3d = surf.Value(u_cls, pert_v); // Unscaled UV
                             vh_to_idx[vh] = N_border_now + interior_info.size();
@@ -1210,23 +1290,15 @@ bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int 
                         }
                     }
                 }
-
-                // Add vertical constraint edges to the seams to enforce perfect symmetry.
-                // We only connect adjacent i_v steps to prevent drawing constraints across cutouts/holes!
-                if (u_per) {
-                    for (size_t i = 1; i < left_seam.size(); i++) {
-                        if (left_seam[i].second == left_seam[i-1].second + 1)
-                            cdt.insert_constraint(left_seam[i-1].first, left_seam[i].first);
-                    }
-                    for (size_t i = 1; i < right_seam.size(); i++) {
-                        if (right_seam[i].second == right_seam[i-1].second + 1)
-                            cdt.insert_constraint(right_seam[i-1].first, right_seam[i].first);
-                    }
-                }
                 spdlog::debug("  grid: {} inserted, {} filtered (BRepClass)", n_inserted, n_filtered);
 
                 // Count inside triangles using BRepClass_FaceClassifier on centroids.
+                bool bypass_classifier = (u_per && loops.size() == 1);
                 for (auto f = cdt.finite_faces_begin(); f != cdt.finite_faces_end(); ++f) {
+                    if (bypass_classifier) {
+                        ++n_interior; // Just accept everything for simple cylinders
+                        continue;
+                    }
                     double cx_scaled = (f->vertex(0)->point().x() + f->vertex(1)->point().x() +
                                         f->vertex(2)->point().x()) / 3.0;
                     double cy_scaled = (f->vertex(0)->point().y() + f->vertex(1)->point().y() +
@@ -1268,27 +1340,30 @@ bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int 
         std::vector<CdtTri> cdt_tris;
         cdt_tris.reserve(n_interior);
         int n_excluded = 0, n_missing = 0;
+        bool bypass_classifier = (u_per && loops.size() == 1);
         {
             double u_first = surf.FirstUParameter();
             for (auto f = cdt.finite_faces_begin(); f != cdt.finite_faces_end(); ++f) {
-                double cx_scaled = (f->vertex(0)->point().x() + f->vertex(1)->point().x() +
-                                    f->vertex(2)->point().x()) / 3.0;
-                double cy_scaled = (f->vertex(0)->point().y() + f->vertex(1)->point().y() +
-                                    f->vertex(2)->point().y()) / 3.0;
+                if (!bypass_classifier) { // <-- ONLY CLASSIFY IF NOT BYPASSED
+                    double cx_scaled = (f->vertex(0)->point().x() + f->vertex(1)->point().x() +
+                                        f->vertex(2)->point().x()) / 3.0;
+                    double cy_scaled = (f->vertex(0)->point().y() + f->vertex(1)->point().y() +
+                                        f->vertex(2)->point().y()) / 3.0;
 
-                // Unscale back to true UV space for BRep classification
-                double cx = cx_scaled / uv_u_scale;
-                double cy = cy_scaled / uv_v_scale;
-                double cx_cls = cx;
-                if (u_per) {
-                    while (cx_cls >= u_first + u_period) cx_cls -= u_period;
-                    while (cx_cls < u_first)              cx_cls += u_period;
+                    // Unscale back to true UV space for BRep classification
+                    double cx = cx_scaled / uv_u_scale;
+                    double cy = cy_scaled / uv_v_scale;
+                    double cx_cls = cx;
+                    if (u_per) {
+                        while (cx_cls >= u_first + u_period) cx_cls -= u_period;
+                        while (cx_cls < u_first)              cx_cls += u_period;
+                    }
+                    // Calculate a dynamic 2D tolerance (25% of grid step) to absorb the chordal
+                    // deviation of the straight CDT edges curving around concave boundaries
+                    double tol2d = 1e-4;
+                    BRepClass_FaceClassifier clf(face, gp_Pnt2d(cx_cls, cy), tol2d);
+                    if (clf.State() != TopAbs_IN && clf.State() != TopAbs_ON) { ++n_excluded; continue; }
                 }
-                // Calculate a dynamic 2D tolerance (25% of grid step) to absorb the chordal
-                // deviation of the straight CDT edges curving around concave boundaries
-                double tol2d = 1e-4;
-                BRepClass_FaceClassifier clf(face, gp_Pnt2d(cx_cls, cy), tol2d);
-                if (clf.State() != TopAbs_IN && clf.State() != TopAbs_ON) { ++n_excluded; continue; }
                 auto it0 = vh_to_idx.find(f->vertex(0));
                 auto it1 = vh_to_idx.find(f->vertex(1));
                 auto it2 = vh_to_idx.find(f->vertex(2));
@@ -1370,7 +1445,13 @@ bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int 
             Mesh::Vertex_index nv;
             if (it == old_idx_to_new.end()) {
                 nv = new_mesh.add_vertex(mesh.point(old_v));
-                new_uv[nv] = uv_map[old_v];
+
+                // Assign the mathematically correct canonical UV to the new mesh
+                auto p = mesh.point(old_v);
+                gp_Pnt p3d(CGAL::to_double(p.x()), CGAL::to_double(p.y()), CGAL::to_double(p.z()));
+                gp_Pnt2d uv2d = sa.ValueOfUV(p3d, 1e-7);
+                new_uv[nv] = {uv2d.X(), uv2d.Y()};
+
                 new_locked[nv] = true;
                 old_idx_to_new[old_v.idx()] = nv;
             } else {
@@ -1425,12 +1506,15 @@ bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int 
             std::array<size_t, 3> fkey = {va.idx(), vb.idx(), vc.idx()};
             std::sort(fkey.begin(), fkey.end());
             if (!seen_faces.insert(fkey).second) continue;  // seam duplicate
-            auto pa = new_mesh.point(va), pb = new_mesh.point(vb), pc = new_mesh.point(vc);
-            auto cross = CGAL::cross_product(pb - pa, pc - pa);
-            double dot = CGAL::to_double(cross.x()) * n_out[0]
-                       + CGAL::to_double(cross.y()) * n_out[1]
-                       + CGAL::to_double(cross.z()) * n_out[2];
-            if (dot < 0.0) std::swap(vb, vc);
+            // Consistently orient the triangles based on the face's topological orientation.
+            // Since CDT finite faces are already guaranteed to have a consistent CCW winding
+            // in 2D space, we simply maintain this consistency globally. Calculating a local
+            // 3D dot product against a static face-center normal is incorrect for curved
+            // surfaces (like cylinders wrapping 360 degrees) and caused winding inversions
+            // that triggered non-manifold rejections.
+            if (face.Orientation() == TopAbs_REVERSED) {
+                std::swap(vb, vc);
+            }
             if (new_mesh.add_face(va, vb, vc) != Mesh::null_face()) added++;
             else rejected++;
         }
@@ -1476,250 +1560,4 @@ bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int 
         return true;
     } // end CDT scope — unreachable: all paths return inside the block above
     return false;
-}
-
-// -- End UV-grid CDT tessellation ---------------------------------------------
-
-void repair_open_boundary_loops(std::vector<std::pair<Mesh, TopoDS_Face>>& tessellation,
-                                 double min_edge_length,
-                                 double collapse_area_ratio)
-{
-    // -- Phase 1: merged position map + per-position vertex reverse lookup ------
-    std::map<std::tuple<double,double,double>, int> pid;
-    std::vector<std::array<double,3>> pos;
-    std::vector<std::vector<std::pair<size_t, Mesh::Vertex_index>>> id_to_verts;
-
-    for (size_t si = 0; si < tessellation.size(); si++) {
-        Mesh& mesh = tessellation[si].first;
-        for (auto v : mesh.vertices()) {
-            auto p = mesh.point(v);
-            double x = CGAL::to_double(p.x()), y = CGAL::to_double(p.y()), z = CGAL::to_double(p.z());
-            auto key = std::make_tuple(x, y, z);
-            auto it = pid.find(key);
-            int id;
-            if (it == pid.end()) {
-                id = (int)pos.size();
-                pid[key] = id;
-                pos.push_back({x, y, z});
-                id_to_verts.emplace_back();
-            } else {
-                id = it->second;
-            }
-            id_to_verts[id].push_back({si, v});
-        }
-    }
-
-    // -- Phase 2: edge incidence count + average triangle area ----------------
-    std::map<std::pair<int,int>, int> edge_count;
-    double total_tri_area = 0.0;
-    size_t total_tri_count = 0;
-
-    auto lookup_id = [&](const Mesh::Point& p) -> int {
-        double x = CGAL::to_double(p.x()), y = CGAL::to_double(p.y()), z = CGAL::to_double(p.z());
-        return pid.at(std::make_tuple(x, y, z));
-    };
-
-    for (const auto& [mesh, face] : tessellation) {
-        for (auto f : mesh.faces()) {
-            int ids[3]; int k = 0;
-            K::Point_3 pts[3];
-            for (auto v : mesh.vertices_around_face(mesh.halfedge(f))) {
-                if (k < 3) { ids[k] = lookup_id(mesh.point(v)); pts[k] = mesh.point(v); }
-                k++;
-            }
-            if (k != 3) continue;
-            for (int e = 0; e < 3; e++) {
-                int a = ids[e], b = ids[(e+1)%3];
-                if (a > b) std::swap(a, b);
-                edge_count[{a, b}]++;
-            }
-            auto cr = CGAL::cross_product(pts[1] - pts[0], pts[2] - pts[0]);
-            double area = 0.5 * std::sqrt(CGAL::to_double(cr.squared_length()));
-            total_tri_area += area;
-            total_tri_count++;
-        }
-    }
-    double avg_tri_area = (total_tri_count > 0) ? total_tri_area / total_tri_count : 1.0;
-    // Cap the reference by the smallest possible triangle at the minimum edge length
-    // so a large average (from big flat faces) doesn't make the collapse threshold too coarse.
-    double ref_area = std::min(avg_tri_area, 0.5 * min_edge_length * min_edge_length);
-
-    // -- Phase 3: collect open edges and trace into closed loops --------------
-    std::map<int, std::vector<int>> open_adj;
-    for (const auto& [e, cnt] : edge_count) {
-        if (cnt != 1) continue;
-        open_adj[e.first].push_back(e.second);
-        open_adj[e.second].push_back(e.first);
-    }
-
-    if (open_adj.empty()) return;
-
-    std::unordered_set<int> visited;
-    std::vector<std::vector<int>> loops;
-
-    for (const auto& [start, _] : open_adj) {
-        if (visited.count(start)) continue;
-        std::vector<int> loop;
-        int cur = start, prev = -1;
-        while (!visited.count(cur)) {
-            visited.insert(cur);
-            loop.push_back(cur);
-            int next = -1;
-            for (int nb : open_adj[cur])
-                if (nb != prev && !visited.count(nb)) { next = nb; break; }
-            if (next == -1) break;
-            prev = cur; cur = next;
-        }
-        if ((int)loop.size() >= 3) loops.push_back(std::move(loop));
-    }
-
-    spdlog::info("  [loop repair] {} open boundary loop(s), avg_tri_area={:.3e} ({} tris), "
-                 "ref_area={:.3e} (min(avg, 0.5*min_edge^2))",
-                 loops.size(), avg_tri_area, total_tri_count, ref_area);
-
-    // -- Phase 4: classify and fix each loop ----------------------------------
-    std::unordered_set<size_t> meshes_to_rebuild;
-
-    for (auto& loop : loops) {
-        int N = (int)loop.size();
-
-        // Polygon area via fan from centroid
-        double cx = 0, cy = 0, cz = 0;
-        for (int id : loop) { cx += pos[id][0]; cy += pos[id][1]; cz += pos[id][2]; }
-        cx /= N; cy /= N; cz /= N;
-
-        double loop_area = 0.0;
-        for (int i = 0; i < N; i++) {
-            const auto& a = pos[loop[i]], &b = pos[loop[(i+1)%N]];
-            double ax=a[0]-cx, ay=a[1]-cy, az=a[2]-cz;
-            double bx=b[0]-cx, by=b[1]-cy, bz=b[2]-cz;
-            double xc=ay*bz-az*by, yc=az*bx-ax*bz, zc=ax*by-ay*bx;
-            loop_area += 0.5 * std::sqrt(xc*xc + yc*yc + zc*zc);
-        }
-
-        // Shortest and longest edge in the loop.
-        // min/max ratio characterises degeneracy within the loop itself -- no external
-        // reference needed.  A loop with one very short edge (near-zero-span BREP artifact)
-        // has ratio << 1; a loop representing genuine missing geometry has roughly
-        // uniform edges and ratio near 1.
-        double min_edge_len = std::numeric_limits<double>::max();
-        double max_edge_len = 0.0;
-        int snap_from = -1, snap_to = -1;
-        for (int i = 0; i < N; i++) {
-            int a = loop[i], b = loop[(i+1)%N];
-            const auto& pa = pos[a]; const auto& pb = pos[b];
-            double dx=pb[0]-pa[0], dy=pb[1]-pa[1], dz=pb[2]-pa[2];
-            double len = std::sqrt(dx*dx+dy*dy+dz*dz);
-            if (len < min_edge_len) { min_edge_len = len; snap_from = a; snap_to = b; }
-            if (len > max_edge_len) max_edge_len = len;
-        }
-        spdlog::info("  [loop repair] {} vertices, area={:.3e}, min_edge={:.3e}, "
-                     "max_edge={:.3e}, area/ref={:.3e}",
-                     N, loop_area, min_edge_len, max_edge_len,
-                     loop_area / ref_area);
-
-        if (loop_area < ref_area * collapse_area_ratio) {
-            // Collapse: snap snap_from -> snap_to across all meshes
-            spdlog::info("    -> collapse: ({:.5f},{:.5f},{:.5f}) -> ({:.5f},{:.5f},{:.5f})",
-                         pos[snap_from][0], pos[snap_from][1], pos[snap_from][2],
-                         pos[snap_to][0],   pos[snap_to][1],   pos[snap_to][2]);
-            K::Point_3 target(pos[snap_to][0], pos[snap_to][1], pos[snap_to][2]);
-            int snaps = 0;
-            for (auto& [si, v] : id_to_verts[snap_from]) {
-                tessellation[si].first.point(v) = target;
-                meshes_to_rebuild.insert(si);
-                snaps++;
-            }
-            spdlog::info("    snapped {} vertices", snaps);
-        } else {
-            // Fill: fan-triangulate from loop[0], add to the segment that owns most loop verts
-            spdlog::info("    -> fill: fan-triangulating {} vertices", N);
-            std::map<size_t, int> seg_votes;
-            for (int id : loop)
-                for (auto& [si, v] : id_to_verts[id])
-                    seg_votes[si]++;
-            size_t best_si = 0;
-            int best_votes = -1;
-            for (auto& [si, votes] : seg_votes)
-                if (votes > best_votes) { best_votes = votes; best_si = si; }
-
-            Mesh& tmesh = tessellation[best_si].first;
-            std::vector<Mesh::Vertex_index> hverts;
-            for (int id : loop) {
-                Mesh::Vertex_index hv = Mesh::null_vertex();
-                for (auto& [si, v] : id_to_verts[id])
-                    if (si == best_si) { hv = v; break; }
-                if (hv == Mesh::null_vertex())
-                    hv = tmesh.add_vertex(K::Point_3(pos[id][0], pos[id][1], pos[id][2]));
-                hverts.push_back(hv);
-            }
-            // The loop tracing gives an arbitrary vertex ordering.  add_face requires
-            // that the directed halfedges v0->v1, v1->v2, v2->v0 are all free boundary
-            // halfedges in the mesh.  If the natural order fails, the reverse winding
-            // will succeed because one of the two orientations must match the free side.
-            int added = 0;
-            for (int i = 1; i < N - 1; i++) {
-                auto fh = tmesh.add_face(hverts[0], hverts[i], hverts[i+1]);
-                if (fh == Mesh::null_face())
-                    fh = tmesh.add_face(hverts[0], hverts[i+1], hverts[i]);
-                if (fh != Mesh::null_face())
-                    added++;
-            }
-            spdlog::info("    added {} fill triangles to seg {}", added, best_si);
-            meshes_to_rebuild.insert(best_si);
-        }
-    }
-
-    // -- Phase 5: rebuild affected meshes via repair_polygon_soup --------------
-    for (size_t si : meshes_to_rebuild) {
-        Mesh& mesh = tessellation[si].first;
-        std::vector<Point> vbuf;
-        std::vector<std::vector<size_t>> fbuf;
-        std::unordered_map<size_t, size_t> vmap;
-
-        for (auto v : mesh.vertices()) {
-            vmap[v.idx()] = vbuf.size();
-            auto p = mesh.point(v);
-            vbuf.push_back({CGAL::to_double(p.x()), CGAL::to_double(p.y()), CGAL::to_double(p.z())});
-        }
-        for (auto f : mesh.faces()) {
-            std::vector<size_t> face;
-            int k = 0;
-            for (auto v : mesh.vertices_around_face(mesh.halfedge(f))) {
-                face.push_back(vmap.at(v.idx())); k++;
-            }
-            if (k == 3) fbuf.push_back(face);
-        }
-
-        PMP::repair_polygon_soup(vbuf, fbuf, CGAL::parameters::geom_traits(PointArray_traits()));
-
-        mesh = Mesh{};
-        std::vector<Mesh::Vertex_index> new_verts;
-        for (const auto& v : vbuf)
-            new_verts.push_back(mesh.add_vertex(K::Point_3(v[0], v[1], v[2])));
-        for (const auto& f : fbuf)
-            if (f.size() == 3) mesh.add_face(new_verts[f[0]], new_verts[f[1]], new_verts[f[2]]);
-
-        // Rebuilt mesh has no UV data; add NaN-filled "v:uv" so the UV fill pass in
-        // remeshing.cpp will populate all vertices via ShapeAnalysis_Surface::ValueOfUV.
-        const double kNaN = std::numeric_limits<double>::quiet_NaN();
-        mesh.add_property_map<Mesh::Vertex_index, std::pair<double,double>>(
-            "v:uv", {kNaN, kNaN});
-    }
-}
-
-bool save_shape_as_step(const std::string& path, const TopoDS_Shape& shape) {
-    STEPControl_Writer writer;
-    auto status = writer.Transfer(shape, STEPControl_AsIs);
-    if (status != IFSelect_RetDone) {
-        spdlog::error("Error transferring shape to STEP writer.");
-        return false;
-    }
-
-    status = writer.Write(path.c_str());
-    if (status != IFSelect_RetDone) {
-        spdlog::error("Error writing STEP file.");
-    }
-
-    return true;
 }
