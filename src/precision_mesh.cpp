@@ -788,7 +788,7 @@ int main(int argc, char **argv) {
                 }
             }
 #endif
-            //repair_open_boundary_loops(tessellation, min_edge_length);
+            repair_open_boundary_loops(tessellation, min_edge_length);
         }
 
         size_t total_faces = 0;

@@ -1188,11 +1188,16 @@ bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int 
     std::vector<Mesh::Vertex_index> border_mesh_verts;
     std::vector<std::pair<gp_Pnt, std::pair<double,double>>> interior_info;
     int n_interior = 0;
+    int n_mark_outside = 0, n_mark_degen = 0;
 
     {
         CRCDT cdt;
 
         bool cdt_ok = true;
+        // True if any periodic seam-wrap closing edge was left unconstrained.  When set, the
+        // border loop is topologically open at the seam, so nesting-level domain marking would
+        // leak — we fall back to centroid classification for those (full-cylinder) faces.
+        bool seam_skipped = false;
         std::vector<std::vector<CRCDT::Vertex_handle>> loop_vhs(loops.size());
         try {
             for (size_t li = 0; li < loops.size(); li++) {
@@ -1235,6 +1240,7 @@ bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int 
                         if (std::abs(std::abs(du) - u_period_scaled) < u_period_scaled * 0.01) {
                             spdlog::debug("  loop {}: skip seam-wrap closing constraint |du|={:.4f}",
                                           li, std::abs(du));
+                            seam_skipped = true;
                             continue;
                         }
                     }
@@ -1334,27 +1340,46 @@ bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int 
                                     (p2.x() - p0.x()) * (p1.y() - p0.y()));
                 };
 
-                // Count inside triangles using BRepClass_FaceClassifier on centroids.
+                // ---- Triangle selection ---------------------------------------------
+                // Decide which CDT faces lie inside the trimmed face and record the verdict
+                // in f->info() (1 = keep, 0 = drop) so the count, extraction, and obj passes
+                // all share one decision.
+                //
+                //  * Fully-constrained loops (partial cylinders, holes): CDT nesting-level
+                //    domain marking — topological and tolerance-free, so it keeps thin valid
+                //    slivers narrower than the grid step and drops concave bays correctly.
+                //  * Seam-open loops (full periodic cylinders, where the wrap-closing edge was
+                //    skipped): the open seam makes nesting-level marking leak, so fall back to
+                //    BRepClass_FaceClassifier on the triangle centroid.
+                if (!seam_skipped) cr_mark_domains(cdt);
                 for (auto f = cdt.finite_faces_begin(); f != cdt.finite_faces_end(); ++f) {
-                    if (tri_2area(f) < min_tri_2area) continue;
-                    double cx_scaled = (f->vertex(0)->point().x() + f->vertex(1)->point().x() +
-                                        f->vertex(2)->point().x()) / 3.0;
-                    double cy_scaled = (f->vertex(0)->point().y() + f->vertex(1)->point().y() +
-                                        f->vertex(2)->point().y()) / 3.0;
-                    double cx = cx_scaled / uv_u_scale;
-                    double cy = cy_scaled / uv_v_scale;
-                    double cx_cls = cx;
-                    if (u_per && u_period > 1e-9) {
-                        double offset = cx_cls - u_first;
-                        offset = std::fmod(offset, u_period);
-                        if (offset < 0.0) offset += u_period;
-                        cx_cls = u_first + offset;
+                    if (tri_2area(f) < min_tri_2area) { f->info() = 0; ++n_mark_degen; continue; }
+                    bool inside;
+                    if (!seam_skipped) {
+                        inside = (f->info() % 2) == 1;   // odd nesting level == inside
+                    } else {
+                        double cx_scaled = (f->vertex(0)->point().x() + f->vertex(1)->point().x() +
+                                            f->vertex(2)->point().x()) / 3.0;
+                        double cy_scaled = (f->vertex(0)->point().y() + f->vertex(1)->point().y() +
+                                            f->vertex(2)->point().y()) / 3.0;
+                        double cx = cx_scaled / uv_u_scale;
+                        double cy = cy_scaled / uv_v_scale;
+                        double cx_cls = cx;
+                        if (u_per && u_period > 1e-9) {
+                            double offset = cx_cls - u_first;
+                            offset = std::fmod(offset, u_period);
+                            if (offset < 0.0) offset += u_period;
+                            cx_cls = u_first + offset;
+                        }
+                        BRepClass_FaceClassifier clf(face, gp_Pnt2d(cx_cls, cy), 1e-6);
+                        inside = (clf.State() == TopAbs_IN || clf.State() == TopAbs_ON);
                     }
-                    BRepClass_FaceClassifier clf(face, gp_Pnt2d(cx_cls, cy), 1e-6);
-                    if (clf.State() == TopAbs_IN || clf.State() == TopAbs_ON) ++n_interior;
+                    f->info() = inside ? 1 : 0;
+                    if (inside) ++n_interior; else ++n_mark_outside;
                 }
-                spdlog::debug("  cdt: {} finite faces, {} inside",
-                              (int)cdt.number_of_faces(), n_interior);
+                spdlog::debug("  cdt: {} finite faces, {} inside ({} mode)",
+                              (int)cdt.number_of_faces(), n_interior,
+                              seam_skipped ? "centroid" : "domain");
             }
         } catch (const std::exception& e) {
             spdlog::warn("uv_grid_retessellate: CDT exception: {}", e.what());
@@ -1374,37 +1399,11 @@ bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int 
         struct CdtTri { size_t a, b, c; };
         std::vector<CdtTri> cdt_tris;
         cdt_tris.reserve(n_interior);
-        int n_excluded = 0, n_missing = 0, n_degenerate = 0;
+        int n_missing = 0;
         {
-            // Canonical U origin for classifier wrapping — matches the grid block.
-            double u_first = surf.FirstUParameter();
-            double cell_area_scaled = (uv_du_step * uv_u_scale) * (uv_dv_step * uv_v_scale);
-            double min_tri_2area = cell_area_scaled * 1e-4;
+            // Selection verdict was recorded in f->info() (1 = keep) by the marking pass.
             for (auto f = cdt.finite_faces_begin(); f != cdt.finite_faces_end(); ++f) {
-                {
-                    // Drop zero-area collinear slivers (cap edges / seam corners) — see count loop.
-                    auto p0 = f->vertex(0)->point(), p1 = f->vertex(1)->point(),
-                         p2 = f->vertex(2)->point();
-                    double tri2a = std::abs((p1.x() - p0.x()) * (p2.y() - p0.y()) -
-                                            (p2.x() - p0.x()) * (p1.y() - p0.y()));
-                    if (tri2a < min_tri_2area) { ++n_degenerate; continue; }
-
-                    double cx_scaled = (f->vertex(0)->point().x() + f->vertex(1)->point().x() +
-                                        f->vertex(2)->point().x()) / 3.0;
-                    double cy_scaled = (f->vertex(0)->point().y() + f->vertex(1)->point().y() +
-                                        f->vertex(2)->point().y()) / 3.0;
-                    double cx = cx_scaled / uv_u_scale;
-                    double cy = cy_scaled / uv_v_scale;
-                    double cx_cls = cx;
-                    if (u_per && u_period > 1e-9) {
-                        double offset = cx_cls - u_first;
-                        offset = std::fmod(offset, u_period);
-                        if (offset < 0.0) offset += u_period;
-                        cx_cls = u_first + offset;
-                    }
-                    BRepClass_FaceClassifier clf(face, gp_Pnt2d(cx_cls, cy), 1e-6);
-                    if (clf.State() != TopAbs_IN && clf.State() != TopAbs_ON) { ++n_excluded; continue; }
-                }
+                if (f->info() != 1) continue;
                 auto it0 = vh_to_idx.find(f->vertex(0));
                 auto it1 = vh_to_idx.find(f->vertex(1));
                 auto it2 = vh_to_idx.find(f->vertex(2));
@@ -1417,8 +1416,8 @@ bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int 
         if (n_missing > 0)
             spdlog::warn("uv_grid_retessellate [face {}]: {} triangles skipped (CDT vertex not in map)",
                          face_idx, n_missing);
-        spdlog::debug("  extraction: {} kept, {} excluded, {} degenerate, {} missing",
-                      cdt_tris.size(), n_excluded, n_degenerate, n_missing);
+        spdlog::debug("  extraction: {} kept, {} outside, {} degenerate, {} missing",
+                      cdt_tris.size(), n_mark_outside, n_mark_degen, n_missing);
         if (cdt_tris.empty()) {
             spdlog::warn("uv_grid_retessellate: no mappable interior triangles");
             return false;
@@ -1437,23 +1436,8 @@ bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int 
             for (auto v = cdt.finite_vertices_begin(); v != cdt.finite_vertices_end(); ++v) {
                 obj_v_idx[v] = idx++;
             }
-            double dbg_u_first = surf.FirstUParameter();
-            double dbg_u_period = surf.IsUPeriodic() ? surf.UPeriod() : 0.0;
-            bool dbg_u_per = surf.IsUPeriodic();
             for (auto f = cdt.finite_faces_begin(); f != cdt.finite_faces_end(); ++f) {
-                double cx_scaled = (f->vertex(0)->point().x() + f->vertex(1)->point().x() + f->vertex(2)->point().x()) / 3.0;
-                double cy_scaled = (f->vertex(0)->point().y() + f->vertex(1)->point().y() + f->vertex(2)->point().y()) / 3.0;
-                double cx = cx_scaled / uv_u_scale;
-                double cy = cy_scaled / uv_v_scale;
-                double cx_cls = cx;
-                if (dbg_u_per && dbg_u_period > 1e-9) {
-                    double offset = cx_cls - dbg_u_first;
-                    offset = std::fmod(offset, dbg_u_period);
-                    if (offset < 0.0) offset += dbg_u_period;
-                    cx_cls = dbg_u_first + offset;
-                }
-                BRepClass_FaceClassifier clf(face, gp_Pnt2d(cx_cls, cy), 1e-6);
-                if (clf.State() == TopAbs_IN || clf.State() == TopAbs_ON) {
+                if (f->info() == 1) {   // selection verdict from the marking pass
                     out_obj << "f " << obj_v_idx[f->vertex(0)] << " "
                                     << obj_v_idx[f->vertex(1)] << " "
                                     << obj_v_idx[f->vertex(2)] << "\n";
