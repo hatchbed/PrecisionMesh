@@ -1315,12 +1315,7 @@ bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int 
                 spdlog::debug("  grid: {} inserted, {} filtered (BRepClass)", n_inserted, n_filtered);
 
                 // Count inside triangles using BRepClass_FaceClassifier on centroids.
-                bool bypass_classifier = (u_per && loops.size() == 1);
                 for (auto f = cdt.finite_faces_begin(); f != cdt.finite_faces_end(); ++f) {
-                    if (bypass_classifier) {
-                        ++n_interior;
-                        continue;
-                    }
                     double cx_scaled = (f->vertex(0)->point().x() + f->vertex(1)->point().x() +
                                         f->vertex(2)->point().x()) / 3.0;
                     double cy_scaled = (f->vertex(0)->point().y() + f->vertex(1)->point().y() +
@@ -1334,12 +1329,7 @@ bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int 
                         if (offset < 0.0) offset += u_period;
                         cx_cls = u_first + offset;
                     }
-
-                    // Calculate a dynamic 2D tolerance (25% of grid step) to absorb the chordal
-                    // deviation of the straight CDT edges curving around concave boundaries
-                    double tol2d = 1e-4;
-                    BRepClass_FaceClassifier clf(face, gp_Pnt2d(cx_cls, cy), tol2d);
-
+                    BRepClass_FaceClassifier clf(face, gp_Pnt2d(cx_cls, cy), 1e-4);
                     if (clf.State() == TopAbs_IN || clf.State() == TopAbs_ON) ++n_interior;
                 }
                 spdlog::debug("  cdt: {} finite faces, {} inside",
@@ -1364,17 +1354,14 @@ bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int 
         std::vector<CdtTri> cdt_tris;
         cdt_tris.reserve(n_interior);
         int n_excluded = 0, n_missing = 0;
-        bool bypass_classifier = (u_per && loops.size() == 1);
         {
             double u_first = surf.FirstUParameter();
             for (auto f = cdt.finite_faces_begin(); f != cdt.finite_faces_end(); ++f) {
-                if (!bypass_classifier) {
+                {
                     double cx_scaled = (f->vertex(0)->point().x() + f->vertex(1)->point().x() +
                                         f->vertex(2)->point().x()) / 3.0;
                     double cy_scaled = (f->vertex(0)->point().y() + f->vertex(1)->point().y() +
                                         f->vertex(2)->point().y()) / 3.0;
-
-                    // Unscale back to true UV space for BRep classification
                     double cx = cx_scaled / uv_u_scale;
                     double cy = cy_scaled / uv_v_scale;
                     double cx_cls = cx;
@@ -1384,10 +1371,7 @@ bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int 
                         if (offset < 0.0) offset += u_period;
                         cx_cls = u_first + offset;
                     }
-                    // Calculate a dynamic 2D tolerance (25% of grid step) to absorb the chordal
-                    // deviation of the straight CDT edges curving around concave boundaries
-                    double tol2d = 1e-4;
-                    BRepClass_FaceClassifier clf(face, gp_Pnt2d(cx_cls, cy), tol2d);
+                    BRepClass_FaceClassifier clf(face, gp_Pnt2d(cx_cls, cy), 1e-4);
                     if (clf.State() != TopAbs_IN && clf.State() != TopAbs_ON) { ++n_excluded; continue; }
                 }
                 auto it0 = vh_to_idx.find(f->vertex(0));
