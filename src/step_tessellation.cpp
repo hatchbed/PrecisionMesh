@@ -1251,23 +1251,30 @@ bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int 
             // BRepClass_FaceClassifier pre-filters points outside the trimmed face
             // (holes, wire cutouts) before inserting them into the CDT.
             if (cdt_ok) {
-                double u_min_g, u_max_g;
-                if (u_per && surf.IsUClosed()) {
-                    double u_bmin = std::numeric_limits<double>::infinity();
-                    for (const auto& lp : loop_uvs)
-                        for (const auto& uv : lp)
-                            u_bmin = std::min(u_bmin, uv.first);
-                    u_min_g = u_bmin;
-                    u_max_g = u_bmin + u_period;
-                } else {
-                    u_min_g = surf.FirstUParameter();
-                    u_max_g = surf.LastUParameter();
-                }
-                double v_min_g = surf.FirstVParameter();
-                double v_max_g = surf.LastVParameter();
+                // Grid bounds come from the ACTUAL (unrolled) border-loop UV extent, NOT
+                // surf.First/LastUParameter().  For a face trimmed into a non-base period
+                // (e.g. a 180° hole at u∈[2π,3π]) the adaptor reports the base surface range
+                // [0,2π], which would generate the grid in the wrong period — disjoint from
+                // the border verts.  The loop UVs are already correctly unrolled, so their
+                // min/max give the true trimmed range for both full and partial cylinders.
+                double u_min_g = std::numeric_limits<double>::infinity();
+                double u_max_g = -std::numeric_limits<double>::infinity();
+                double v_min_g = std::numeric_limits<double>::infinity();
+                double v_max_g = -std::numeric_limits<double>::infinity();
+                for (const auto& lp : loop_uvs)
+                    for (const auto& uv : lp) {
+                        u_min_g = std::min(u_min_g, uv.first);
+                        u_max_g = std::max(u_max_g, uv.first);
+                        v_min_g = std::min(v_min_g, uv.second);
+                        v_max_g = std::max(v_max_g, uv.second);
+                    }
 
                 size_t N_border_now = border_mesh_verts.size();
                 int n_inserted = 0, n_filtered = 0;
+                // Wrapping base for surf.Value / classifier = the surface's canonical U origin
+                // ([0,2π) for a cylinder).  BRepClass_FaceClassifier rejects params outside the
+                // canonical range, and a periodic surf.Value is correct at the canonical angle.
+                // (Grid *bounds* above stay in the loop's own period to match the border verts.)
                 double u_first = surf.FirstUParameter();
 
                 // STRCITLY GENERATE INTERIOR POINTS ONLY
@@ -1369,6 +1376,7 @@ bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int 
         cdt_tris.reserve(n_interior);
         int n_excluded = 0, n_missing = 0, n_degenerate = 0;
         {
+            // Canonical U origin for classifier wrapping — matches the grid block.
             double u_first = surf.FirstUParameter();
             double cell_area_scaled = (uv_du_step * uv_u_scale) * (uv_dv_step * uv_v_scale);
             double min_tri_2area = cell_area_scaled * 1e-4;
