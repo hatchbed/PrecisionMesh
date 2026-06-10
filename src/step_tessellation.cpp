@@ -935,6 +935,18 @@ bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int 
             double u_curr = uv2d.X();
             double v_curr = uv2d.Y();
 
+            // Canonicalize the unroll seed with the SAME snap used for anchor selection
+            // above.  For a vertex exactly on the seam, ValueOfUV may return u=0 for one
+            // loop and u=period for another; seeding the unroll from the raw value then
+            // places the loops one full period apart, making the CDT span two periods
+            // (duplicate 3D evaluations -> merged vertices -> overlapping triangles ->
+            // open edges along the seam).
+            if (i == 0 && u_per && u_period > 1e-9) {
+                u_curr = std::fmod(u_curr, u_period);
+                if (u_curr < 0) u_curr += u_period;
+                if (u_period - u_curr < 1e-5) u_curr = 0.0;
+            }
+
             if (i > 0) {
                 double u_prev = loop_uvs[li][i-1].first;
                 double du = u_curr - u_prev;
@@ -1095,6 +1107,12 @@ bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int 
                 // allowing CDT to bridge directly to the original BRep border vertices without duplicates!
                 double start_u = u_min_g + uv_du_step;
                 double end_u   = u_max_g - uv_du_step * 0.5;
+                // For full-period faces (seam_skipped) the u extremes are the periodic
+                // seam, not a real trim boundary.  Seam columns are generated explicitly
+                // below; clamp the interior columns to one step inside the period so they
+                // don't collide with them.
+                if (seam_skipped && u_per && u_period > 1e-9)
+                    end_u = std::min(end_u, u_min_g + u_period - uv_du_step * 0.5);
 
                 int i_u = 1; // Start index at 1 since we are strictly in the interior
                 for (double u = start_u; u < end_u; u += uv_du_step, ++i_u) {
@@ -1128,6 +1146,40 @@ bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int 
                             vh_to_idx[vh] = N_border_now + interior_info.size();
                             interior_info.push_back({p3d, {u_cls, pert_v}});
                             ++n_inserted;
+                        }
+                    }
+                }
+                // Seam columns: on a full-period face the quad grid must continue through
+                // the periodic seam — without them the [u_min, u_min+du] and
+                // [u_min+period-du, u_min+period] strips have no interior vertices and the
+                // CDT bridges them with full-height slivers along the seam.  Insert one
+                // column exactly at u_min_g and its duplicate exactly one period up: both
+                // evaluate at the same canonical U (bit-identical 3D points), so the
+                // position merge welds them into a single seam column.  Only v is
+                // perturbed, identically for both copies.
+                if (seam_skipped && u_per && u_period > 1e-9) {
+                    double u_cls = u_min_g - u_first;
+                    u_cls = std::fmod(u_cls, u_period);
+                    if (u_cls < 0.0) u_cls += u_period;
+                    u_cls += u_first;
+                    for (double off : {0.0, u_period}) {
+                        double u = u_min_g + off;
+                        int i_v = 1;
+                        for (double v = v_min_g + uv_dv_step; v < v_max_g - uv_dv_step * 0.5;
+                             v += uv_dv_step, ++i_v) {
+                            double pert_v = v + ((i_v % 2 == 0) ? 1e-5 : -1e-5) * uv_dv_step;
+                            BRepClass_FaceClassifier clf(face, gp_Pnt2d(u_cls, pert_v), 1e-6);
+                            if (clf.State() != TopAbs_IN && clf.State() != TopAbs_ON) {
+                                ++n_filtered;
+                                continue;
+                            }
+                            auto vh = cdt.insert(CRCDT::Point(u * uv_u_scale, pert_v * uv_v_scale));
+                            if (!vh_to_idx.count(vh)) {
+                                gp_Pnt p3d = surf.Value(u_cls, pert_v);
+                                vh_to_idx[vh] = N_border_now + interior_info.size();
+                                interior_info.push_back({p3d, {u_cls, pert_v}});
+                                ++n_inserted;
+                            }
                         }
                     }
                 }
@@ -1323,6 +1375,14 @@ bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int 
         }
         spdlog::debug("uv_grid_retessellate [face {}]: successfully merged {} seam/duplicate vertices",
                       face_idx, seam_merge_count);
+        // Expected merges: ~one per grid row along the seam.  A large fraction of the
+        // interior merging means duplicate 3D evaluations (e.g. the grid spanning more
+        // than one period) — the duplicated triangles will collide in add_face and leave
+        // open edges.
+        if (seam_merge_count > (int)interior_info.size() / 4)
+            spdlog::warn("uv_grid_retessellate [face {}]: {} of {} interior Steiner points "
+                         "merged — grid likely spans multiple periods",
+                         face_idx, seam_merge_count, interior_info.size());
 
         // Seam vertices: for periodic (u_closed) faces the seam physical vertex appears
         // at both u=FirstU and u=LastU as two distinct CDT handles, both mapping to the
