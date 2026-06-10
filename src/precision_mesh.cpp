@@ -1,6 +1,9 @@
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
+#include <ctime>
 #include <filesystem>
+#include <fstream>
 #include <limits>
 #include <map>
 #include <string>
@@ -196,7 +199,17 @@ int main(int argc, char **argv) {
     bool validate = false;
     app.add_flag("--validate", validate,
                  "Validate the final tessellation against the BREP (vertex placement, "
-                 "surface error, watertightness).  Slow; for diagnostics.");
+                 "watertightness).  Slow; for diagnostics.");
+
+    bool validate_surface_error = false;
+    app.add_flag("--validate-surface-error", validate_surface_error,
+                 "During --validate, also sample triangle interiors (centroid + edge "
+                 "midpoints) against the BREP to measure chord deviation.  Expensive.");
+
+    std::string validate_report;
+    app.add_option("--validate-report", validate_report,
+                   "Write validation metrics, health counters, and all run parameters to "
+                   "a YAML report file at the given path (implies --validate).");
 
     bool no_tess_repair = false;
     app.add_flag("--no-tess-repair", no_tess_repair,
@@ -207,10 +220,10 @@ int main(int argc, char **argv) {
                  "Disable UV-grid CDT tessellation for regularly-curved faces; fall back to "
                  "BRepMesh + isotropic remeshing (diagnostic).");
 
-    bool dump_cdt_obj = false;
-    app.add_flag("--dump-cdt-obj", dump_cdt_obj,
-                 "Write each UV-grid CDT face's 2D triangulation to Face_<idx>_CDT.obj in the "
-                 "current directory (diagnostic).");
+    std::string dump_cdt_dir;
+    app.add_option("--dump-cdt-obj", dump_cdt_dir,
+                   "Write each UV-grid CDT face's 2D triangulation to Face_<idx>_CDT.obj in "
+                   "the given directory, created if missing (diagnostic).");
 
 #ifdef PRECISION_MESH_HAS_VIEWER
     bool enable_display = false;
@@ -301,8 +314,24 @@ int main(int argc, char **argv) {
 
     CLI11_PARSE(app, argc, argv);
 
+    if (!validate_report.empty()) {
+        validate = true;
+    }
+
+    if (!dump_cdt_dir.empty()) {
+        std::error_code ec;
+        std::filesystem::create_directories(dump_cdt_dir, ec);
+        if (ec) {
+            spdlog::error("Failed to create --dump-cdt-obj directory '{}': {}",
+                          dump_cdt_dir, ec.message());
+            return 1;
+        }
+    }
+
     spdlog::set_level(log_level);
     spdlog::set_pattern("[%^%l%$] %v");
+
+    const auto run_start = std::chrono::steady_clock::now();
 
     std::filesystem::path input_path(input);
     std::string extension = boost::algorithm::to_lower_copy(input_path.extension().string());
@@ -836,6 +865,10 @@ int main(int argc, char **argv) {
         return saveOutput(outputs, meshes, segments, {}, conversion_scale) ? 0 : 1;
     }
 
+    // CDT engagement counters, reported by --validate-report.
+    size_t cdt_faces_attempted = 0;
+    size_t cdt_faces_succeeded = 0;
+
     if (iterations > 0) {
         split_border_edges(meshes, max_edge_length);
 
@@ -872,19 +905,20 @@ int main(int argc, char **argv) {
             }
         }
         if (!uv_faces.empty()) {
+            cdt_faces_attempted = uv_faces.size();
             spdlog::info("  UV-grid CDT tessellation for {} regularly-curved faces ...",
                          uv_faces.size());
             for (auto& f : uv_faces) {
                 if (!uv_grid_retessellate(meshes[f.idx], segments[f.idx],
                                           f.u_steps, f.v_steps, min_edge_length, f.idx,
-                                          dump_cdt_obj)) {
+                                          dump_cdt_dir)) {
                     use_uv_tess[f.idx] = false;
                     spdlog::warn("  seg {}: uv_grid_retessellate failed, falling back to "
                                  "isotropic remeshing", f.idx);
                 }
             }
-            size_t n_ok = std::count(use_uv_tess.begin(), use_uv_tess.end(), true);
-            spdlog::info("  {} segments tessellated via UV-grid CDT", n_ok);
+            cdt_faces_succeeded = std::count(use_uv_tess.begin(), use_uv_tess.end(), true);
+            spdlog::info("  {} segments tessellated via UV-grid CDT", cdt_faces_succeeded);
 
 #ifdef PRECISION_MESH_HAS_VIEWER
             push_to_viewer(viewer_ptr, meshes, segments, original_faces, component_map, is_step,
@@ -946,7 +980,8 @@ int main(int argc, char **argv) {
             edge_faces[i] = (orig >= 0 && orig < (int)original_faces.size())
                             ? original_faces[orig] : segments[i];
         }
-        auto vr = validate_tessellation(meshes, segments, edge_faces, vtol);
+        auto vr = validate_tessellation(meshes, segments, edge_faces, vtol,
+                                        validate_surface_error ? 4 : 0);
         spdlog::info("  validation ({} segments, {} triangles, tol={:.4g} {}):",
                      vr.segments, vr.total_tris, vtol * conversion_scale, output_unit);
         spdlog::info("    vertices: {} on-edge, {} interior", vr.border_verts, vr.interior_verts);
@@ -954,13 +989,90 @@ int main(int argc, char **argv) {
                      vr.max_border_edge_dist * conversion_scale, output_unit, vr.misclassified_border);
         spdlog::info("    other vertex   -> STEP surface: max={:.4g} {} ({} beyond tol)",
                      vr.max_interior_face_dist * conversion_scale, output_unit, vr.misclassified_interior);
-        spdlog::info("    surface error (tri samples):  max={:.4g} mean={:.4g} {} ({} samples)",
-                     vr.max_surface_error * conversion_scale, vr.mean_surface_error * conversion_scale,
-                     output_unit, vr.surface_samples);
+        if (validate_surface_error)
+            spdlog::info("    surface error (tri samples):  max={:.4g} mean={:.4g} {} ({} samples)",
+                         vr.max_surface_error * conversion_scale, vr.mean_surface_error * conversion_scale,
+                         output_unit, vr.surface_samples);
+        else
+            spdlog::info("    surface error (tri samples):  not sampled (--validate-surface-error)");
         if (vr.open_boundary_edges > 0)
             spdlog::warn("    watertight: {} open boundary edges (triangle soup, by position)", vr.open_boundary_edges);
         else
             spdlog::info("    watertight: 0 open boundary edges");
+
+        if (!validate_report.empty()) {
+            std::ofstream report(validate_report);
+            if (!report) {
+                spdlog::error("Failed to open validation report file: {}", validate_report);
+            }
+            else {
+                auto now = std::chrono::system_clock::now();
+                std::time_t tt = std::chrono::system_clock::to_time_t(now);
+                char timestamp[32] = {0};
+                std::strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%S",
+                              std::localtime(&tt));
+                double runtime_s = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - run_start).count();
+                // All distances in output units (same conversion as the console block);
+                // min/max edge length etc. were converted to model units earlier, so
+                // scale them back.
+                const double cs = conversion_scale;
+                report << "# precision_mesh validation report\n";
+                report << fmt::format("generated: \"{}\"\n", timestamp);
+                report << fmt::format("input: \"{}\"\n", input);
+                report << fmt::format("component: \"{}\"\n", selected_component->qualified_name);
+                report << fmt::format("units: \"{}\"\n", output_unit);
+                report << fmt::format("runtime_seconds: {:.2f}\n", runtime_s);
+                report << "parameters:\n";
+                report << fmt::format("  iterations: {}\n", iterations);
+                report << fmt::format("  crease_angle_deg: {:.6g}\n", crease_angle);
+                report << fmt::format("  min_edge_length: {:.6g}\n", min_edge_length * cs);
+                report << fmt::format("  max_edge_length: {:.6g}\n", max_edge_length * cs);
+                report << fmt::format("  max_surface_error: {:.6g}\n", max_surface_error * cs);
+                report << fmt::format("  max_boundary_surface_error: {:.6g}\n",
+                                      max_boundary_surface_error * cs);
+                report << fmt::format("  no_subdivision: {}\n", no_subdivision);
+                report << fmt::format("  no_projection: {}\n", no_projection);
+                report << fmt::format("  no_uv_tess: {}\n", no_uv_tess);
+                report << fmt::format("  no_tess_repair: {}\n", no_tess_repair);
+                report << fmt::format("  raw_step_mesh: {}\n", raw_step_mesh);
+                report << fmt::format("  unfreeze_step_boundaries: {}\n", unfreeze_step_boundaries);
+                report << fmt::format("  validate_surface_error: {}\n", validate_surface_error);
+                report << "tessellation:\n";
+                report << fmt::format("  segments: {}\n", vr.segments);
+                report << fmt::format("  triangles: {}\n", vr.total_tris);
+                report << fmt::format("  cdt_faces_attempted: {}\n", cdt_faces_attempted);
+                report << fmt::format("  cdt_faces_succeeded: {}\n", cdt_faces_succeeded);
+                report << fmt::format("  cdt_faces_fallback: {}\n",
+                                      cdt_faces_attempted - cdt_faces_succeeded);
+                report << "validation:\n";
+                report << fmt::format("  tolerance: {:.6g}\n", vtol * cs);
+                report << fmt::format("  border_vertices: {}\n", vr.border_verts);
+                report << fmt::format("  interior_vertices: {}\n", vr.interior_verts);
+                report << fmt::format("  max_border_edge_dist: {:.6g}\n",
+                                      vr.max_border_edge_dist * cs);
+                report << fmt::format("  border_beyond_tol: {}\n", vr.misclassified_border);
+                report << fmt::format("  max_interior_face_dist: {:.6g}\n",
+                                      vr.max_interior_face_dist * cs);
+                report << fmt::format("  interior_beyond_tol: {}\n", vr.misclassified_interior);
+                report << fmt::format("  open_boundary_edges: {}\n", vr.open_boundary_edges);
+                report << fmt::format("  non_manifold_edges: {}\n", vr.non_manifold_edges);
+                report << fmt::format("  watertight: {}\n", vr.open_boundary_edges == 0);
+                if (validate_surface_error) {
+                    report << "  surface_error:\n";
+                    report << fmt::format("    max: {:.6g}\n", vr.max_surface_error * cs);
+                    report << fmt::format("    mean: {:.6g}\n", vr.mean_surface_error * cs);
+                    report << fmt::format("    samples: {}\n", vr.surface_samples);
+                }
+                else {
+                    report << "  surface_error: null\n";
+                }
+                spdlog::info("  validation report written to: {}", validate_report);
+            }
+        }
+    }
+    else if (!validate_report.empty()) {
+        spdlog::warn("--validate-report requires a STEP input; no report written.");
     }
 
     return saveOutput(outputs, meshes, original_faces, component_map, conversion_scale) ? 0 : 1;

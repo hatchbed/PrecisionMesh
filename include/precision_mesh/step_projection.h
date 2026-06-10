@@ -122,16 +122,19 @@ struct TessellationValidation {
     size_t misclassified_interior  = 0;    // interior verts farther than tol from face
     double max_surface_error  = 0.0;  // worst triangle-interior sample -> BREP face
     double mean_surface_error = 0.0;  // mean over all samples
-    size_t surface_samples    = 0;
+    size_t surface_samples    = 0;    // 0 when triangle sampling was disabled
     size_t open_boundary_edges = 0;   // border edges of the merged mesh (cracks / true boundary)
+    size_t non_manifold_edges  = 0;   // undirected edges incident to >2 triangles
 };
 
 // Validate the tessellation against the BREP: per vertex, check that border vertices lie
 // on a STEP edge and interior vertices on the STEP face (invariants 2 & 3); sample each
-// triangle's interior (centroid; + edge midpoints if samples_per_tri >= 4) and measure the
-// surface error to the BREP face; and count open boundary edges of the merged mesh
-// (watertightness).  Intended as an opt-in validation pass -- BRep distance queries make it
-// slow on large meshes.
+// triangle's interior (centroid if samples_per_tri >= 1; + edge midpoints if >= 4) and
+// measure the surface error to the BREP face; and count open boundary edges of the merged
+// mesh (watertightness).  samples_per_tri == 0 skips the per-triangle surface-error
+// sampling entirely (it dominates the cost on large meshes); vertex placement and
+// watertightness are always checked.  Intended as an opt-in validation pass -- BRep
+// distance queries make it slow on large meshes.
 // `edge_faces` is parallel to `segments`: the ORIGINAL (pre-subdivision) face each segment
 // came from.  Vertices are classified against that face's REAL edges (seam edges excluded) --
 // not the segment mesh's border -- so periodic seams and subdivision cuts (which are interior

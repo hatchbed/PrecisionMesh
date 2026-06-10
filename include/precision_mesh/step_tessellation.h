@@ -1,5 +1,6 @@
 #pragma once
 
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -33,10 +34,11 @@ double find_surface_error_param(const TopoDS_Shape& shape, double min_edge_lengt
 // by Jacobian-corrected Steiner points evaluated on `face` via BRepClass_FaceClassifier.
 // Requires "v:uv" property map to exist on `mesh` (set by tessellate_shape).
 // Returns false (mesh unchanged) if CDT fails or produces no triangles.
-// dump_obj: write the 2D CDT to Face_<face_idx>_CDT.obj in the CWD for diagnosis.
+// dump_dir: when non-empty, write the 2D CDT to <dump_dir>/Face_<face_idx>_CDT.obj
+// for diagnosis (the directory must already exist).
 bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int v_steps,
                           double min_edge_length, size_t face_idx = 0,
-                          bool dump_obj = false);
+                          const std::string& dump_dir = {});
 
 // Post-tessellation open boundary loop repair.  Merges the soup by exact vertex
 // position, traces open boundary edges into closed loops, and classifies each by

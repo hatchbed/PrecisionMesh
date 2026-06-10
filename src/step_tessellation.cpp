@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <filesystem>
 #include <fstream>
 #include <limits>
 #include <list>
@@ -766,7 +767,7 @@ std::vector<std::pair<Mesh, TopoDS_Face>> boundary_meshes(const TopoDS_Shape& sh
 // seeded by the fixed border vertices already established by BRepMesh + split/snap.
 
 bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int v_steps,
-                          double min_edge_length, size_t face_idx, bool dump_obj)
+                          double min_edge_length, size_t face_idx, const std::string& dump_dir)
 {
     const double kNaNuv = std::numeric_limits<double>::quiet_NaN();
     auto uv_map = mesh.add_property_map<Mesh::Vertex_index, std::pair<double,double>>(
@@ -1229,10 +1230,15 @@ bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int 
             return false;
         }
 
-        // Diagnostic export of the 2D CDT (--dump-cdt-obj).
-        if (dump_obj) {
-            std::ofstream out_obj("Face_" + std::to_string(face_idx) + "_CDT.obj");
-            if (out_obj.is_open()) {
+        // Diagnostic export of the 2D CDT (--dump-cdt-obj <dir>).
+        if (!dump_dir.empty()) {
+            std::string obj_path = (std::filesystem::path(dump_dir) /
+                                    ("Face_" + std::to_string(face_idx) + "_CDT.obj")).string();
+            std::ofstream out_obj(obj_path);
+            if (!out_obj.is_open()) {
+                spdlog::warn("uv_grid_retessellate [face {}]: failed to open '{}' for CDT dump",
+                             face_idx, obj_path);
+            } else {
                 std::map<CRCDT::Vertex_handle, int> obj_v_idx;
                 int idx = 1;
                 for (auto v = cdt.finite_vertices_begin(); v != cdt.finite_vertices_end(); ++v) {
@@ -1246,8 +1252,8 @@ bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int 
                                         << obj_v_idx[f->vertex(2)] << "\n";
                     }
                 }
-                spdlog::debug("uv_grid_retessellate [face {}]: wrote debug CDT to 'Face_{}_CDT.obj'",
-                              face_idx, face_idx);
+                spdlog::debug("uv_grid_retessellate [face {}]: wrote debug CDT to '{}'",
+                              face_idx, obj_path);
             }
         }
 
@@ -1365,9 +1371,9 @@ bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int 
             for (auto h : mesh.halfedges())
                 if (mesh.is_border(h)) actual_he++;
             if (actual_he != expected_he) {
-                spdlog::warn("uv_grid_retessellate [face {}]: border halfedge mismatch — "
-                             "expected {} got {} (tessellation has gaps)",
-                             face_idx, expected_he, actual_he);
+                spdlog::debug("uv_grid_retessellate [face {}]: border halfedge mismatch — "
+                              "expected {} got {}",
+                              face_idx, expected_he, actual_he);
                 // Dump UV of every border halfedge so we can locate the holes.
                 auto dump_uv = mesh.property_map<Mesh::Vertex_index,
                                                   std::pair<double,double>>("v:uv").value();

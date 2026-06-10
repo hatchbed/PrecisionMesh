@@ -38,3 +38,6 @@ subprojects/*
 *.png
 *.AppImage
 debug_*.stp
+test/step/
+test/results/
+__pycache__/

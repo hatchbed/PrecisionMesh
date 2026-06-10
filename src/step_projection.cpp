@@ -665,8 +665,11 @@ TessellationValidation validate_tessellation(const std::vector<Mesh>& meshes,
 
             // Surface error: sample triangle interiors (centroid, + edge midpoints) and
             // measure to the BREP face -- captures chord deviation between vertices.
+            // samples_per_tri == 0 disables the sampling (the expensive part); triangle
+            // counting is kept either way.
             for (auto f : mesh.faces()) {
                 p.total_tris++;
+                if (samples_per_tri < 1) continue;
                 auto h0 = mesh.halfedge(f);
                 auto h1 = mesh.next(h0);
                 auto h2 = mesh.next(h1);
@@ -761,6 +764,7 @@ TessellationValidation validate_tessellation(const std::vector<Mesh>& meshes,
         spdlog::debug("    [openedge] ({:.4f},{:.4f},{:.4f}) -> ({:.4f},{:.4f},{:.4f}) len={:.5f} owners:{}",
                       A[0],A[1],A[2], B[0],B[1],B[2], len, owners);
     }
+    r.non_manifold_edges = non_manifold_edges;
     if (non_manifold_edges)
         spdlog::warn("    non-manifold edges (incident>2): {}", non_manifold_edges);
 
