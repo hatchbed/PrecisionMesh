@@ -23,12 +23,22 @@ struct FaceTessellationSteps {
 
 // Classify a face and return the UV subdivision steps that would be applied.
 // Returns type=None and u=v=1 for non-regularly-curved faces (planes, splines, etc.).
-// CDT-eligible face types (Cylinder, Cone, Torus, Revolution, Extrusion) use this
-// to determine the interior grid density for uv_grid_retessellate().
+// CDT-eligible face types use this to determine the interior grid density for
+// uv_grid_retessellate().
 FaceTessellationSteps get_face_tessellation_steps(const TopoDS_Face& face,
                                                    double min_edge_length,
                                                    double max_edge_length,
                                                    double max_surface_error);
+
+// Single source of truth for which face types use the UV-grid CDT path
+// (uv_grid_retessellate) instead of BRepAlgoAPI_Splitter subdivision + isotropic
+// remeshing.  Such faces skip subdivision entirely; faces whose steps are u=v=1
+// additionally need no CDT (the BRepMesh interior is already at target density).
+// Extend here as cone/torus/revolution/extrusion CDT support lands.
+inline bool cdt_eligible(const FaceTessellationSteps& steps)
+{
+    return steps.type == CurvedFaceType::Cylinder;
+}
 
 // Compute the number of U (angular) and V (axial) parametric subdivisions for a
 // cylindrical face such that the resulting sub-faces satisfy edge length and surface

@@ -32,3 +32,9 @@
 *.app
 
 subprojects/*
+# Local test/debug artifacts
+*.ply
+*.stl
+*.png
+*.AppImage
+debug_*.stp

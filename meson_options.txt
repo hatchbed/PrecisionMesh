@@ -1,0 +1,2 @@
+option('viewer', type: 'feature', value: 'auto',
+       description: 'Build the interactive 3D mesh viewer (requires GLFW3 + GLEW)')

@@ -517,7 +517,7 @@ std::tuple<TopoDS_Shape, FaceMap> subdivide_step_shape(TopoDS_Shape& shape,
 
         // CDT-eligible face types bypass the BRepAlgoAPI_Splitter subdivision path.
         // Their interior is filled by uv_grid_retessellate() after tessellation.
-        if (steps.type == CurvedFaceType::Cylinder) {
+        if (cdt_eligible(steps)) {
             u_steps = 1;
             v_steps = 1;
         }

@@ -202,6 +202,16 @@ int main(int argc, char **argv) {
     app.add_flag("--no-tess-repair", no_tess_repair,
                  "Disable the inverted/holed/dropped-corner tessellation repair (diagnostic).");
 
+    bool no_uv_tess = false;
+    app.add_flag("--no-uv-tess", no_uv_tess,
+                 "Disable UV-grid CDT tessellation for regularly-curved faces; fall back to "
+                 "BRepMesh + isotropic remeshing (diagnostic).");
+
+    bool dump_cdt_obj = false;
+    app.add_flag("--dump-cdt-obj", dump_cdt_obj,
+                 "Write each UV-grid CDT face's 2D triangulation to Face_<idx>_CDT.obj in the "
+                 "current directory (diagnostic).");
+
 #ifdef PRECISION_MESH_HAS_VIEWER
     bool enable_display = false;
     app.add_flag("--display", enable_display, "Open interactive 3D viewer during processing.");
@@ -837,6 +847,11 @@ int main(int argc, char **argv) {
             snap_border_midpoints_to_brep(meshes, segments, max_edge_length);
         }
 
+#ifdef PRECISION_MESH_HAS_VIEWER
+        push_to_viewer(viewer_ptr, meshes, segments, original_faces, component_map, is_step,
+                       "After Border Splitting", max_surface_error, free_edge_lines, healed_edge_lines);
+#endif
+
         // UV-grid CDT tessellation for regularly-curved STEP faces (cylinder, and later
         // cone/torus/revolution).  Replaces the BRepMesh interior with a UV-grid CDT
         // seeded by Jacobian-corrected Steiner points, giving uniform normal distribution.
@@ -845,18 +860,13 @@ int main(int argc, char **argv) {
         struct UvFace { size_t idx; int u_steps, v_steps; };
         std::vector<UvFace> uv_faces;
         std::vector<bool> use_uv_tess(meshes.size(), false);
-        // TEMP DIAGNOSTIC: set PM_NO_UV_TESS=1 to skip UV-grid CDT for cylinders and let them
-        // fall back to BRepMesh + isotropic remeshing (isolates border-interaction issues).
-        const bool disable_uv_tess = std::getenv("PM_NO_UV_TESS") != nullptr;
-        if (disable_uv_tess)
-            spdlog::warn("  PM_NO_UV_TESS set: skipping UV-grid CDT (cylinders use BRepMesh)");
-        if (is_step && !disable_uv_tess) {
+        if (is_step && !no_uv_tess) {
             for (size_t i = 0; i < segments.size(); i++) {
                 auto steps = get_face_tessellation_steps(segments[i], min_edge_length,
                                                          max_edge_length, max_surface_error);
-                bool eligible = (steps.type == CurvedFaceType::Cylinder)
-                                && (steps.u_steps > 1 || steps.v_steps > 1);
-                if (!eligible) continue;
+                // u=v=1 means the BRepMesh interior is already at target density.
+                if (!cdt_eligible(steps) || (steps.u_steps <= 1 && steps.v_steps <= 1))
+                    continue;
                 uv_faces.push_back({i, steps.u_steps, steps.v_steps});
                 use_uv_tess[i] = true;
             }
@@ -866,7 +876,8 @@ int main(int argc, char **argv) {
                          uv_faces.size());
             for (auto& f : uv_faces) {
                 if (!uv_grid_retessellate(meshes[f.idx], segments[f.idx],
-                                          f.u_steps, f.v_steps, min_edge_length, f.idx)) {
+                                          f.u_steps, f.v_steps, min_edge_length, f.idx,
+                                          dump_cdt_obj)) {
                     use_uv_tess[f.idx] = false;
                     spdlog::warn("  seg {}: uv_grid_retessellate failed, falling back to "
                                  "isotropic remeshing", f.idx);
@@ -874,12 +885,13 @@ int main(int argc, char **argv) {
             }
             size_t n_ok = std::count(use_uv_tess.begin(), use_uv_tess.end(), true);
             spdlog::info("  {} segments tessellated via UV-grid CDT", n_ok);
-        }
 
 #ifdef PRECISION_MESH_HAS_VIEWER
-        push_to_viewer(viewer_ptr, meshes, segments, original_faces, component_map, is_step,
-                       "After Border Splitting", max_surface_error, free_edge_lines, healed_edge_lines);
+            push_to_viewer(viewer_ptr, meshes, segments, original_faces, component_map, is_step,
+                           "After UV-grid CDT", max_surface_error, free_edge_lines,
+                           healed_edge_lines);
 #endif
+        }
 
         spdlog::info("  adaptive isotropic remeshing ...");
 

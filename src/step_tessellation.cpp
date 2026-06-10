@@ -2,7 +2,6 @@
 #include <CGAL/Exact_predicates_inexact_constructions_kernel.h>
 #include <CGAL/Constrained_Delaunay_triangulation_2.h>
 #include <CGAL/Constrained_triangulation_face_base_2.h>
-#include <CGAL/Polygon_mesh_processing/remesh.h>
 #include <CGAL/Polygon_mesh_processing/repair_polygon_soup.h>
 #include <CGAL/Simple_cartesian.h>
 #include <CGAL/Surface_mesh.h>
@@ -766,208 +765,8 @@ std::vector<std::pair<Mesh, TopoDS_Face>> boundary_meshes(const TopoDS_Shape& sh
 // face mesh is replaced by a uniform UV-parameter grid triangulated with CGAL CDT,
 // seeded by the fixed border vertices already established by BRepMesh + split/snap.
 
-std::vector<std::pair<double,double>> generate_uv_interior_grid(
-    const TopoDS_Face& face, int u_steps, int v_steps)
-{
-    BRepAdaptor_Surface surf(face);
-    double u_min = surf.FirstUParameter(), u_max = surf.LastUParameter();
-    double v_min = surf.FirstVParameter(), v_max = surf.LastVParameter();
-    double u_step = (u_max - u_min) / u_steps;
-    double v_step = (v_max - v_min) / v_steps;
-
-    std::vector<std::pair<double,double>> pts;
-    pts.reserve((u_steps > 1 ? u_steps - 1 : 0) * (v_steps > 1 ? v_steps - 1 : 0));
-    for (int i = 1; i < u_steps; i++)
-        for (int j = 1; j < v_steps; j++)
-            pts.push_back({u_min + i * u_step, v_min + j * v_step});
-    return pts;
-}
-
-bool uv_remesh(Mesh& mesh, const TopoDS_Face& face,
-               int u_steps, int v_steps, double min_edge_length, size_t face_idx)
-{
-    // Get UV property map (populated by tessellate_shape).
-    auto uv_opt = mesh.property_map<Mesh::Vertex_index, std::pair<double,double>>("v:uv");
-    if (!uv_opt.has_value()) {
-        spdlog::warn("uv_remesh [face {}]: no v:uv property map", face_idx);
-        return false;
-    }
-    auto uv_map = uv_opt.value();
-
-    BRepAdaptor_Surface surf(face);
-
-    // Sample first-order partial derivatives at the UV domain centre.
-    // Scaling u→(u_scale*u) and v→(v_scale*v) makes the flat working space
-    // approximately isometric with the analytic surface, so equal edge lengths
-    // in that space correspond to equal arc lengths in 3D.
-    double u_mid = (surf.FirstUParameter() + surf.LastUParameter()) / 2.0;
-    double v_mid = (surf.FirstVParameter() + surf.LastVParameter()) / 2.0;
-    gp_Pnt cp; gp_Vec d1, d2;
-    surf.D1(u_mid, v_mid, cp, d1, d2);
-    double u_scale = d1.Magnitude();
-    double v_scale = d2.Magnitude();
-    if (u_scale < 1e-10 || v_scale < 1e-10) {
-        spdlog::warn("uv_remesh [face {}]: degenerate surface metric (u_scale={:.4f} v_scale={:.4f})",
-                     face_idx, u_scale, v_scale);
-        return false;
-    }
-
-    // Derive the target edge length from the desired step counts and the actual
-    // arc lengths in the scaled UV space.  This gives the right density regardless
-    // of how coarse the initial BRepMesh triangulation was.
-    double u_arc = (surf.LastUParameter() - surf.FirstUParameter()) * u_scale;
-    double v_arc = (surf.LastVParameter() - surf.FirstVParameter()) * v_scale;
-    double target_u = u_steps > 1 ? u_arc / u_steps : u_arc;
-    double target_v = v_steps > 1 ? v_arc / v_steps : v_arc;
-    double target_edge_length = std::max(std::min(target_u, target_v), min_edge_length);
-
-    spdlog::debug("uv_remesh [face {}]: u_scale={:.4f} v_scale={:.4f} "
-                  "target={:.4f} (u_step={:.4f} v_step={:.4f}) "
-                  "verts_in={} faces_in={}",
-                  face_idx, u_scale, v_scale, target_edge_length, target_u, target_v,
-                  mesh.number_of_vertices(), mesh.number_of_faces());
-
-    // Snapshot the exact 3D positions of border vertices before overwriting them.
-    std::unordered_map<size_t, Mesh::Point> border_pos;
-    for (auto v : mesh.vertices())
-        if (mesh.is_border(v))
-            border_pos[v.idx()] = mesh.point(v);
-
-    // Replace every vertex position with (u_scale*u, v_scale*v, 0) so that the
-    // remeshing operates in a flat, arc-length-accurate 2D space.
-    for (auto v : mesh.vertices()) {
-        auto [u, vp] = uv_map[v];
-        mesh.point(v) = Mesh::Point(u_scale * u, v_scale * vp, 0.0);
-    }
-
-    // Diagnostics: edge-length distribution in UV-scaled space before remeshing.
-    {
-        double emin = 1e18, emax = 0.0, esum = 0.0;
-        int ecnt = 0, border_ecnt = 0, interior_ecnt = 0;
-        int border_vcnt = 0, interior_vcnt = 0;
-        for (auto v : mesh.vertices()) {
-            if (mesh.is_border(v)) border_vcnt++; else interior_vcnt++;
-        }
-        for (auto e : mesh.edges()) {
-            auto h = mesh.halfedge(e);
-            auto p0 = mesh.point(mesh.source(h));
-            auto p1 = mesh.point(mesh.target(h));
-            double len = std::sqrt(CGAL::to_double(CGAL::squared_distance(p0, p1)));
-            emin = std::min(emin, len); emax = std::max(emax, len); esum += len; ecnt++;
-            if (mesh.is_border(e)) border_ecnt++; else interior_ecnt++;
-        }
-        spdlog::debug("uv_remesh [face {}]: pre-remesh verts border={} interior={} "
-                      "edges border={} interior={} len=[{:.3f},{:.3f}] avg={:.3f}",
-                      face_idx, border_vcnt, interior_vcnt, border_ecnt, interior_ecnt,
-                      emin, emax, ecnt > 0 ? esum/ecnt : 0.0);
-    }
-
-    // Mark border edges and vertices as constrained so they won't move.
-    auto vcmap = mesh.add_property_map<Mesh::Vertex_index, bool>("v:uv_remesh_c", false).first;
-    auto ecmap = mesh.add_property_map<Mesh::Edge_index,   bool>("e:uv_remesh_c", false).first;
-    for (auto v : mesh.vertices()) if (mesh.is_border(v)) vcmap[v] = true;
-    for (auto e : mesh.edges())   if (mesh.is_border(e)) ecmap[e] = true;
-
-    bool ok = true;
-    try {
-        PMP::isotropic_remeshing(faces(mesh), target_edge_length, mesh,
-            CGAL::parameters::number_of_iterations(5)
-                             .number_of_relaxation_steps(3)
-                             .protect_constraints(true)
-                             .vertex_is_constrained_map(vcmap)
-                             .edge_is_constrained_map(ecmap));
-    } catch (const std::exception& e) {
-        spdlog::warn("uv_remesh [face {}]: remeshing exception: {}", face_idx, e.what());
-        ok = false;
-    } catch (...) {
-        spdlog::warn("uv_remesh [face {}]: unknown remeshing exception", face_idx);
-        ok = false;
-    }
-
-    mesh.remove_property_map(vcmap);
-    mesh.remove_property_map(ecmap);
-
-    if (!ok) {
-        for (auto v : mesh.vertices()) {
-            auto it = border_pos.find(v.idx());
-            if (it != border_pos.end()) mesh.point(v) = it->second;
-        }
-        return false;
-    }
-
-    // Diagnostics: edge-length distribution in UV-scaled space immediately after remeshing,
-    // before back-projection.  Verifies convergence: edges should be within
-    // [4/5*target, 4/3*target] if CGAL considers the mesh done.
-    {
-        double emin = 1e18, emax = 0.0, esum = 0.0;
-        int ecnt = 0, n_short = 0, n_long = 0;
-        int border_vcnt = 0, interior_vcnt = 0;
-        for (auto v : mesh.vertices()) {
-            if (mesh.is_border(v)) border_vcnt++; else interior_vcnt++;
-        }
-        for (auto e : mesh.edges()) {
-            auto h = mesh.halfedge(e);
-            auto p0 = mesh.point(mesh.source(h));
-            auto p1 = mesh.point(mesh.target(h));
-            double len = std::sqrt(CGAL::to_double(CGAL::squared_distance(p0, p1)));
-            emin = std::min(emin, len); emax = std::max(emax, len); esum += len; ecnt++;
-            if (len < 0.8 * target_edge_length) n_short++;
-            if (len > (4.0/3.0) * target_edge_length) n_long++;
-        }
-        spdlog::debug("uv_remesh [face {}]: post-remesh UV space: verts border={} interior={} "
-                      "len=[{:.3f},{:.3f}] avg={:.3f} thresh=[{:.3f},{:.3f}] "
-                      "n_short={} n_long={}",
-                      face_idx, border_vcnt, interior_vcnt,
-                      emin, emax, ecnt > 0 ? esum/ecnt : 0.0,
-                      0.8*target_edge_length, (4.0/3.0)*target_edge_length,
-                      n_short, n_long);
-    }
-
-    // Map all vertices back to 3D.
-    // Border vertices: restore the exact snapped position.
-    // Interior vertices: their position (u_scale*u, v_scale*v, 0) encodes the UV
-    // after remeshing; evaluate the analytic surface to get the exact 3D point.
-    for (auto v : mesh.vertices()) {
-        auto it = border_pos.find(v.idx());
-        if (it != border_pos.end()) {
-            mesh.point(v) = it->second;
-        } else {
-            auto p = mesh.point(v);
-            double u  = p.x() / u_scale;
-            double vp = p.y() / v_scale;
-            uv_map[v] = {u, vp};
-            gp_Pnt p3d = surf.Value(u, vp);
-            mesh.point(v) = Mesh::Point(p3d.X(), p3d.Y(), p3d.Z());
-        }
-    }
-
-    // Diagnostics: 3D edge-length distribution after back-projection.
-    {
-        double emin = 1e18, emax = 0.0, esum = 0.0;
-        int ecnt = 0, border_vcnt = 0, interior_vcnt = 0;
-        for (auto v : mesh.vertices()) {
-            if (mesh.is_border(v)) border_vcnt++; else interior_vcnt++;
-        }
-        for (auto e : mesh.edges()) {
-            auto h = mesh.halfedge(e);
-            auto p0 = mesh.point(mesh.source(h));
-            auto p1 = mesh.point(mesh.target(h));
-            double len = std::sqrt(CGAL::to_double(CGAL::squared_distance(p0, p1)));
-            emin = std::min(emin, len); emax = std::max(emax, len); esum += len; ecnt++;
-        }
-        spdlog::debug("uv_remesh [face {}]: post-project 3D space: verts border={} interior={} "
-                      "len=[{:.3f},{:.3f}] avg={:.3f}",
-                      face_idx, border_vcnt, interior_vcnt,
-                      emin, emax, ecnt > 0 ? esum/ecnt : 0.0);
-    }
-
-    spdlog::debug("uv_remesh [face {}]: {} verts {} faces after remesh",
-                  face_idx, mesh.number_of_vertices(), mesh.number_of_faces());
-    return true;
-}
-
 bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int v_steps,
-                          double min_edge_length, size_t face_idx)
+                          double min_edge_length, size_t face_idx, bool dump_obj)
 {
     const double kNaNuv = std::numeric_limits<double>::quiet_NaN();
     auto uv_map = mesh.add_property_map<Mesh::Vertex_index, std::pair<double,double>>(
@@ -1026,20 +825,21 @@ bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int 
         uv_dv_step = target / uv_v_scale;
     }
 
+    const bool u_per = surf.IsUPeriodic();
+    const double u_period = u_per ? surf.UPeriod() : 0.0;
+    const bool v_per = surf.IsVPeriodic();
+    const double v_period = v_per ? surf.VPeriod() : 0.0;
+
     // If the surface is periodic, we must adjust the step sizes so that the period
     // is an EXACT integer multiple of the step size. This guarantees that the grid
     // of interior points is perfectly symmetric and centered.
-    bool is_u_per = surf.IsUPeriodic();
-    double u_per_val = is_u_per ? surf.UPeriod() : 0.0;
-    if (is_u_per && u_per_val > 1e-9) {
-        int n_u_steps = std::max(1, (int)std::round(u_per_val / uv_du_step));
-        uv_du_step = u_per_val / n_u_steps;
+    if (u_per && u_period > 1e-9) {
+        int n_u_steps = std::max(1, (int)std::round(u_period / uv_du_step));
+        uv_du_step = u_period / n_u_steps;
     }
-    bool is_v_per = surf.IsVPeriodic();
-    double v_per_val = is_v_per ? surf.VPeriod() : 0.0;
-    if (is_v_per && v_per_val > 1e-9) {
-        int n_v_steps = std::max(1, (int)std::round(v_per_val / uv_dv_step));
-        uv_dv_step = v_per_val / n_v_steps;
+    if (v_per && v_period > 1e-9) {
+        int n_v_steps = std::max(1, (int)std::round(v_period / uv_dv_step));
+        uv_dv_step = v_period / n_v_steps;
     }
 
     // 1. Extract ordered border loops by walking border halfedges.
@@ -1091,9 +891,6 @@ bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int 
     // 2. Build UV arrays for each loop using pure geometric projection.
     // We anchor each loop to the U=0 periodic seam to guarantee they unroll
     // into a perfect vertical rectangle, completely eliminating parallelogram skew.
-    bool u_per = surf.IsUPeriodic();  double u_period = u_per ? surf.UPeriod() : 0.0;
-    bool v_per = surf.IsVPeriodic();  double v_period = v_per ? surf.VPeriod() : 0.0;
-
     Handle(Geom_Surface) geom_surf = BRep_Tool::Surface(face);
     ShapeAnalysis_Surface sa(geom_surf);
 
@@ -1188,24 +985,6 @@ bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int 
                   "du_step={:.4f} dv_step={:.4f} u_per={} loops={}",
                   face_idx, uv_u_scale, uv_v_scale, uv_du_step, uv_dv_step,
                   u_per, (int)loops.size());
-
-    // ==============================================================
-    // DIAGNOSTIC: Print all border vertices of the INPUT mesh
-    // ==============================================================
-    spdlog::debug("DIAGNOSTIC [face {}]: loops found = {}", face_idx, loops.size());
-    for (size_t li = 0; li < loops.size(); li++) {
-        spdlog::debug("  Loop {} has {} vertices in unrolled UV space:", li, loops[li].size());
-        for (size_t i = 0; i < loops[li].size(); i++) {
-            auto v = loops[li][i];
-            auto p = mesh.point(v);
-            auto uv = loop_uvs[li][i];
-            spdlog::debug("    Index {:4d} | 3D: ({:8.4f}, {:8.4f}, {:8.4f}) | UV: ({:8.4f}, {:8.4f})",
-                          v.idx(),
-                          CGAL::to_double(p.x()), CGAL::to_double(p.y()), CGAL::to_double(p.z()),
-                          uv.first, uv.second);
-        }
-    }
-    // ==============================================================
 
     // 3. Build CDT. vertex handle → index in unified vertex table.
     //    Border vertices:  index 0 .. N_border-1  → border_mesh_verts[i]
@@ -1421,7 +1200,8 @@ bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int 
             return false;
         }
 
-        // Extract interior triangles using BRepClass_FaceClassifier on centroids.
+        // Extract the triangles selected by the marking pass above (domain marking for
+        // constrained loops, centroid classification for seam-open full-period faces).
         struct CdtTri { size_t a, b, c; };
         std::vector<CdtTri> cdt_tris;
         cdt_tris.reserve(n_interior);
@@ -1449,30 +1229,27 @@ bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int 
             return false;
         }
 
-        // ==========================================
-        // TEMPORARY DIAGNOSTIC: Export 2D CDT to Obj
-        // ==========================================
-        std::ofstream out_obj("Face_" + std::to_string(face_idx) + "_CDT.obj");
-        if (out_obj.is_open()) {
-            for (auto v = cdt.finite_vertices_begin(); v != cdt.finite_vertices_end(); ++v) {
-                out_obj << "v " << v->point().x() << " " << v->point().y() << " 0\n";
-            }
-            std::map<CRCDT::Vertex_handle, int> obj_v_idx;
-            int idx = 1;
-            for (auto v = cdt.finite_vertices_begin(); v != cdt.finite_vertices_end(); ++v) {
-                obj_v_idx[v] = idx++;
-            }
-            for (auto f = cdt.finite_faces_begin(); f != cdt.finite_faces_end(); ++f) {
-                if (f->info() == 1) {   // selection verdict from the marking pass
-                    out_obj << "f " << obj_v_idx[f->vertex(0)] << " "
-                                    << obj_v_idx[f->vertex(1)] << " "
-                                    << obj_v_idx[f->vertex(2)] << "\n";
+        // Diagnostic export of the 2D CDT (--dump-cdt-obj).
+        if (dump_obj) {
+            std::ofstream out_obj("Face_" + std::to_string(face_idx) + "_CDT.obj");
+            if (out_obj.is_open()) {
+                std::map<CRCDT::Vertex_handle, int> obj_v_idx;
+                int idx = 1;
+                for (auto v = cdt.finite_vertices_begin(); v != cdt.finite_vertices_end(); ++v) {
+                    out_obj << "v " << v->point().x() << " " << v->point().y() << " 0\n";
+                    obj_v_idx[v] = idx++;
                 }
+                for (auto f = cdt.finite_faces_begin(); f != cdt.finite_faces_end(); ++f) {
+                    if (f->info() == 1) {   // selection verdict from the marking pass
+                        out_obj << "f " << obj_v_idx[f->vertex(0)] << " "
+                                        << obj_v_idx[f->vertex(1)] << " "
+                                        << obj_v_idx[f->vertex(2)] << "\n";
+                    }
+                }
+                spdlog::debug("uv_grid_retessellate [face {}]: wrote debug CDT to 'Face_{}_CDT.obj'",
+                              face_idx, face_idx);
             }
-            out_obj.close();
-            spdlog::debug("uv_grid_retessellate [face {}]: wrote debug CDT to 'Face_{}_CDT.obj'", face_idx, face_idx);
         }
-        // ==========================================
 
         size_t N_border = border_mesh_verts.size();
 
@@ -1608,8 +1385,7 @@ bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int 
         }
 
         return true;
-    } // end CDT scope — unreachable: all paths return inside the block above
-    return false;
+    }
 }
 
 void repair_open_boundary_loops(std::vector<std::pair<Mesh, TopoDS_Face>>& tessellation,

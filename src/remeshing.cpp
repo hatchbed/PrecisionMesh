@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cassert>
 #include <cmath>
 #include <limits>
 #include <mutex>
@@ -253,6 +254,12 @@ void remesh_and_project(
     double max_remeshing_surface_error =
         std::min(params.max_surface_error, params.min_edge_length * 0.1);
 
+    // Segments flagged in skip_mask (UV-grid CDT tessellated) are already final: their
+    // interior is exactly on the analytic surface and their border is shared with the
+    // neighbours, so they bypass remeshing, projection, and the repair passes entirely.
+    assert(skip_mask.empty() || skip_mask.size() == meshes.size());
+    auto skip = [&skip_mask](size_t m) { return !skip_mask.empty() && skip_mask[m]; };
+
     // Lock all border vertices before remeshing begins.  vertex_is_constrained_map prevents
     // border vertices from being moved by tangential relaxation.  Built once from the
     // pre-remeshing border (which includes any midpoints from split_border_edges).
@@ -296,10 +303,12 @@ void remesh_and_project(
         // collapsed by isotropic_remeshing can be re-inserted afterward.
         std::vector<std::vector<Mesh::Point>> saved_bverts(meshes.size());
         if (params.is_step) {
-            for (size_t m = 0; m < meshes.size(); m++)
+            for (size_t m = 0; m < meshes.size(); m++) {
+                if (skip(m)) continue;
                 for (auto h : meshes[m].halfedges())
                     if (meshes[m].is_border(h))
                         saved_bverts[m].push_back(meshes[m].point(meshes[m].target(h)));
+            }
         }
 
         // Snapshot border vertex positions before remeshing.  isotropic_remeshing honours
@@ -309,6 +318,7 @@ void remesh_and_project(
         std::vector<std::unordered_map<size_t, Mesh::Point>> saved_border(meshes.size());
         if (params.is_step) {
             for (size_t m = 0; m < meshes.size(); m++) {
+                if (skip(m)) continue;
                 const Mesh& mesh = meshes[m];
                 for (auto v : mesh.vertices())
                     if (mesh.is_border(v))
@@ -319,7 +329,7 @@ void remesh_and_project(
         tbb::parallel_for(
             tbb::blocked_range<size_t>(0, meshes.size()), [&](const tbb::blocked_range<size_t>& r) {
                 for (size_t m = r.begin(); m != r.end(); ++m) {
-                    if (!skip_mask.empty() && m < skip_mask.size() && skip_mask[m]) continue;
+                    if (skip(m)) continue;
                     Mesh& mesh = meshes[m];
                     const std::pair edge_min_max{params.min_edge_length, params.max_edge_length};
                     PMP::Adaptive_sizing_field<Mesh> sizing_field(max_remeshing_surface_error,
@@ -388,6 +398,7 @@ void remesh_and_project(
             tbb::parallel_for(
                 tbb::blocked_range<size_t>(0, meshes.size()), [&](const tbb::blocked_range<size_t>& r) {
                     for (size_t m = r.begin(); m != r.end(); ++m) {
+                        if (skip(m)) continue;
                         Mesh& mesh = meshes[m];
                         size_t restored = 0;
                         for (auto v : mesh.vertices()) {
@@ -418,6 +429,7 @@ void remesh_and_project(
         if (params.is_step) {
             size_t total_restored_bv = 0;
             for (size_t m = 0; m < meshes.size(); m++) {
+                if (skip(m)) continue;
                 Mesh& mesh = meshes[m];
                 size_t cur_bhe = 0;
                 for (auto h : mesh.halfedges()) if (mesh.is_border(h)) cur_bhe++;
@@ -509,6 +521,7 @@ void remesh_and_project(
         tbb::parallel_for(
             tbb::blocked_range<size_t>(0, meshes.size()), [&](const tbb::blocked_range<size_t>& r) {
                 for (size_t m = r.begin(); m != r.end(); ++m) {
+                    if (skip(m)) continue;
                     Mesh& mesh = meshes[m];
                     size_t repaired = 0, border_repaired = 0;
                     // Pass 1: for each null-halfedge vertex, collect the best halfedge
@@ -544,6 +557,7 @@ void remesh_and_project(
             tbb::parallel_for(
                 tbb::blocked_range<size_t>(0, meshes.size()), [&](const tbb::blocked_range<size_t>& r) {
                     for (size_t m = r.begin(); m != r.end(); ++m) {
+                        if (skip(m)) continue;
                         Mesh& mesh = meshes[m];
                         const double kNaN = std::numeric_limits<double>::quiet_NaN();
                         auto uv_map = mesh.add_property_map<Mesh::Vertex_index,
@@ -600,6 +614,7 @@ void remesh_and_project(
             tbb::parallel_for(
                 tbb::blocked_range<size_t>(0, meshes.size()), [&](const tbb::blocked_range<size_t>& r) {
                     for (size_t m = r.begin(); m != r.end(); ++m) {
+                        if (skip(m)) continue;
                         project_to_step(segments[m], meshes[m], wire_projectors,
                                         *surface_projectors[m], *border_projectors[m],
                                         weight, m, &seg_stats[m],
