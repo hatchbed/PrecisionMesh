@@ -1063,9 +1063,8 @@ bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int 
     }
 
     // 2. Build UV arrays for each loop using pure geometric projection.
-    // We unroll sequentially to keep constraints from crossing the domain, and we duplicate
-    // the first vertex of each loop at the end of the unrolled array to close the 2pi period.
-    // This ensures the UV rectangle spans exactly the full 2pi width, closing the final segment.
+    // We anchor each loop to the U=0 periodic seam to guarantee they unroll
+    // into a perfect vertical rectangle, completely eliminating parallelogram skew.
     bool u_per = surf.IsUPeriodic();  double u_period = u_per ? surf.UPeriod() : 0.0;
     bool v_per = surf.IsVPeriodic();  double v_period = v_per ? surf.VPeriod() : 0.0;
 
@@ -1075,6 +1074,32 @@ bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int 
     std::vector<std::vector<std::pair<double,double>>> loop_uvs(loops.size());
     for (size_t li = 0; li < loops.size(); li++) {
         size_t N = loops[li].size();
+
+        // --- ARRAY ROTATION PASS ---
+        // Find the vertex geometrically closest to the U=0 seam and rotate the array
+        // so it becomes Index 0. This forces the unroller to anchor both the top
+        // and bottom cylinder caps to the exact same starting column.
+        if (u_per && u_period > 1e-9) {
+            double min_u = std::numeric_limits<double>::max();
+            size_t min_idx = 0;
+            for (size_t i = 0; i < N; i++) {
+                auto p = mesh.point(loops[li][i]);
+                gp_Pnt p3d(CGAL::to_double(p.x()), CGAL::to_double(p.y()), CGAL::to_double(p.z()));
+                gp_Pnt2d uv2d = sa.ValueOfUV(p3d, 1e-7);
+
+                double canon_u = std::fmod(uv2d.X(), u_period);
+                if (canon_u < 0) canon_u += u_period;
+                // Snap vertices extremely close to 2pi back to 0
+                if (u_period - canon_u < 1e-5) canon_u = 0.0;
+
+                if (canon_u < min_u) {
+                    min_u = canon_u;
+                    min_idx = i;
+                }
+            }
+            std::rotate(loops[li].begin(), loops[li].begin() + min_idx, loops[li].end());
+        }
+
         loop_uvs[li].resize(N + 1); // Resize to hold the duplicate seam vertex
 
         // Unroll the original N vertices
@@ -1101,8 +1126,6 @@ bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int 
         }
 
         // --- PERIODIC SEAM DUPLICATION ---
-        // Duplicate the first vertex at the end of the unrolled loop to close the 2pi period.
-        // This adds the N-th segment to the flat 2D CDT plane.
         if (u_per && u_period > 1e-9) {
             double u_curr = loop_uvs[li][0].first;
             double u_prev = loop_uvs[li][N-1].first;
@@ -1111,11 +1134,9 @@ bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int 
             while (du < -u_period * 0.5) { u_curr += u_period; du = u_curr - u_prev; }
 
             loop_uvs[li][N] = {u_curr, loop_uvs[li][0].second};
-
-            // Append the first vertex index to the end of the loop array so they map to the same 3D point
-            loops[li].push_back(loops[li][0]);
+            loops[li].push_back(loops[li][0]); // Append physical vertex index
         } else {
-            loop_uvs[li].pop_back(); // Remove the extra slot if not periodic
+            loop_uvs[li].pop_back(); // Remove extra slot if not periodic
         }
 
         // ==============================================================
