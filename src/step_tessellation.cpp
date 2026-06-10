@@ -1314,8 +1314,22 @@ bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int 
                 }
                 spdlog::debug("  grid: {} inserted, {} filtered (BRepClass)", n_inserted, n_filtered);
 
+                // Degenerate-area threshold (scaled UV²): CGAL can emit zero-area slivers
+                // along exactly-collinear boundary chains (cap edges, seam corners).  These
+                // overlap the real triangles and corrupt the rebuild, so we drop any triangle
+                // whose 2D area is a tiny fraction of a grid cell.
+                double cell_area_scaled = (uv_du_step * uv_u_scale) * (uv_dv_step * uv_v_scale);
+                double min_tri_2area = cell_area_scaled * 1e-4;
+                auto tri_2area = [](CRCDT::Face_handle f) {
+                    auto p0 = f->vertex(0)->point(), p1 = f->vertex(1)->point(),
+                         p2 = f->vertex(2)->point();
+                    return std::abs((p1.x() - p0.x()) * (p2.y() - p0.y()) -
+                                    (p2.x() - p0.x()) * (p1.y() - p0.y()));
+                };
+
                 // Count inside triangles using BRepClass_FaceClassifier on centroids.
                 for (auto f = cdt.finite_faces_begin(); f != cdt.finite_faces_end(); ++f) {
+                    if (tri_2area(f) < min_tri_2area) continue;
                     double cx_scaled = (f->vertex(0)->point().x() + f->vertex(1)->point().x() +
                                         f->vertex(2)->point().x()) / 3.0;
                     double cy_scaled = (f->vertex(0)->point().y() + f->vertex(1)->point().y() +
@@ -1329,7 +1343,7 @@ bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int 
                         if (offset < 0.0) offset += u_period;
                         cx_cls = u_first + offset;
                     }
-                    BRepClass_FaceClassifier clf(face, gp_Pnt2d(cx_cls, cy), 1e-4);
+                    BRepClass_FaceClassifier clf(face, gp_Pnt2d(cx_cls, cy), 1e-6);
                     if (clf.State() == TopAbs_IN || clf.State() == TopAbs_ON) ++n_interior;
                 }
                 spdlog::debug("  cdt: {} finite faces, {} inside",
@@ -1353,11 +1367,20 @@ bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int 
         struct CdtTri { size_t a, b, c; };
         std::vector<CdtTri> cdt_tris;
         cdt_tris.reserve(n_interior);
-        int n_excluded = 0, n_missing = 0;
+        int n_excluded = 0, n_missing = 0, n_degenerate = 0;
         {
             double u_first = surf.FirstUParameter();
+            double cell_area_scaled = (uv_du_step * uv_u_scale) * (uv_dv_step * uv_v_scale);
+            double min_tri_2area = cell_area_scaled * 1e-4;
             for (auto f = cdt.finite_faces_begin(); f != cdt.finite_faces_end(); ++f) {
                 {
+                    // Drop zero-area collinear slivers (cap edges / seam corners) — see count loop.
+                    auto p0 = f->vertex(0)->point(), p1 = f->vertex(1)->point(),
+                         p2 = f->vertex(2)->point();
+                    double tri2a = std::abs((p1.x() - p0.x()) * (p2.y() - p0.y()) -
+                                            (p2.x() - p0.x()) * (p1.y() - p0.y()));
+                    if (tri2a < min_tri_2area) { ++n_degenerate; continue; }
+
                     double cx_scaled = (f->vertex(0)->point().x() + f->vertex(1)->point().x() +
                                         f->vertex(2)->point().x()) / 3.0;
                     double cy_scaled = (f->vertex(0)->point().y() + f->vertex(1)->point().y() +
@@ -1371,7 +1394,7 @@ bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int 
                         if (offset < 0.0) offset += u_period;
                         cx_cls = u_first + offset;
                     }
-                    BRepClass_FaceClassifier clf(face, gp_Pnt2d(cx_cls, cy), 1e-4);
+                    BRepClass_FaceClassifier clf(face, gp_Pnt2d(cx_cls, cy), 1e-6);
                     if (clf.State() != TopAbs_IN && clf.State() != TopAbs_ON) { ++n_excluded; continue; }
                 }
                 auto it0 = vh_to_idx.find(f->vertex(0));
@@ -1386,8 +1409,8 @@ bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int 
         if (n_missing > 0)
             spdlog::warn("uv_grid_retessellate [face {}]: {} triangles skipped (CDT vertex not in map)",
                          face_idx, n_missing);
-        spdlog::debug("  extraction: {} kept, {} excluded, {} missing",
-                      cdt_tris.size(), n_excluded, n_missing);
+        spdlog::debug("  extraction: {} kept, {} excluded, {} degenerate, {} missing",
+                      cdt_tris.size(), n_excluded, n_degenerate, n_missing);
         if (cdt_tris.empty()) {
             spdlog::warn("uv_grid_retessellate: no mappable interior triangles");
             return false;
@@ -1421,7 +1444,7 @@ bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int 
                     if (offset < 0.0) offset += dbg_u_period;
                     cx_cls = dbg_u_first + offset;
                 }
-                BRepClass_FaceClassifier clf(face, gp_Pnt2d(cx_cls, cy), 1e-4);
+                BRepClass_FaceClassifier clf(face, gp_Pnt2d(cx_cls, cy), 1e-6);
                 if (clf.State() == TopAbs_IN || clf.State() == TopAbs_ON) {
                     out_obj << "f " << obj_v_idx[f->vertex(0)] << " "
                                     << obj_v_idx[f->vertex(1)] << " "
