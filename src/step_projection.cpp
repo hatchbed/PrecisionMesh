@@ -747,12 +747,7 @@ TessellationValidation validate_tessellation(const std::vector<Mesh>& meshes,
         return Mesh::null_vertex();
     };
     int non_manifold_edges = 0;
-    for (const auto& kv : edge_count) {
-        if (kv.second > 2) { non_manifold_edges++; continue; }
-        if (kv.second != 1) continue;
-        r.open_boundary_edges++;
-        const auto& A = pos[kv.first.first]; const auto& B = pos[kv.first.second];
-        double len = std::sqrt((B[0]-A[0])*(B[0]-A[0])+(B[1]-A[1])*(B[1]-A[1])+(B[2]-A[2])*(B[2]-A[2]));
+    auto edge_owners = [&](const std::array<double,3>& A, const std::array<double,3>& B) {
         std::string owners;
         for (size_t m = 0; m < n; m++) {
             auto v0 = seg_vertex(meshes[m], A[0],A[1],A[2]);
@@ -761,8 +756,21 @@ TessellationValidation validate_tessellation(const std::vector<Mesh>& meshes,
             if (h0 && h1)        owners += " " + std::to_string(m) + "(both," + std::to_string(meshes[m].number_of_faces()) + "t)";
             else if (h0 || h1)   owners += " " + std::to_string(m) + (h0 ? "(p0)" : "(p1)");
         }
+        return owners;
+    };
+    for (const auto& kv : edge_count) {
+        const auto& A = pos[kv.first.first]; const auto& B = pos[kv.first.second];
+        if (kv.second > 2) {
+            non_manifold_edges++;
+            spdlog::debug("    [nonmanifold] ({:.4f},{:.4f},{:.4f}) -> ({:.4f},{:.4f},{:.4f}) incident={} owners:{}",
+                          A[0],A[1],A[2], B[0],B[1],B[2], kv.second, edge_owners(A, B));
+            continue;
+        }
+        if (kv.second != 1) continue;
+        r.open_boundary_edges++;
+        double len = std::sqrt((B[0]-A[0])*(B[0]-A[0])+(B[1]-A[1])*(B[1]-A[1])+(B[2]-A[2])*(B[2]-A[2]));
         spdlog::debug("    [openedge] ({:.4f},{:.4f},{:.4f}) -> ({:.4f},{:.4f},{:.4f}) len={:.5f} owners:{}",
-                      A[0],A[1],A[2], B[0],B[1],B[2], len, owners);
+                      A[0],A[1],A[2], B[0],B[1],B[2], len, edge_owners(A, B));
     }
     r.non_manifold_edges = non_manifold_edges;
     if (non_manifold_edges)
