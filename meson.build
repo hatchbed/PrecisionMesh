@@ -131,6 +131,12 @@ precision_mesh = executable('precision_mesh',
 
 test('basic', precision_mesh)
 
+# Generator for synthetic STEP test parts (test/step corpus).
+executable('gen_test_parts',
+  'test/gen_test_parts.cpp',
+  dependencies : [occt_dep],
+  install : false)
+
 # Install the .desktop file for application menus
 install_data('data/precision_mesh.desktop',
   install_dir: get_option('datadir') / 'applications')
