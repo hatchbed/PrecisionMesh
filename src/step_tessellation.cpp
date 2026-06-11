@@ -766,8 +766,9 @@ std::vector<std::pair<Mesh, TopoDS_Face>> boundary_meshes(const TopoDS_Shape& sh
 // face mesh is replaced by a uniform UV-parameter grid triangulated with CGAL CDT,
 // seeded by the fixed border vertices already established by BRepMesh + split/snap.
 
-bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int v_steps,
-                          double min_edge_length, size_t face_idx, const std::string& dump_dir)
+UvTessResult uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps,
+                                  int v_steps, double min_edge_length, size_t face_idx,
+                                  const std::string& dump_dir)
 {
     const double kNaNuv = std::numeric_limits<double>::quiet_NaN();
     auto uv_map = mesh.add_property_map<Mesh::Vertex_index, std::pair<double,double>>(
@@ -779,7 +780,7 @@ bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int 
     }
     if (!uv_ok) {
         spdlog::warn("uv_grid_retessellate: mesh has no valid v:uv values on border vertices");
-        return false;
+        return UvTessResult::Failed;
     }
 
     // Re-evaluate UV values for all border vertices using ShapeAnalysis_Surface
@@ -843,24 +844,30 @@ bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int 
         uv_dv_step = v_period / n_v_steps;
     }
 
-    // 1. Extract ordered border loops by walking border halfedges.
+    // 1. Extract ordered border loops by walking border halfedges.  loop_hes[li][i] is
+    // the border halfedge whose target is loops[li][i] (source = previous loop vertex);
+    // its opposite's triangle tells which side of the loop the surface interior is on
+    // (used by the oriented domain marking below).
     std::unordered_set<size_t> visited_hes;
     std::vector<std::vector<Mesh::Vertex_index>> loops;
+    std::vector<std::vector<Mesh::Halfedge_index>> loop_hes;
     for (auto h : mesh.halfedges()) {
         if (!mesh.is_border(h)) continue;
         if (visited_hes.count(h.idx())) continue;
         std::vector<Mesh::Vertex_index> loop;
+        std::vector<Mesh::Halfedge_index> hes;
         auto cur = h;
         do {
             visited_hes.insert(cur.idx());
             loop.push_back(mesh.target(cur));
+            hes.push_back(cur);
             cur = mesh.next(cur);
         } while (cur != h);
-        if (loop.size() >= 3) loops.push_back(loop);
+        if (loop.size() >= 3) { loops.push_back(loop); loop_hes.push_back(hes); }
     }
     if (loops.empty()) {
         spdlog::warn("uv_grid_retessellate: no border loops found");
-        return false;
+        return UvTessResult::Failed;
     }
 
     // Bail out on a self-touching wire: two DISTINCT border vertices at the same 3D point
@@ -883,7 +890,7 @@ bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int 
                 if (it != pinch_pos.end() && it->second != v.idx()) {
                     spdlog::info("uv_grid_retessellate [face {}]: self-touching wire at a pinch "
                                  "point — falling back to BRepMesh for this face", face_idx);
-                    return false;
+                    return UvTessResult::Skipped;
                 }
                 pinch_pos[key] = v.idx();
             }
@@ -922,6 +929,7 @@ bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int 
                 }
             }
             std::rotate(loops[li].begin(), loops[li].begin() + min_idx, loops[li].end());
+            std::rotate(loop_hes[li].begin(), loop_hes[li].begin() + min_idx, loop_hes[li].end());
         }
 
         loop_uvs[li].resize(N + 1); // Resize to hold the duplicate seam vertex
@@ -1094,7 +1102,51 @@ bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int 
                     }
 
                 size_t N_border_now = border_mesh_verts.size();
-                int n_inserted = 0, n_filtered = 0;
+                int n_inserted = 0, n_filtered = 0, n_near_border = 0;
+
+                // Border proximity rejection: a Steiner point landing within a sliver of a
+                // border constraint creates a near-zero-area triangle against the border
+                // that the degenerate filter below then drops, notching the border (open
+                // edges against the neighbour face).  This happens in practice when the
+                // period-snapped grid pitch makes a column/row coincide exactly with a
+                // border edge (e.g. a boundary at exactly half the period).  Reject
+                // candidates within a quarter target edge length of any border segment
+                // (scaled UV ~ 3D metric); the CDT then bridges directly from the first
+                // interior column to the border vertices.
+                std::vector<std::array<double, 4>> border_segs;
+                for (const auto& uvl : loop_uvs) {
+                    size_t nseg = uvl.size();
+                    for (size_t i = 0; i < nseg; i++) {
+                        size_t j = (i + 1) % nseg;
+                        if (j == 0 && u_per && u_period > 1e-9) {
+                            // Closing edge: skip the periodic seam-wrap (same rule as the
+                            // constraint insertion); for non-periodic loops it is real.
+                            double du = uvl[i].first - uvl[0].first;
+                            if (std::abs(std::abs(du) - u_period) < u_period * 0.01)
+                                continue;
+                        }
+                        border_segs.push_back(
+                            {uvl[i].first * uv_u_scale, uvl[i].second * uv_v_scale,
+                             uvl[j].first * uv_u_scale, uvl[j].second * uv_v_scale});
+                    }
+                }
+                const double border_clearance =
+                    0.25 * std::min(uv_du_step * uv_u_scale, uv_dv_step * uv_v_scale);
+                auto near_border = [&](double sx, double sy) -> bool {
+                    for (const auto& s : border_segs) {
+                        if (sx < std::min(s[0], s[2]) - border_clearance ||
+                            sx > std::max(s[0], s[2]) + border_clearance ||
+                            sy < std::min(s[1], s[3]) - border_clearance ||
+                            sy > std::max(s[1], s[3]) + border_clearance) continue;
+                        double dx = s[2] - s[0], dy = s[3] - s[1];
+                        double len2 = dx * dx + dy * dy;
+                        double t = len2 > 0 ? ((sx - s[0]) * dx + (sy - s[1]) * dy) / len2 : 0.0;
+                        t = std::clamp(t, 0.0, 1.0);
+                        double px = s[0] + t * dx - sx, py = s[1] + t * dy - sy;
+                        if (px * px + py * py < border_clearance * border_clearance) return true;
+                    }
+                    return false;
+                };
                 // Wrapping base for surf.Value / classifier = the surface's canonical U origin
                 // ([0,2π) for a cylinder).  BRepClass_FaceClassifier rejects params outside the
                 // canonical range, and a periodic surf.Value is correct at the canonical angle.
@@ -1123,6 +1175,11 @@ bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int 
                         // Since we are strictly in the interior, we can safely perturb all generated points.
                         double pert_u = u + (((i_u + i_v) % 2 == 0) ? 1e-5 : -1e-5) * uv_du_step;
                         double pert_v = v + ((i_u % 2 == 0) ? 1e-5 : -1e-5) * uv_dv_step;
+
+                        if (near_border(pert_u * uv_u_scale, pert_v * uv_v_scale)) {
+                            ++n_near_border;
+                            continue;
+                        }
 
                         // Map the perturbed coordinate to canonical UV range
                         double u_cls = pert_u;
@@ -1162,18 +1219,26 @@ bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int 
                     u_cls = std::fmod(u_cls, u_period);
                     if (u_cls < 0.0) u_cls += u_period;
                     u_cls += u_first;
-                    for (double off : {0.0, u_period}) {
-                        double u = u_min_g + off;
-                        int i_v = 1;
-                        for (double v = v_min_g + uv_dv_step; v < v_max_g - uv_dv_step * 0.5;
-                             v += uv_dv_step, ++i_v) {
-                            double pert_v = v + ((i_v % 2 == 0) ? 1e-5 : -1e-5) * uv_dv_step;
-                            BRepClass_FaceClassifier clf(face, gp_Pnt2d(u_cls, pert_v), 1e-6);
-                            if (clf.State() != TopAbs_IN && clf.State() != TopAbs_ON) {
-                                ++n_filtered;
-                                continue;
-                            }
-                            auto vh = cdt.insert(CRCDT::Point(u * uv_u_scale, pert_v * uv_v_scale));
+                    int i_v = 1;
+                    for (double v = v_min_g + uv_dv_step; v < v_max_g - uv_dv_step * 0.5;
+                         v += uv_dv_step, ++i_v) {
+                        double pert_v = v + ((i_v % 2 == 0) ? 1e-5 : -1e-5) * uv_dv_step;
+                        // Reject the row if EITHER copy is near a border segment: the two
+                        // copies weld into one seam vertex, so an asymmetric rejection
+                        // would itself create a T-junction along the seam.
+                        if (near_border(u_min_g * uv_u_scale, pert_v * uv_v_scale) ||
+                            near_border((u_min_g + u_period) * uv_u_scale, pert_v * uv_v_scale)) {
+                            ++n_near_border;
+                            continue;
+                        }
+                        BRepClass_FaceClassifier clf(face, gp_Pnt2d(u_cls, pert_v), 1e-6);
+                        if (clf.State() != TopAbs_IN && clf.State() != TopAbs_ON) {
+                            ++n_filtered;
+                            continue;
+                        }
+                        for (double off : {0.0, u_period}) {
+                            auto vh = cdt.insert(CRCDT::Point((u_min_g + off) * uv_u_scale,
+                                                              pert_v * uv_v_scale));
                             if (!vh_to_idx.count(vh)) {
                                 gp_Pnt p3d = surf.Value(u_cls, pert_v);
                                 vh_to_idx[vh] = N_border_now + interior_info.size();
@@ -1183,14 +1248,34 @@ bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int 
                         }
                     }
                 }
-                spdlog::debug("  grid: {} inserted, {} filtered (BRepClass)", n_inserted, n_filtered);
+                spdlog::debug("  grid: {} inserted, {} filtered (BRepClass), {} rejected "
+                              "(border clearance)", n_inserted, n_filtered, n_near_border);
+
+                // No interior Steiner points: the CDT would replace the BRepMesh interior
+                // with a pure border-vertex triangulation — no normal-uniformity benefit,
+                // and on sub-resolution micro faces it emits near-zero-area sliver fans
+                // along near-collinear border chains (open or non-manifold edges, with no
+                // area threshold able to separate the slivers from the real triangles).
+                // Keep the BRepMesh interior + isotropic remeshing path instead.
+                if (interior_info.empty()) {
+                    spdlog::debug("uv_grid_retessellate [face {}]: no interior Steiner "
+                                  "points — keeping BRepMesh interior", face_idx);
+                    return UvTessResult::Skipped;
+                }
 
                 // Degenerate-area threshold (scaled UV²): CGAL can emit zero-area slivers
                 // along exactly-collinear boundary chains (cap edges, seam corners).  These
-                // overlap the real triangles and corrupt the rebuild, so we drop any triangle
-                // whose 2D area is a tiny fraction of a grid cell.
-                double cell_area_scaled = (uv_du_step * uv_u_scale) * (uv_dv_step * uv_v_scale);
-                double min_tri_2area = cell_area_scaled * 1e-4;
+                // overlap the real triangles and corrupt the rebuild.  Drop ONLY numerically
+                // zero-area triangles: the threshold scales with the squared coordinate
+                // magnitude (the cross product's cancellation noise floor), NOT with the
+                // grid cell — micro faces (sub-resolution sliver strips) have real triangles
+                // far smaller than a grid cell, and dropping those notches the border.
+                double coord_mag = 0.0;
+                for (const auto& lp : loop_uvs)
+                    for (const auto& uv : lp)
+                        coord_mag = std::max({coord_mag, std::abs(uv.first * uv_u_scale),
+                                              std::abs(uv.second * uv_v_scale)});
+                double min_tri_2area = coord_mag * coord_mag * 1e-12;
                 auto tri_2area = [](CRCDT::Face_handle f) {
                     auto p0 = f->vertex(0)->point(), p1 = f->vertex(1)->point(),
                          p2 = f->vertex(2)->point();
@@ -1198,46 +1283,136 @@ bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int 
                                     (p2.x() - p0.x()) * (p1.y() - p0.y()));
                 };
 
-                // Classify a CDT point (scaled UV) against the trimmed face, unscaling and
-                // canonicalising U for the periodic surface.
-                auto uv_inside = [&](double sx, double sy) -> bool {
-                    double cx = sx / uv_u_scale, cy = sy / uv_v_scale;
-                    double cx_cls = cx;
-                    if (u_per && u_period > 1e-9) {
-                        double offset = cx_cls - u_first;
-                        offset = std::fmod(offset, u_period);
-                        if (offset < 0.0) offset += u_period;
-                        cx_cls = u_first + offset;
+                // Which side of each border loop the surface interior is on, in unrolled
+                // UV: +1 = left of the walk direction, -1 = right, 0 = ambiguous.  Decided
+                // empirically from the source mesh — for each border halfedge, the third
+                // vertex of its opposite (interior) triangle lies on the interior side.
+                // Votes are weighted by the cross-product magnitude so near-degenerate
+                // edges don't flip the verdict.
+                auto loop_side = [&](size_t li) -> int {
+                    const auto& uvl = loop_uvs[li];
+                    const auto& hes = loop_hes[li];
+                    const size_t N = hes.size();
+                    double vote = 0.0;
+                    for (size_t j = 0; j < N; j++) {
+                        const auto& pa = uvl[(j + N - 1) % N];
+                        const auto& pb = (j == 0 && uvl.size() == N + 1) ? uvl[N] : uvl[j];
+                        auto o = mesh.opposite(hes[j]);
+                        if (mesh.is_border(o)) continue;
+                        auto w = mesh.target(mesh.next(o));
+                        auto p = mesh.point(w);
+                        gp_Pnt2d wuv = sa.ValueOfUV(
+                            gp_Pnt(CGAL::to_double(p.x()), CGAL::to_double(p.y()),
+                                   CGAL::to_double(p.z())), 1e-7);
+                        double wu = wuv.X(), wv = wuv.Y();
+                        double um = (pa.first + pb.first) / 2.0;
+                        if (u_per && u_period > 1e-9) {
+                            while (wu - um > u_period * 0.5)  wu -= u_period;
+                            while (wu - um < -u_period * 0.5) wu += u_period;
+                        }
+                        double vm = (pa.second + pb.second) / 2.0;
+                        if (v_per && v_period > 1e-9) {
+                            while (wv - vm > v_period * 0.5)  wv -= v_period;
+                            while (wv - vm < -v_period * 0.5) wv += v_period;
+                        }
+                        vote += (pb.first - pa.first) * (wv - pa.second) -
+                                (pb.second - pa.second) * (wu - pa.first);
                     }
-                    BRepClass_FaceClassifier clf(face, gp_Pnt2d(cx_cls, cy), 1e-6);
-                    return clf.State() == TopAbs_IN || clf.State() == TopAbs_ON;
+                    return vote > 0 ? 1 : (vote < 0 ? -1 : 0);
+                };
+
+                // Oriented domain marking for seam-open loops: seed every CDT triangle
+                // adjacent to a border constraint as inside/outside from the loop's
+                // interior side, then flood-fill without crossing constrained edges.
+                // Topological and tolerance-free like nesting-level marking, but immune
+                // to the open seam: the interior legitimately flows through it.  Leaves
+                // f->info() = 1 (inside) / 0 (outside) / -1 (unreached).  Returns false
+                // on an ambiguous loop side or a label conflict (caller falls back to
+                // centroid classification).
+                auto oriented_mark = [&]() -> bool {
+                    for (auto f = cdt.all_faces_begin(); f != cdt.all_faces_end(); ++f)
+                        f->info() = -1;
+                    for (size_t li = 0; li < loop_vhs.size(); li++) {
+                        int side = loop_side(li);
+                        if (side == 0) return false;
+                        const auto& vhs = loop_vhs[li];
+                        for (size_t i = 0; i < vhs.size(); i++) {
+                            auto va = vhs[i], vb = vhs[(i + 1) % vhs.size()];
+                            if (va == vb) continue;
+                            auto pa = va->point(), pb = vb->point();
+                            double du = pa.x() - pb.x(), dv = pa.y() - pb.y();
+                            if (du * du + dv * dv < 1e-20) continue;
+                            if (u_per && i == vhs.size() - 1) {
+                                double u_period_scaled = u_period * uv_u_scale;
+                                if (std::abs(std::abs(du) - u_period_scaled) <
+                                    u_period_scaled * 0.01)
+                                    continue;   // seam-wrap closing edge: not a wall
+                            }
+                            CRCDT::Face_handle fh;
+                            int idx;
+                            if (!cdt.is_edge(va, vb, fh, idx)) continue;
+                            for (auto cand : {fh, fh->neighbor(idx)}) {
+                                if (cdt.is_infinite(cand)) continue;
+                                CRCDT::Vertex_handle t;
+                                for (int k = 0; k < 3; k++)
+                                    if (cand->vertex(k) != va && cand->vertex(k) != vb)
+                                        t = cand->vertex(k);
+                                auto orient = CGAL::orientation(va->point(), vb->point(),
+                                                                t->point());
+                                if (orient == CGAL::COLLINEAR) continue;
+                                int lbl = ((orient == CGAL::LEFT_TURN) == (side > 0)) ? 1 : 0;
+                                if (cand->info() == -1) cand->info() = lbl;
+                                else if (cand->info() != lbl) return false;  // seed conflict
+                            }
+                        }
+                    }
+                    std::vector<CRCDT::Face_handle> stack;
+                    for (auto f = cdt.finite_faces_begin(); f != cdt.finite_faces_end(); ++f)
+                        if (f->info() != -1) stack.push_back(f);
+                    while (!stack.empty()) {
+                        auto f = stack.back();
+                        stack.pop_back();
+                        for (int k = 0; k < 3; k++) {
+                            if (cdt.is_constrained(CRCDT::Edge(f, k))) continue;
+                            auto nb = f->neighbor(k);
+                            if (cdt.is_infinite(nb)) continue;
+                            if (nb->info() == -1) { nb->info() = f->info(); stack.push_back(nb); }
+                            else if (nb->info() != f->info()) return false;  // flood conflict
+                        }
+                    }
+                    return true;
                 };
 
                 // ---- Triangle selection ---------------------------------------------
                 //  * Fully-constrained loops (partial cylinders, holes): CDT nesting-level
                 //    domain marking — topological and tolerance-free, keeps thin valid slivers
                 //    and drops concave bays / bay-spanning fans correctly.
-                //  * Seam-open loops (full periodic cylinders, wrap-closing edge skipped): the
-                //    open seam makes nesting marking leak, so classify by the triangle centroid.
-                if (!seam_skipped) cr_mark_domains(cdt);
+                //  * Seam-open loops (full periodic cylinders, wrap-closing edge skipped):
+                //    nesting marking would leak through the open seam, so use the oriented
+                //    flood fill above.  If it reports ambiguity (inside/outside meet around
+                //    an open chain end — boundary bays at the seam), there is no exact
+                //    classification available: skip the face and keep the BRepMesh interior
+                //    rather than guess per-triangle (centroid tests bridge concave bays).
+                if (!seam_skipped) {
+                    cr_mark_domains(cdt);
+                } else if (!oriented_mark()) {
+                    spdlog::info("uv_grid_retessellate [face {}]: oriented domain marking "
+                                 "ambiguous (complex boundary at the periodic seam) — "
+                                 "keeping BRepMesh interior", face_idx);
+                    return UvTessResult::Skipped;
+                }
                 for (auto f = cdt.finite_faces_begin(); f != cdt.finite_faces_end(); ++f) {
-                    if (tri_2area(f) < min_tri_2area) { f->info() = 0; ++n_mark_degen; continue; }
-                    bool inside;
-                    if (!seam_skipped) {
-                        inside = (f->info() % 2) == 1;   // odd nesting level == inside
-                    } else {
-                        double cx = (f->vertex(0)->point().x() + f->vertex(1)->point().x() +
-                                     f->vertex(2)->point().x()) / 3.0;
-                        double cy = (f->vertex(0)->point().y() + f->vertex(1)->point().y() +
-                                     f->vertex(2)->point().y()) / 3.0;
-                        inside = uv_inside(cx, cy);
+                    bool inside = !seam_skipped ? (f->info() % 2) == 1  // odd nesting == inside
+                                                : f->info() == 1;  // -1 (unreached) == outside
+                    if (inside && tri_2area(f) < min_tri_2area) {
+                        f->info() = 0; ++n_mark_degen; continue;
                     }
                     f->info() = inside ? 1 : 0;
                     if (inside) ++n_interior; else ++n_mark_outside;
                 }
                 spdlog::debug("  cdt: {} finite faces, {} inside ({} mode)",
                               (int)cdt.number_of_faces(), n_interior,
-                              seam_skipped ? "centroid" : "domain");
+                              seam_skipped ? "oriented" : "domain");
             }
         } catch (const std::exception& e) {
             spdlog::warn("uv_grid_retessellate: CDT exception: {}", e.what());
@@ -1250,7 +1425,7 @@ bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int 
         if (!cdt_ok || n_interior == 0) {
             if (n_interior == 0 && cdt_ok)
                 spdlog::warn("uv_grid_retessellate: CDT produced 0 interior triangles");
-            return false;
+            return UvTessResult::Failed;
         }
 
         // Extract the triangles selected by the marking pass above (domain marking for
@@ -1279,7 +1454,7 @@ bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int 
                       cdt_tris.size(), n_mark_outside, n_mark_degen, n_missing);
         if (cdt_tris.empty()) {
             spdlog::warn("uv_grid_retessellate: no mappable interior triangles");
-            return false;
+            return UvTessResult::Failed;
         }
 
         // Diagnostic export of the 2D CDT (--dump-cdt-obj <dir>).
@@ -1416,7 +1591,7 @@ bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int 
                          " (non-manifold)", face_idx, rejected);
         if (added == 0) {
             spdlog::warn("uv_grid_retessellate: 0 faces added");
-            return false;
+            return UvTessResult::Failed;
         }
         spdlog::debug("uv_grid_retessellate [face {}]: {} border verts, {} interior Steiner, {} triangles",
                       face_idx, N_border, interior_info.size(), added);
@@ -1426,7 +1601,11 @@ bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int 
         // A mismatch means the CDT left gaps (open edges that aren't part of the BREP wire).
         {
             size_t expected_he = 0;
-            for (const auto& lp : loops) expected_he += lp.size();
+            // Periodic loops carry the duplicated seam vertex (front == back), which is
+            // the same mesh vertex: it adds an unrolled point but no mesh border edge.
+            for (const auto& lp : loops)
+                expected_he += (lp.size() > 1 && lp.front() == lp.back()) ? lp.size() - 1
+                                                                          : lp.size();
             size_t actual_he = 0;
             for (auto h : mesh.halfedges())
                 if (mesh.is_border(h)) actual_he++;
@@ -1450,7 +1629,7 @@ bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int 
                               face_idx, actual_he);
         }
 
-        return true;
+        return UvTessResult::Ok;
     }
 }
 

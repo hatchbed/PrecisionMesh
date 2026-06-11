@@ -909,12 +909,17 @@ int main(int argc, char **argv) {
             spdlog::info("  UV-grid CDT tessellation for {} regularly-curved faces ...",
                          uv_faces.size());
             for (auto& f : uv_faces) {
-                if (!uv_grid_retessellate(meshes[f.idx], segments[f.idx],
-                                          f.u_steps, f.v_steps, min_edge_length, f.idx,
-                                          dump_cdt_dir)) {
+                auto res = uv_grid_retessellate(meshes[f.idx], segments[f.idx],
+                                                f.u_steps, f.v_steps, min_edge_length, f.idx,
+                                                dump_cdt_dir);
+                if (res != UvTessResult::Ok) {
                     use_uv_tess[f.idx] = false;
-                    spdlog::warn("  seg {}: uv_grid_retessellate failed, falling back to "
-                                 "isotropic remeshing", f.idx);
+                    if (res == UvTessResult::Failed)
+                        spdlog::warn("  seg {}: uv_grid_retessellate failed, falling back to "
+                                     "isotropic remeshing", f.idx);
+                    else
+                        spdlog::debug("  seg {}: UV-grid CDT not applicable, using BRepMesh "
+                                      "interior + isotropic remeshing", f.idx);
                 }
             }
             cdt_faces_succeeded = std::count(use_uv_tess.begin(), use_uv_tess.end(), true);

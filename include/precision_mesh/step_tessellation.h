@@ -29,16 +29,21 @@ size_t get_short_edge_count(const std::vector<std::pair<Mesh, TopoDS_Face>>& tes
 double find_surface_error_param(const TopoDS_Shape& shape, double min_edge_length,
                                 int max_iterations = 10, double conversion_scale = 1);
 
+// Result of uv_grid_retessellate.  Skipped = the face was deliberately left on the
+// BRepMesh + remeshing path (pinch-point wire, or no interior Steiner points to
+// place); Failed = the CDT was attempted but could not produce a valid interior.
+// In both non-Ok cases the mesh is unchanged.
+enum class UvTessResult { Ok, Skipped, Failed };
+
 // Replace the interior triangulation of `mesh` with a UV-grid CDT tessellation.
 // Border vertices (mesh.is_border(v)) are fixed constraints; interior is filled
 // by Jacobian-corrected Steiner points evaluated on `face` via BRepClass_FaceClassifier.
 // Requires "v:uv" property map to exist on `mesh` (set by tessellate_shape).
-// Returns false (mesh unchanged) if CDT fails or produces no triangles.
 // dump_dir: when non-empty, write the 2D CDT to <dump_dir>/Face_<face_idx>_CDT.obj
 // for diagnosis (the directory must already exist).
-bool uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps, int v_steps,
-                          double min_edge_length, size_t face_idx = 0,
-                          const std::string& dump_dir = {});
+UvTessResult uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps,
+                                  int v_steps, double min_edge_length, size_t face_idx = 0,
+                                  const std::string& dump_dir = {});
 
 // Post-tessellation open boundary loop repair.  Merges the soup by exact vertex
 // position, traces open boundary edges into closed loops, and classifies each by
