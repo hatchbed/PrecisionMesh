@@ -877,6 +877,27 @@ UvTessResult uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_ste
     const bool dev_map_reverses =
         is_cone && ((surf.FirstVParameter() + surf.LastVParameter()) / 2.0 + cone_apex_s) > 0.0;
 
+    // Apex containment, from the FACE's parametric v-bounds (BRepAdaptor restricts to
+    // the face; the apex enters via the degenerate edge's pcurve).  The border loops
+    // CANNOT be used for this: the apex is a BRepMesh-interior pole, not a border
+    // vertex, so border-derived bounds miss the apex side of the face entirely.
+    // Touching (s == 0 at one end) is supported via an apex Steiner point; strictly
+    // crossing (both nappes) has no single-sheet development — leave it to BRepMesh.
+    bool apex_touch = false;
+    double v_apex = 0.0;
+    if (is_cone) {
+        double fv1 = surf.FirstVParameter(), fv2 = surf.LastVParameter();
+        double s1 = fv1 + cone_apex_s, s2 = fv2 + cone_apex_s;
+        double s_tol = 1e-9 * std::max(std::abs(fv2 - fv1), 1.0);
+        v_apex = -cone_apex_s;
+        apex_touch = std::abs(s1) <= s_tol || std::abs(s2) <= s_tol;
+        if (!apex_touch && s1 * s2 < 0.0) {
+            spdlog::info("uv_grid_retessellate [face {}]: face crosses the cone apex — "
+                         "keeping BRepMesh interior", face_idx);
+            return UvTessResult::Skipped;
+        }
+    }
+
     // 1. Extract ordered border loops by walking border halfedges.  loop_hes[li][i] is
     // the border halfedge whose target is loops[li][i] (source = previous loop vertex);
     // its opposite's triangle tells which side of the loop the surface interior is on
@@ -1195,12 +1216,14 @@ UvTessResult uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_ste
                     return u_first + offset;
                 };
 
-                // A cone face whose v-range crosses the apex has no single-sheet
-                // development (slant distance changes sign) — leave it to BRepMesh.
-                if (is_cone && (v_min_g + cone_apex_s) * (v_max_g + cone_apex_s) <= 0.0) {
-                    spdlog::info("uv_grid_retessellate [face {}]: face crosses the cone "
-                                 "apex — keeping BRepMesh interior", face_idx);
-                    return UvTessResult::Skipped;
+                // Ring v-range: border-derived bounds, extended to the apex when the
+                // face contains it (the apex is not on any border loop — for a full
+                // apex cone the ONLY border loop is the base circle, so v_min_g and
+                // v_max_g alone would collapse the range to the base ring).
+                double v_lo_ring = v_min_g, v_hi_ring = v_max_g;
+                if (apex_touch) {
+                    v_lo_ring = std::min(v_lo_ring, v_apex);
+                    v_hi_ring = std::max(v_hi_ring, v_apex);
                 }
 
                 // Ring sampler: rows at uniform v (uniform 3D spacing — |dS/dv| is
@@ -1215,8 +1238,11 @@ UvTessResult uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_ste
                 // perturbation -> identical 3D evaluation -> the position merge welds
                 // them, continuing the lattice through the seam.
                 int i_v = 1;
-                for (double v = v_min_g + uv_dv_step; v < v_max_g - uv_dv_step * 0.5;
+                for (double v = v_lo_ring + uv_dv_step; v < v_hi_ring - uv_dv_step * 0.5;
                      v += uv_dv_step, ++i_v) {
+                    // Rings closer to the apex than half the target edge length would sit
+                    // nearer to the apex Steiner point than to each other — slivers only.
+                    if (apex_touch && std::abs(v + cone_apex_s) < 0.5 * target) continue;
                     double r_k = row_radius(v);
                     const bool seam_row = seam_skipped && u_per && u_period > 1e-9;
                     double du_k;
@@ -1289,6 +1315,29 @@ UvTessResult uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_ste
                             vh_to_idx[vh] = N_border_now + interior_info.size();
                             interior_info.push_back({p3d, {u_cls, pert_v}});
                             ++n_inserted;
+                        }
+                    }
+                }
+                // Apex Steiner point: a face touching the cone apex closes at the
+                // development origin, but the apex is an interior vertex of the BRepMesh
+                // fan (not on any border loop), so without an explicit point there the
+                // CDT would bridge the tip with chords, truncating it.  Insert the exact
+                // apex once, unperturbed.  near_border suppresses it automatically when
+                // the apex lies ON the border (partial wedges) — the border vertex
+                // already covers it there.
+                if (apex_touch) {
+                    auto pa2 = to2d(u_min_g, v_apex);   // == (0,0) up to rounding
+                    if (near_border(pa2[0], pa2[1])) {
+                        ++n_near_border;
+                    } else {
+                        double u_cls = canon_u(u_min_g);
+                        auto vh = cdt.insert(CRCDT::Point(pa2[0], pa2[1]));
+                        if (!vh_to_idx.count(vh)) {
+                            gp_Pnt p3d = surf.Value(u_cls, v_apex);
+                            vh_to_idx[vh] = N_border_now + interior_info.size();
+                            interior_info.push_back({p3d, {u_cls, v_apex}});
+                            ++n_inserted;
+                            spdlog::debug("  apex Steiner point inserted at development origin");
                         }
                     }
                 }
