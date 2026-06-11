@@ -149,6 +149,9 @@ def judge(cdt, base):
         fail(f"border verts beyond tol {cv['border_beyond_tol']} > {bv['border_beyond_tol']}")
     if cv["interior_beyond_tol"] > bv["interior_beyond_tol"]:
         fail(f"interior verts beyond tol {cv['interior_beyond_tol']} > {bv['interior_beyond_tol']}")
+    if cv.get("flipped_triangles", 0) > bv.get("flipped_triangles", 0):
+        fail(f"flipped triangles {cv.get('flipped_triangles', 0)} > "
+             f"baseline {bv.get('flipped_triangles', 0)}")
     if cdt["hard_failures"]:
         fail("CDT warnings: " + "; ".join(cdt["hard_failures"]))
 
@@ -278,6 +281,8 @@ def write_summary(results_dir, rows, surface_error):
             "base_interior_max": metric(base, "validation", "max_interior_face_dist"),
             "cdt_border_beyond_tol": metric(cdt, "validation", "border_beyond_tol"),
             "cdt_interior_beyond_tol": metric(cdt, "validation", "interior_beyond_tol"),
+            "cdt_flipped_triangles": metric(cdt, "validation", "flipped_triangles"),
+            "base_flipped_triangles": metric(base, "validation", "flipped_triangles"),
             "cdt_faces_attempted": metric(cdt, "tessellation", "cdt_faces_attempted"),
             "cdt_faces_succeeded": metric(cdt, "tessellation", "cdt_faces_succeeded"),
             "cdt_runtime_s": f"{cdt['elapsed']:.1f}",

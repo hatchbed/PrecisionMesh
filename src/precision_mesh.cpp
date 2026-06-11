@@ -1004,6 +1004,10 @@ int main(int argc, char **argv) {
             spdlog::warn("    watertight: {} open boundary edges (triangle soup, by position)", vr.open_boundary_edges);
         else
             spdlog::info("    watertight: 0 open boundary edges");
+        if (vr.flipped_triangles > 0)
+            spdlog::warn("    winding: {} triangles oppose the surface normal", vr.flipped_triangles);
+        else
+            spdlog::info("    winding: all triangles match the surface normal");
 
         if (!validate_report.empty()) {
             std::ofstream report(validate_report);
@@ -1062,6 +1066,7 @@ int main(int argc, char **argv) {
                 report << fmt::format("  interior_beyond_tol: {}\n", vr.misclassified_interior);
                 report << fmt::format("  open_boundary_edges: {}\n", vr.open_boundary_edges);
                 report << fmt::format("  non_manifold_edges: {}\n", vr.non_manifold_edges);
+                report << fmt::format("  flipped_triangles: {}\n", vr.flipped_triangles);
                 report << fmt::format("  watertight: {}\n", vr.open_boundary_edges == 0);
                 if (validate_surface_error) {
                     report << "  surface_error:\n";

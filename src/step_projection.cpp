@@ -19,6 +19,10 @@
 #include <BRep_Tool.hxx>
 #include <BRepAdaptor_Curve.hxx>
 #include <BRepAdaptor_Surface.hxx>
+#include <Geom_Surface.hxx>
+#include <gp_Pnt2d.hxx>
+#include <gp_Vec.hxx>
+#include <ShapeAnalysis_Surface.hxx>
 #include <Extrema_GenLocateExtPS.hxx>
 #include <Extrema_POnSurf.hxx>
 #include <BRepBuilderAPI_MakeVertex.hxx>
@@ -663,20 +667,44 @@ TessellationValidation validate_tessellation(const std::vector<Mesh>& meshes,
                 }
             }
 
-            // Surface error: sample triangle interiors (centroid, + edge midpoints) and
-            // measure to the BREP face -- captures chord deviation between vertices.
-            // samples_per_tri == 0 disables the sampling (the expensive part); triangle
-            // counting is kept either way.
+            // Per-triangle checks.  Winding (always): triangle normal from vertex order
+            // vs the BREP face normal at the centroid -- orientation bugs are invisible
+            // to the position/watertightness metrics but break shading and
+            // inside/outside tests.  Surface error (samples_per_tri >= 1): sample
+            // triangle interiors (centroid, + edge midpoints) and measure to the BREP
+            // face -- captures chord deviation between vertices.
+            Handle(Geom_Surface) gsurf = BRep_Tool::Surface(face);
+            ShapeAnalysis_Surface sn(gsurf);
+            const bool face_reversed = (face.Orientation() == TopAbs_REVERSED);
             for (auto f : mesh.faces()) {
                 p.total_tris++;
-                if (samples_per_tri < 1) continue;
                 auto h0 = mesh.halfedge(f);
                 auto h1 = mesh.next(h0);
                 auto h2 = mesh.next(h1);
                 const auto& a = mesh.point(mesh.source(h0));
                 const auto& b = mesh.point(mesh.source(h1));
                 const auto& c = mesh.point(mesh.source(h2));
+                double ax = CGAL::to_double(a.x()), ay = CGAL::to_double(a.y()), az = CGAL::to_double(a.z());
+                double bx = CGAL::to_double(b.x()), by = CGAL::to_double(b.y()), bz = CGAL::to_double(b.z());
+                double cx = CGAL::to_double(c.x()), cy = CGAL::to_double(c.y()), cz = CGAL::to_double(c.z());
 
+                gp_Vec n_tri(gp_Vec(bx - ax, by - ay, bz - az)
+                                 .Crossed(gp_Vec(cx - ax, cy - ay, cz - az)));
+                if (n_tri.SquareMagnitude() > 1e-30) {
+                    gp_Pnt centroid((ax + bx + cx) / 3.0, (ay + by + cy) / 3.0,
+                                    (az + bz + cz) / 3.0);
+                    gp_Pnt2d uv = sn.ValueOfUV(centroid, 1e-7);
+                    gp_Pnt sp;
+                    gp_Vec d1u, d1v;
+                    gsurf->D1(uv.X(), uv.Y(), sp, d1u, d1v);
+                    gp_Vec n_surf = d1u.Crossed(d1v);
+                    if (face_reversed) n_surf.Reverse();
+                    // Skip degenerate surface normals (poles / apexes).
+                    if (n_surf.SquareMagnitude() > 1e-20 && n_tri.Dot(n_surf) < 0.0)
+                        p.flipped_triangles++;
+                }
+
+                if (samples_per_tri < 1) continue;
                 std::vector<Mesh::Point> samples;
                 samples.emplace_back((a.x()+b.x()+c.x())/3.0, (a.y()+b.y()+c.y())/3.0, (a.z()+b.z()+c.z())/3.0);
                 if (samples_per_tri >= 4) {
@@ -708,6 +736,7 @@ TessellationValidation validate_tessellation(const std::vector<Mesh>& meshes,
         r.misclassified_border  += p.misclassified_border;
         r.misclassified_interior+= p.misclassified_interior;
         r.surface_samples       += p.surface_samples;
+        r.flipped_triangles     += p.flipped_triangles;
         r.max_border_edge_dist   = std::max(r.max_border_edge_dist, p.max_border_edge_dist);
         r.max_interior_face_dist = std::max(r.max_interior_face_dist, p.max_interior_face_dist);
         r.max_surface_error      = std::max(r.max_surface_error, p.max_surface_error);

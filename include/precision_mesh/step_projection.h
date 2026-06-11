@@ -125,16 +125,20 @@ struct TessellationValidation {
     size_t surface_samples    = 0;    // 0 when triangle sampling was disabled
     size_t open_boundary_edges = 0;   // border edges of the merged mesh (cracks / true boundary)
     size_t non_manifold_edges  = 0;   // undirected edges incident to >2 triangles
+    size_t flipped_triangles   = 0;   // triangles whose winding opposes the BREP face normal
 };
 
 // Validate the tessellation against the BREP: per vertex, check that border vertices lie
 // on a STEP edge and interior vertices on the STEP face (invariants 2 & 3); sample each
 // triangle's interior (centroid if samples_per_tri >= 1; + edge midpoints if >= 4) and
-// measure the surface error to the BREP face; and count open boundary edges of the merged
-// mesh (watertightness).  samples_per_tri == 0 skips the per-triangle surface-error
-// sampling entirely (it dominates the cost on large meshes); vertex placement and
-// watertightness are always checked.  Intended as an opt-in validation pass -- BRep
-// distance queries make it slow on large meshes.
+// measure the surface error to the BREP face; count open boundary edges of the merged
+// mesh (watertightness); and check each triangle's winding against the BREP face normal
+// at its centroid (flipped_triangles -- orientation bugs are invisible to the
+// position/watertightness metrics but break shading and inside/outside tests).
+// samples_per_tri == 0 skips the per-triangle surface-error sampling entirely (it
+// dominates the cost on large meshes); vertex placement, watertightness, and winding
+// are always checked.  Intended as an opt-in validation pass -- BRep distance queries
+// make it slow on large meshes.
 // `edge_faces` is parallel to `segments`: the ORIGINAL (pre-subdivision) face each segment
 // came from.  Vertices are classified against that face's REAL edges (seam edges excluded) --
 // not the segment mesh's border -- so periodic seams and subdivision cuts (which are interior
