@@ -792,8 +792,8 @@ std::vector<std::pair<Mesh, TopoDS_Face>> boundary_meshes(const TopoDS_Shape& sh
 // seeded by the fixed border vertices already established by BRepMesh + split/snap.
 
 UvTessResult uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps,
-                                  int v_steps, double min_edge_length, size_t face_idx,
-                                  const std::string& dump_dir)
+                                  int v_steps, double min_edge_length, double max_edge_length,
+                                  size_t face_idx, const std::string& dump_dir)
 {
     const double kNaNuv = std::numeric_limits<double>::quiet_NaN();
     auto uv_map = mesh.add_property_map<Mesh::Vertex_index, std::pair<double,double>>(
@@ -846,8 +846,8 @@ UvTessResult uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_ste
         uv_v_scale = std::max(d_dv.Magnitude(), 1e-10);
         double u_arc = (surf.LastUParameter() - surf.FirstUParameter()) * uv_u_scale;
         double v_arc = (surf.LastVParameter() - surf.FirstVParameter()) * uv_v_scale;
-        double target_u = u_steps > 1 ? u_arc / u_steps : u_arc;
-        double target_v = v_steps > 1 ? v_arc / v_steps : v_arc;
+        double target_u = u_steps > 1 ? u_arc / u_steps : max_edge_length;
+        double target_v = v_steps > 1 ? v_arc / v_steps : max_edge_length;
         target = std::max(std::min(target_u, target_v), min_edge_length);
     }
 
@@ -1293,12 +1293,96 @@ UvTessResult uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_ste
                 // snapped and carries a seam PAIR at u_min and u_min+period: identical v
                 // perturbation -> identical 3D evaluation -> the position merge welds
                 // them, continuing the lattice through the seam.
-                int i_v = 1;
+                // Collect ring v-positions using uniform steps from v_lo_ring.
+                // Narrow-face fallback: when the face is between 1× and 1.5× the step pitch
+                // (1.5× is the minimum for the standard step-from-bottom approach to place any
+                // ring), place one ring at v_mid instead.  v_mid has v_span/2 clearance from
+                // both borders, which is always > border_clearance (= 0.25*dv_step) when
+                // v_span > 0.5*dv_step.
+                std::vector<double> ring_vs;
                 for (double v = v_lo_ring + uv_dv_step; v < v_hi_ring - uv_dv_step * 0.5;
-                     v += uv_dv_step, ++i_v) {
+                     v += uv_dv_step)
+                    ring_vs.push_back(v);
+                if (ring_vs.empty() && v_hi_ring - v_lo_ring > uv_dv_step)
+                    ring_vs.push_back((v_lo_ring + v_hi_ring) / 2.0);
+
+                // For non-seam faces where all rings carry only one interior u-point
+                // (n_k rounds to 1, bumped to 2), the uniform v-step grid is typically
+                // offset from the border vertex grid — large diagonal triangles span the
+                // full strip height and appear as valley artifacts in the rendered surface.
+                // Fix: replace ring_vs with the side-border v-positions (those at
+                // u ≈ u_min_g or u_max_g), filtering out any level that is closer than
+                // 0.5*uv_dv_step to the previous kept level.  This aligns each Steiner
+                // with a border vertex pair at the same v, while removing spurious
+                // close-pair levels that split_border_edges can produce (~0.28 mm apart
+                // for torus/complex faces) which would otherwise create sliver triangles.
+                {
+                    const bool could_be_seam_row = seam_skipped && u_per && u_period > 1e-9;
+                    if (!could_be_seam_row) {
+                        const double u_span_sc = std::max(u_max_g - u_min_g, 1e-12);
+                        const double r_at_mid = row_radius((v_lo_ring + v_hi_ring) / 2.0);
+                        const int n_k_mid = std::max(1, (int)std::round(u_span_sc * r_at_mid / target));
+                        if (n_k_mid == 1 && !ring_vs.empty()) {
+                            const double u_tol = 1e-4 * u_span_sc + 1e-9;
+                            std::vector<double> side_vs;
+                            for (const auto& uvl : loop_uvs) {
+                                for (const auto& [u_bv, v_bv] : uvl) {
+                                    if (std::abs(u_bv - u_min_g) < u_tol ||
+                                        std::abs(u_bv - u_max_g) < u_tol)
+                                        side_vs.push_back(v_bv);
+                                }
+                            }
+                            std::sort(side_vs.begin(), side_vs.end());
+                            side_vs.erase(std::unique(side_vs.begin(), side_vs.end()),
+                                          side_vs.end());
+                            if (side_vs.size() >= 2) {
+                                // Walk border levels in order, keeping each only if it is
+                                // at least min_gap from the previous kept level.  This
+                                // removes spurious close-pair levels (split_border_edges
+                                // can create near-coincident border rows ~0.28 mm apart)
+                                // while preserving coverage at all legitimate border rows.
+                                // Using all border levels (rather than the sparser uniform
+                                // grid) avoids the gap/spanning-edge problem that snapping
+                                // to the uniform grid introduces.
+                                //
+                                // End-strip exception: in the bottom/top strips (within
+                                // 1.5×uv_dv_step of v_lo_ring or v_hi_ring) the left and
+                                // right side borders reach different v-extremes (the arc
+                                // corner sits at a different v than the opposite-side's
+                                // second vertex).  Those two end-strip entries are only
+                                // ~0.66×uv_dv_step apart — below min_gap — so without the
+                                // exception the min_gap filter would drop one of them,
+                                // leaving the end strip with no effective Steiner (the
+                                // corner-level Steiner is within border_clearance of the
+                                // arc and gets rejected at evaluation time).  Keeping both
+                                // ensures the second vertex's Steiner, which is safely
+                                // inside border_clearance, breaks the spanning triangle.
+                                const double min_gap   = 0.5  * uv_dv_step;
+                                const double end_strip = 1.5  * uv_dv_step;
+                                std::vector<double> filtered;
+                                double last_kept = std::numeric_limits<double>::lowest();
+                                for (double v_side : side_vs) {
+                                    if (v_side > v_lo_ring && v_side < v_hi_ring) {
+                                        const bool in_end = (v_side - v_lo_ring < end_strip) ||
+                                                            (v_hi_ring - v_side < end_strip);
+                                        if (in_end || v_side - last_kept >= min_gap) {
+                                            filtered.push_back(v_side);
+                                            last_kept = v_side;
+                                        }
+                                    }
+                                }
+                                if (!filtered.empty())
+                                    ring_vs = std::move(filtered);
+                            }
+                        }
+                    }
+                }
+
+                int i_v = 1;
+                for (double v : ring_vs) {
                     // Rings closer to the apex than half the target edge length would sit
                     // nearer to the apex Steiner point than to each other — slivers only.
-                    if (apex_touch && std::abs(v + cone_apex_s) < 0.5 * target) continue;
+                    if (apex_touch && std::abs(v + cone_apex_s) < 0.5 * target) { ++i_v; continue; }
                     double r_k = row_radius(v);
                     const bool seam_row = seam_skipped && u_per && u_period > 1e-9;
                     double du_k;
@@ -1310,9 +1394,10 @@ UvTessResult uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_ste
                     } else {
                         double span = std::max(u_max_g - u_min_g, 1e-12);
                         int n_k = std::max(1, (int)std::round(span * r_k / target));
+                        if (n_k == 1) n_k = 2;  // narrow-span: one centered midpoint
                         du_k = span / n_k;
                         j_begin = 1; j_end = n_k - 1;   // strictly interior
-                        if (j_end < j_begin) continue;
+                        if (j_end < j_begin) { ++i_v; continue; }
                     }
                     // Seam pair v perturbation is shared by both copies (weld requires
                     // bit-identical evaluations).
@@ -1373,6 +1458,7 @@ UvTessResult uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_ste
                             ++n_inserted;
                         }
                     }
+                    ++i_v;
                 }
                 // Apex Steiner point: a face touching the cone apex closes at the
                 // development origin, but the apex is an interior vertex of the BRepMesh
@@ -1400,15 +1486,14 @@ UvTessResult uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_ste
                 spdlog::debug("  grid: {} inserted, {} filtered (BRepClass), {} rejected "
                               "(border clearance)", n_inserted, n_filtered, n_near_border);
 
-                // No interior Steiner points: the CDT would replace the BRepMesh interior
-                // with a pure border-vertex triangulation — no normal-uniformity benefit,
-                // and on sub-resolution micro faces it emits near-zero-area sliver fans
-                // along near-collinear border chains (open or non-manifold edges, with no
-                // area threshold able to separate the slivers from the real triangles).
-                // Keep the BRepMesh interior + isotropic remeshing path instead.
+                // No interior Steiner points: the face is sub-resolution relative to the
+                // target edge length.  Keep the BRepMesh interior unchanged and signal the
+                // caller to also skip isotropic remeshing — remeshing would add interior
+                // vertices that form valley tessellations on these narrow/short faces.
                 if (interior_info.empty()) {
                     spdlog::debug("uv_grid_retessellate [face {}]: no interior Steiner "
-                                  "points — keeping BRepMesh interior", face_idx);
+                                  "points — keeping BRepMesh interior + isotropic remeshing",
+                                  face_idx);
                     return UvTessResult::Skipped;
                 }
 

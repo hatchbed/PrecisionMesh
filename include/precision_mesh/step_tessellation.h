@@ -29,10 +29,14 @@ size_t get_short_edge_count(const std::vector<std::pair<Mesh, TopoDS_Face>>& tes
 double find_surface_error_param(const TopoDS_Shape& shape, double min_edge_length,
                                 int max_iterations = 10, double conversion_scale = 1);
 
-// Result of uv_grid_retessellate.  Skipped = the face was deliberately left on the
-// BRepMesh + remeshing path (pinch-point wire, or no interior Steiner points to
-// place); Failed = the CDT was attempted but could not produce a valid interior.
-// In both non-Ok cases the mesh is unchanged.
+// Result of uv_grid_retessellate.
+//   Ok      — CDT applied; caller should skip isotropic remeshing.
+//   Skipped — CDT not applicable for structural reasons (pinch-point wire,
+//             full-period torus, apex-crossing cone, ambiguous domain, or no
+//             interior Steiner points placed); mesh is unchanged; caller should
+//             run isotropic remeshing normally.
+//   Failed  — CDT was attempted but produced an invalid interior; mesh is
+//             unchanged; caller should run isotropic remeshing as fallback.
 enum class UvTessResult { Ok, Skipped, Failed };
 
 // Replace the interior triangulation of `mesh` with a UV-grid CDT tessellation.
@@ -42,8 +46,8 @@ enum class UvTessResult { Ok, Skipped, Failed };
 // dump_dir: when non-empty, write the 2D CDT to <dump_dir>/Face_<face_idx>_CDT.obj
 // for diagnosis (the directory must already exist).
 UvTessResult uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps,
-                                  int v_steps, double min_edge_length, size_t face_idx = 0,
-                                  const std::string& dump_dir = {});
+                                  int v_steps, double min_edge_length, double max_edge_length,
+                                  size_t face_idx = 0, const std::string& dump_dir = {});
 
 // Post-tessellation open boundary loop repair.  Merges the soup by exact vertex
 // position, traces open boundary edges into closed loops, and classifies each by

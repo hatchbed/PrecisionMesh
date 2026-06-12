@@ -898,7 +898,7 @@ int main(int argc, char **argv) {
                 auto steps = get_face_tessellation_steps(segments[i], min_edge_length,
                                                          max_edge_length, max_surface_error);
                 // u=v=1 means the BRepMesh interior is already at target density.
-                if (!cdt_eligible(steps) || (steps.u_steps <= 1 && steps.v_steps <= 1))
+                if (!cdt_eligible(steps))
                     continue;
                 uv_faces.push_back({i, steps.u_steps, steps.v_steps});
                 use_uv_tess[i] = true;
@@ -910,8 +910,8 @@ int main(int argc, char **argv) {
                          uv_faces.size());
             for (auto& f : uv_faces) {
                 auto res = uv_grid_retessellate(meshes[f.idx], segments[f.idx],
-                                                f.u_steps, f.v_steps, min_edge_length, f.idx,
-                                                dump_cdt_dir);
+                                                f.u_steps, f.v_steps, min_edge_length,
+                                                max_edge_length, f.idx, dump_cdt_dir);
                 if (res != UvTessResult::Ok) {
                     use_uv_tess[f.idx] = false;
                     if (res == UvTessResult::Failed)
