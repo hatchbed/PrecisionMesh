@@ -1,9 +1,21 @@
 // Generator for synthetic STEP test parts exercising specific tessellation paths.
 // Usage: gen_test_parts <shape> [output.step]
 // Shapes:
-//   party_hat   Hollow cone shell: outer cone with apex (30 deg semi-angle), identical
-//               inner cone offset down the axis, planar annular ring at the base.
-//               Exercises apex-containing cone faces in the UV-grid CDT path.
+//   party_hat     Hollow cone shell: outer cone with apex (30 deg semi-angle), identical
+//                 inner cone offset down the axis, planar annular ring at the base.
+//                 Exercises apex-containing cone faces in the UV-grid CDT path.
+//   torus_quarter Quarter-tube torus (R=20mm, r=5mm, v in [0, pi/2]), full azimuthal
+//                 revolution.  Exercises torus CDT (varying row_radius, u-seam).
+//   torus_half    Half-tube torus (v in [-pi/2, pi/2]), symmetric about outer equator,
+//                 full azimuthal revolution.  Wider v span than torus_quarter.
+//   donut         Complete torus (both u and v full-period).  Fully-closed face —
+//                 CDT skips (no border loops), falls back to BRepMesh.
+//   donut_c       C-shaped torus: half azimuthal revolution (u in [0, pi]), full tube
+//                 cross-section (v full-period).  CDT skips (v-seam not yet implemented),
+//                 falls back to BRepMesh.
+//   cube          20mm box, all planar faces.  Exercises the all-planar early-return
+//                 path in find_surface_error_param (no arc-forced nodes to calibrate).
+
 
 #include <cmath>
 #include <cstdio>
@@ -12,7 +24,9 @@
 
 #include <BRepAlgoAPI_Cut.hxx>
 #include <BRepBuilderAPI_Transform.hxx>
+#include <BRepPrimAPI_MakeBox.hxx>
 #include <BRepPrimAPI_MakeCone.hxx>
+#include <BRepPrimAPI_MakeTorus.hxx>
 #include <gp_Ax2.hxx>
 #include <gp_Pnt.hxx>
 #include <gp_Trsf.hxx>
@@ -41,12 +55,58 @@ TopoDS_Shape make_party_hat()
     return BRepAlgoAPI_Cut(outer, inner).Shape();
 }
 
+TopoDS_Shape make_torus_quarter()
+{
+    // Quarter-tube torus: R=20mm (tube center to axis), r=5mm (tube radius).
+    // v in [0, π/2] — outer top quarter of the tube cross-section.
+    // Full azimuthal revolution (u in [0, 2π]) exercises the u-seam CDT path.
+    // row_radius varies from R+r (v=0, outer equator) to R (v=π/2, tube top).
+    return BRepPrimAPI_MakeTorus(20.0, 5.0, 0.0, M_PI / 2.0).Shape();
+}
+
+TopoDS_Shape make_torus_half()
+{
+    // Half-tube torus: R=20mm, r=5mm, v in [-π/2, π/2].
+    // Symmetric about the outer equator (v=0): row_radius peaks at R+r on the
+    // equator and falls to R at both edges — exercises the full row_radius variation.
+    // Full azimuthal revolution (u in [0, 2π]) — u-seam CDT path.
+    return BRepPrimAPI_MakeTorus(20.0, 5.0, -M_PI / 2.0, M_PI / 2.0).Shape();
+}
+
+TopoDS_Shape make_donut()
+{
+    // Complete torus: R=20mm, r=5mm.  Both u and v are full-period — the BREP
+    // face has no border loops.  CDT skips (fully-closed face), BRepMesh interior.
+    return BRepPrimAPI_MakeTorus(20.0, 5.0).Shape();
+}
+
+TopoDS_Shape make_donut_c()
+{
+    // C-shaped torus: R=20mm, r=5mm, u in [0, π] (half azimuthal revolution).
+    // The tube cross-section is fully closed (v full-period), so CDT skips the
+    // lateral face (v-seam not yet implemented) and falls back to BRepMesh.
+    // The two planar semi-disk caps at u=0 and u=π are non-CDT faces.
+    return BRepPrimAPI_MakeTorus(20.0, 5.0, M_PI).Shape();
+}
+
+TopoDS_Shape make_cube()
+{
+    // 20mm box, all planar faces.  No arc-forced nodes — exercises the early-return
+    // path in find_surface_error_param (no non-planar faces to calibrate against).
+    return BRepPrimAPI_MakeBox(20.0, 20.0, 20.0).Shape();
+}
+
 }  // namespace
 
 int main(int argc, char** argv)
 {
     std::map<std::string, TopoDS_Shape (*)()> shapes = {
-        {"party_hat", make_party_hat},
+        {"party_hat",     make_party_hat},
+        {"torus_quarter", make_torus_quarter},
+        {"torus_half",    make_torus_half},
+        {"donut",         make_donut},
+        {"donut_c",       make_donut_c},
+        {"cube",          make_cube},
     };
 
     if (argc < 2 || !shapes.count(argv[1])) {

@@ -38,7 +38,8 @@ FaceTessellationSteps get_face_tessellation_steps(const TopoDS_Face& face,
 inline bool cdt_eligible(const FaceTessellationSteps& steps)
 {
     return steps.type == CurvedFaceType::Cylinder ||
-           steps.type == CurvedFaceType::Cone;
+           steps.type == CurvedFaceType::Cone ||
+           steps.type == CurvedFaceType::Torus;
 }
 
 // Compute the number of U (angular) and V (axial) parametric subdivisions for a

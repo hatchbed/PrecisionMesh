@@ -38,6 +38,7 @@
 #include <GeomAbs_SurfaceType.hxx>
 #include <GeomAPI_ProjectPointOnCurve.hxx>
 #include <gp_Cone.hxx>
+#include <gp_Torus.hxx>
 #include <gp_Pnt.hxx>
 #include <gp_Pnt2d.hxx>
 #include <gp_Vec.hxx>
@@ -678,8 +679,16 @@ size_t get_short_edge_count(const std::vector<std::pair<Mesh, TopoDS_Face>>& tes
             continue;
         }
 
+        // On faces with no border edges (fully-closed, e.g. a complete torus), the
+        // arc-forced-node signal is absent.  Fall back to counting all edges so the
+        // calibration still converges at the interior tessellation density.
+        bool has_border = false;
+        for (auto e : mesh.edges()) {
+            if (mesh.is_border(e)) { has_border = true; break; }
+        }
+
         for (auto e: mesh.edges()) {
-            if (!mesh.is_border(e)) {
+            if (has_border && !mesh.is_border(e)) {
                 continue;
             }
             auto h = mesh.halfedge(e);
@@ -702,9 +711,23 @@ double find_surface_error_param(const TopoDS_Shape& shape, double min_edge_lengt
 
     double threshold_max = min_edge_length;
     double threshold_min = 0;
-    // Deflection tuning only counts short border edges -- skip the inverted-face repair.
+    // Deflection tuning only counts short border/interior edges -- skip the inverted-face repair.
     const bool kNoRepair = false;
     auto tessellation = tessellate_shape(shape, threshold_max, kNoRepair);
+
+    // For shapes with no non-planar faces (e.g. a box) there are no arc-forced nodes
+    // to calibrate against — planar faces are always skipped by get_short_edge_count.
+    // Return threshold_max directly rather than running a binary search that would
+    // keep halving until it hit the iteration limit.
+    bool has_nonplanar = false;
+    for (const auto& [mesh, face] : tessellation)
+        if (Handle(Geom_Plane)::DownCast(BRep_Tool::Surface(face)).IsNull())
+            { has_nonplanar = true; break; }
+    if (!has_nonplanar) {
+        spdlog::info("  no curved faces — skipping calibration, "
+                     "using threshold = {}", threshold_max * conversion_scale);
+        return threshold_max;
+    }
 
     size_t max_short_edges = get_short_edge_count(tessellation, min_edge_length);
     spdlog::info("  initial short edges: {}", max_short_edges);
@@ -856,17 +879,34 @@ UvTessResult uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_ste
         // r(v) = RefRadius + v*sin(a)  =>  slant distance from apex s(v) = v + RefRadius/sin(a)
         cone_apex_s = gc.RefRadius() / cone_sin;
     }
+    const bool is_torus = surf.GetType() == GeomAbs_Torus;
+    double torus_R = 0.0, torus_r = 0.0;
+    if (is_torus) {
+        gp_Torus gt = surf.Torus();
+        torus_R = gt.MajorRadius();
+        torus_r = gt.MinorRadius();
+    }
     auto to2d = [&](double u, double v) -> std::array<double, 2> {
         if (is_cone) {
             double rho = v + cone_apex_s;
             double theta = u * std::abs(cone_sin);
             return {rho * std::cos(theta), rho * std::sin(theta)};
         }
+        // Cylinder and torus both use a rectangular product embedding:
+        //   cylinder: (u*r, v)    exact isometry, row_radius = r constant
+        //   torus:    (u*R_mid, v*r_min)  best-effort, row_radius varies per ring
+        // In both cases to2d is (u * uv_u_scale, v * uv_v_scale) with a fixed
+        // midpoint scale; the Jacobian is uv_u_scale * uv_v_scale > 0, so
+        // dev_map_reverses = false for both.
         return {u * uv_u_scale, v * uv_v_scale};
     };
-    // 3D circumferential radius at parameter v (per-ring u spacing).
+    // 3D circumferential radius at parameter v (drives per-ring u point count).
+    // Cylinder: constant (= uv_u_scale).
+    // Cone: signed slant distance from the apex times sin(semi-angle).
+    // Torus: R + r*cos(v) — varies so the inner equator gets fewer points than the outer.
     auto row_radius = [&](double v) -> double {
         if (is_cone) return std::max(std::abs((v + cone_apex_s) * cone_sin), 1e-10);
+        if (is_torus) return std::max(torus_R + torus_r * std::cos(v), 1e-10);
         return uv_u_scale;
     };
     // Whether the development map reverses orientation: its Jacobian determinant is
@@ -898,6 +938,21 @@ UvTessResult uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_ste
         }
     }
 
+    // Torus faces fully periodic in V need v-seam pair insertion + v-seam wrap
+    // detection in constraint insertion and oriented_mark — the same machinery as
+    // the u-seam path but for the tube (V) direction.  Not yet implemented; skip
+    // and keep the BRepMesh interior for those faces.  Quarter/half-torus fillets
+    // (the common case) have partial v spans and are NOT affected.
+    if (is_torus && v_per && v_period > 1e-9) {
+        double v_span = std::abs(surf.LastVParameter() - surf.FirstVParameter());
+        if (v_span >= v_period * 0.99) {
+            spdlog::info("uv_grid_retessellate [face {}]: torus face spans full v-period "
+                         "— v-seam machinery not yet implemented, keeping BRepMesh interior",
+                         face_idx);
+            return UvTessResult::Skipped;
+        }
+    }
+
     // 1. Extract ordered border loops by walking border halfedges.  loop_hes[li][i] is
     // the border halfedge whose target is loops[li][i] (source = previous loop vertex);
     // its opposite's triangle tells which side of the loop the surface interior is on
@@ -920,8 +975,9 @@ UvTessResult uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_ste
         if (loop.size() >= 3) { loops.push_back(loop); loop_hes.push_back(hes); }
     }
     if (loops.empty()) {
-        spdlog::warn("uv_grid_retessellate: no border loops found");
-        return UvTessResult::Failed;
+        spdlog::info("uv_grid_retessellate [face {}]: no border loops found "
+                     "(fully-closed face) — keeping BRepMesh interior", face_idx);
+        return UvTessResult::Skipped;
     }
 
     // Bail out on a self-touching wire: two DISTINCT border vertices at the same 3D point
