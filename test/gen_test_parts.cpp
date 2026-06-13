@@ -13,6 +13,12 @@
 //   donut_c       C-shaped torus: half azimuthal revolution (u in [0, pi]), full tube
 //                 cross-section (v full-period).  CDT skips (v-seam not yet implemented),
 //                 falls back to BRepMesh.
+//   vase          Closed B-spline profile revolved full 2pi about Z into a SOLID (outer
+//                 wall = genuine Geom_SurfaceOfRevolution r in [7,15]mm, inner wall =
+//                 cylinder r=5, planar annular caps).  Exercises revolution CDT: arc-length
+//                 V development, curvature-driven V spacing, and the u-seam path.
+//   vase_wedge    Same profile revolved 90deg into a solid wedge — partial-u outer wall
+//                 plus planar side caps, the simplest revolution CDT case (no seam).
 //   cube          20mm box, all planar faces.  Exercises the all-planar early-return
 //                 path in find_surface_error_param (no arc-forced nodes to calibrate).
 
@@ -23,16 +29,28 @@
 #include <string>
 
 #include <BRepAlgoAPI_Cut.hxx>
+#include <BRepBuilderAPI_MakeEdge.hxx>
+#include <BRepBuilderAPI_MakeFace.hxx>
+#include <BRepBuilderAPI_MakeWire.hxx>
 #include <BRepBuilderAPI_Transform.hxx>
 #include <BRepPrimAPI_MakeBox.hxx>
 #include <BRepPrimAPI_MakeCone.hxx>
+#include <BRepPrimAPI_MakeRevol.hxx>
 #include <BRepPrimAPI_MakeTorus.hxx>
+#include <Geom_BSplineCurve.hxx>
+#include <GeomAPI_PointsToBSpline.hxx>
+#include <gp_Ax1.hxx>
 #include <gp_Ax2.hxx>
+#include <gp_Dir.hxx>
 #include <gp_Pnt.hxx>
 #include <gp_Trsf.hxx>
 #include <gp_Vec.hxx>
 #include <STEPControl_Writer.hxx>
+#include <TColgp_Array1OfPnt.hxx>
+#include <TopoDS_Edge.hxx>
+#include <TopoDS_Face.hxx>
 #include <TopoDS_Shape.hxx>
+#include <TopoDS_Wire.hxx>
 
 namespace {
 
@@ -89,6 +107,50 @@ TopoDS_Shape make_donut_c()
     return BRepPrimAPI_MakeTorus(20.0, 5.0, M_PI).Shape();
 }
 
+// Revolve a CLOSED planar profile (in the XZ plane) into a SOLID about the Z axis.  The
+// outer wall is a curved B-spline → a genuine Geom_SurfaceOfRevolution (analytic profiles
+// would downcast to cylinder/cone/sphere/torus and never reach the revolution path); the
+// inner wall is a cylinder, the top/bottom are planar annuli.  Building a solid (not a bare
+// open face) gives BRepMesh well-formed boundary loops — a lone revolved EDGE produces a
+// single open face with a degenerate boundary that BRepMesh fans badly.  The outer profile
+// stays in r ∈ [7, 15] mm (clear of the axis, no pole), its bulge gives real curvature
+// (exercises sagitta-driven V spacing), and the non-uniform B-spline parameterisation
+// exercises arc-length V development.
+TopoDS_Shape make_vase_revol(double angle)
+{
+    // Outer wall: curved B-spline from (8,0,0) up to (9,0,30) — the surface under test.
+    TColgp_Array1OfPnt pts(1, 6);
+    pts.SetValue(1, gp_Pnt( 8.0, 0.0,  0.0));
+    pts.SetValue(2, gp_Pnt(12.0, 0.0,  5.0));
+    pts.SetValue(3, gp_Pnt(15.0, 0.0, 12.0));
+    pts.SetValue(4, gp_Pnt(10.0, 0.0, 20.0));
+    pts.SetValue(5, gp_Pnt( 7.0, 0.0, 26.0));
+    pts.SetValue(6, gp_Pnt( 9.0, 0.0, 30.0));
+    Handle(Geom_BSplineCurve) outer = GeomAPI_PointsToBSpline(pts).Curve();
+
+    // Close the profile into a planar loop offset from the axis (inner wall at r=5, so no
+    // pole): outer(bot→top) → top cap → inner wall(top→bot) → bottom cap.
+    gp_Pnt top_out(9.0, 0.0, 30.0), top_in(5.0, 0.0, 30.0),
+           bot_in(5.0, 0.0, 0.0),   bot_out(8.0, 0.0, 0.0);
+    BRepBuilderAPI_MakeWire mw;
+    mw.Add(BRepBuilderAPI_MakeEdge(outer).Edge());
+    mw.Add(BRepBuilderAPI_MakeEdge(top_out, top_in).Edge());
+    mw.Add(BRepBuilderAPI_MakeEdge(top_in, bot_in).Edge());
+    mw.Add(BRepBuilderAPI_MakeEdge(bot_in, bot_out).Edge());
+    TopoDS_Face profile = BRepBuilderAPI_MakeFace(mw.Wire(), /*OnlyPlane=*/true).Face();
+
+    gp_Ax1 z_axis(gp_Pnt(0, 0, 0), gp_Dir(0, 0, 1));
+    return BRepPrimAPI_MakeRevol(profile, z_axis, angle).Shape();
+}
+
+// Full 2π revolution: the outer wall is a u-periodic surface of revolution (exercises the
+// u-seam path on a revolution), arc-length V, curvature-driven V spacing.
+TopoDS_Shape make_vase()        { return make_vase_revol(2.0 * M_PI); }
+
+// 90° wedge: partial-u outer wall + planar side caps — the simplest revolution CDT case
+// (no seam).
+TopoDS_Shape make_vase_wedge()  { return make_vase_revol(M_PI / 2.0); }
+
 TopoDS_Shape make_cube()
 {
     // 20mm box, all planar faces.  No arc-forced nodes — exercises the early-return
@@ -106,6 +168,8 @@ int main(int argc, char** argv)
         {"torus_half",    make_torus_half},
         {"donut",         make_donut},
         {"donut_c",       make_donut_c},
+        {"vase",          make_vase},
+        {"vase_wedge",    make_vase_wedge},
         {"cube",          make_cube},
     };
 

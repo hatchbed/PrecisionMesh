@@ -39,7 +39,8 @@ inline bool cdt_eligible(const FaceTessellationSteps& steps)
 {
     return steps.type == CurvedFaceType::Cylinder ||
            steps.type == CurvedFaceType::Cone ||
-           steps.type == CurvedFaceType::Torus;
+           steps.type == CurvedFaceType::Torus ||
+           steps.type == CurvedFaceType::Revolution;
 }
 
 // Compute the number of U (angular) and V (axial) parametric subdivisions for a

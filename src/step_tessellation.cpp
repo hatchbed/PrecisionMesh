@@ -35,8 +35,11 @@
 #include <Geom_Plane.hxx>
 #include <GProp_GProps.hxx>
 #include <Geom_Surface.hxx>
+#include <Geom_Curve.hxx>
+#include <Geom_SurfaceOfRevolution.hxx>
 #include <GeomAbs_SurfaceType.hxx>
 #include <GeomAPI_ProjectPointOnCurve.hxx>
+#include <gp_Ax1.hxx>
 #include <gp_Cone.hxx>
 #include <gp_Torus.hxx>
 #include <gp_Pnt.hxx>
@@ -886,11 +889,85 @@ UvTessResult uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_ste
         torus_R = gt.MajorRadius();
         torus_r = gt.MinorRadius();
     }
+
+    // Surface of revolution: U = revolution angle (periodic, like a cylinder), V = profile-
+    // curve parameter.  A general revolution is NOT developable, so the map is best-effort
+    // like the torus — BUT, unlike every implemented type, |dS/dv| = |profile'(v)| is not
+    // constant, so V cannot develop as v*uv_v_scale.  Develop V as the profile ARC LENGTH
+    // s(v) (a dense sampled, monotone table; |dS/dv| = |P'(v)| since S(u,v)=rotate(P(v),u)),
+    // and the per-ring circumferential radius is r(v) = distance from the axis.  uv_u_scale
+    // (midpoint |dS/du| = r(v_mid)) is the constant u-scale; row_radius(v) refines the
+    // per-ring point count (torus precedent).
+    const bool is_revolution = surf.GetType() == GeomAbs_SurfaceOfRevolution;
+    gp_Ax1 rev_axis;
+    Handle(Geom_Curve) rev_curve;
+    std::vector<double> rev_v_tab, rev_s_tab;   // monotone v -> cumulative profile arc length
+    double rev_r_min = std::numeric_limits<double>::max();
+    double rev_min_speed = std::numeric_limits<double>::max();
+    auto rev_radius_at = [&](double v) -> double {
+        gp_Pnt p = rev_curve->Value(v);
+        gp_Vec op(rev_axis.Location(), p);
+        gp_Vec ax(rev_axis.Direction());
+        double along = op.Dot(ax);
+        return (op - ax * along).Magnitude();
+    };
+    if (is_revolution) {
+        Handle(Geom_SurfaceOfRevolution) grev =
+            Handle(Geom_SurfaceOfRevolution)::DownCast(BRep_Tool::Surface(face));
+        // A trimmed/offset wrapper would downcast to null; leaving the arc-length table
+        // empty makes the singular-profile gate below Skip cleanly (no crash).
+        if (!grev.IsNull()) {
+        rev_axis  = grev->Axis();
+        rev_curve = grev->BasisCurve();
+        double v0 = surf.FirstVParameter(), v1 = surf.LastVParameter();
+        const int NS = 256;
+        rev_v_tab.reserve(NS + 1);
+        rev_s_tab.reserve(NS + 1);
+        double acc = 0.0, prev_speed = 0.0;
+        for (int i = 0; i <= NS; i++) {
+            double v = v0 + (v1 - v0) * i / NS;
+            gp_Pnt p; gp_Vec d1;
+            rev_curve->D1(v, p, d1);
+            double speed = d1.Magnitude();
+            if (i > 0) acc += 0.5 * (speed + prev_speed) * (v1 - v0) / NS;
+            prev_speed = speed;
+            rev_v_tab.push_back(v);
+            rev_s_tab.push_back(acc);
+            rev_min_speed = std::min(rev_min_speed, speed);
+            rev_r_min = std::min(rev_r_min, rev_radius_at(v));
+        }
+        }  // if (!grev.IsNull())
+    }
+    auto rev_s_of_v = [&](double v) -> double {
+        if (rev_v_tab.empty()) return 0.0;
+        if (v <= rev_v_tab.front()) return rev_s_tab.front();
+        if (v >= rev_v_tab.back())  return rev_s_tab.back();
+        auto it = std::lower_bound(rev_v_tab.begin(), rev_v_tab.end(), v);
+        size_t k = it - rev_v_tab.begin();
+        double t = (v - rev_v_tab[k-1]) / (rev_v_tab[k] - rev_v_tab[k-1]);
+        return rev_s_tab[k-1] + t * (rev_s_tab[k] - rev_s_tab[k-1]);
+    };
+    auto rev_v_of_s = [&](double s) -> double {
+        if (rev_s_tab.empty()) return 0.0;
+        if (s <= rev_s_tab.front()) return rev_v_tab.front();
+        if (s >= rev_s_tab.back())  return rev_v_tab.back();
+        auto it = std::lower_bound(rev_s_tab.begin(), rev_s_tab.end(), s);
+        size_t k = it - rev_s_tab.begin();
+        double ds = rev_s_tab[k] - rev_s_tab[k-1];
+        double t = ds > 0 ? (s - rev_s_tab[k-1]) / ds : 0.0;
+        return rev_v_tab[k-1] + t * (rev_v_tab[k] - rev_v_tab[k-1]);
+    };
+
     auto to2d = [&](double u, double v) -> std::array<double, 2> {
         if (is_cone) {
             double rho = v + cone_apex_s;
             double theta = u * std::abs(cone_sin);
             return {rho * std::cos(theta), rho * std::sin(theta)};
+        }
+        if (is_revolution) {
+            // Rectangular best-effort: u scaled by the midpoint radius, v as profile arc
+            // length.  Jacobian = uv_u_scale * s'(v) > 0, so dev_map_reverses = false.
+            return {u * uv_u_scale, rev_s_of_v(v)};
         }
         // Cylinder and torus both use a rectangular product embedding:
         //   cylinder: (u*r, v)    exact isometry, row_radius = r constant
@@ -907,6 +984,7 @@ UvTessResult uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_ste
     auto row_radius = [&](double v) -> double {
         if (is_cone) return std::max(std::abs((v + cone_apex_s) * cone_sin), 1e-10);
         if (is_torus) return std::max(torus_R + torus_r * std::cos(v), 1e-10);
+        if (is_revolution) return std::max(rev_radius_at(v), 1e-10);
         return uv_u_scale;
     };
     // Whether the development map reverses orientation: its Jacobian determinant is
@@ -949,6 +1027,38 @@ UvTessResult uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_ste
             spdlog::info("uv_grid_retessellate [face {}]: torus face spans full v-period "
                          "— v-seam machinery not yet implemented, keeping BRepMesh interior",
                          face_idx);
+            return UvTessResult::Skipped;
+        }
+    }
+
+    // Revolution corner cases — keep the BRepMesh interior (never guess):
+    //   - Pole: the profile meets the axis (r->0).  The rectangular development cannot
+    //     represent a pole (a zero-radius ring is one 3D point but a full horizontal dev
+    //     line), and there is no analytic apex form like the cone's.
+    //   - Closed profile (v-periodic): needs v-seam machinery (same as the torus full-v
+    //     case above), not yet implemented.
+    //   - Singular/cusped profile: arc length is not strictly increasing, so the s<->v
+    //     inversion is ill-defined.
+    if (is_revolution) {
+        if (rev_r_min < std::max(min_edge_length, 0.5 * target)) {
+            spdlog::info("uv_grid_retessellate [face {}]: revolution profile reaches the axis "
+                         "(r_min={:.4g}) — pole has no rectangular development, keeping "
+                         "BRepMesh interior", face_idx, rev_r_min);
+            return UvTessResult::Skipped;
+        }
+        if (v_per && v_period > 1e-9) {
+            double v_span = std::abs(surf.LastVParameter() - surf.FirstVParameter());
+            if (v_span >= v_period * 0.99) {
+                spdlog::info("uv_grid_retessellate [face {}]: revolution profile is closed "
+                             "(full v-period) — v-seam machinery not yet implemented, keeping "
+                             "BRepMesh interior", face_idx);
+                return UvTessResult::Skipped;
+            }
+        }
+        if (rev_min_speed < 1e-7 || rev_s_tab.empty() || rev_s_tab.back() <= 1e-9) {
+            spdlog::info("uv_grid_retessellate [face {}]: revolution profile is singular/cusped "
+                         "(min speed={:.4g}) — arc-length development ill-defined, keeping "
+                         "BRepMesh interior", face_idx, rev_min_speed);
             return UvTessResult::Skipped;
         }
     }
@@ -1113,9 +1223,9 @@ UvTessResult uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_ste
     }
 
     spdlog::debug("uv_grid_retessellate [face {}]: u_scale={:.4f} v_scale={:.4f} "
-                  "target={:.4f} dv_step={:.4f} u_per={} cone={} loops={}",
+                  "target={:.4f} dv_step={:.4f} u_per={} cone={} rev={} loops={}",
                   face_idx, uv_u_scale, uv_v_scale, target, uv_dv_step,
-                  u_per, is_cone, (int)loops.size());
+                  u_per, is_cone, is_revolution, (int)loops.size());
 
     // 3. Build CDT. vertex handle → index in unified vertex table.
     //    Border vertices:  index 0 .. N_border-1  → border_mesh_verts[i]
@@ -1300,11 +1410,22 @@ UvTessResult uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_ste
                 // both borders, which is always > border_clearance (= 0.25*dv_step) when
                 // v_span > 0.5*dv_step.
                 std::vector<double> ring_vs;
-                for (double v = v_lo_ring + uv_dv_step; v < v_hi_ring - uv_dv_step * 0.5;
-                     v += uv_dv_step)
-                    ring_vs.push_back(v);
-                if (ring_vs.empty() && v_hi_ring - v_lo_ring > uv_dv_step)
-                    ring_vs.push_back((v_lo_ring + v_hi_ring) / 2.0);
+                if (is_revolution) {
+                    // Rows at uniform PROFILE ARC LENGTH (|dS/dv| varies), inverted back to
+                    // the v parameter for evaluation.  Spacing is `target` in true 3D arc
+                    // length (uv_dv_step is only a midpoint-param approximation here).
+                    double s_lo = rev_s_of_v(v_lo_ring), s_hi = rev_s_of_v(v_hi_ring);
+                    for (double s = s_lo + target; s < s_hi - target * 0.5; s += target)
+                        ring_vs.push_back(rev_v_of_s(s));
+                    if (ring_vs.empty() && (s_hi - s_lo) > target)
+                        ring_vs.push_back(rev_v_of_s((s_lo + s_hi) / 2.0));
+                } else {
+                    for (double v = v_lo_ring + uv_dv_step; v < v_hi_ring - uv_dv_step * 0.5;
+                         v += uv_dv_step)
+                        ring_vs.push_back(v);
+                    if (ring_vs.empty() && v_hi_ring - v_lo_ring > uv_dv_step)
+                        ring_vs.push_back((v_lo_ring + v_hi_ring) / 2.0);
+                }
 
                 // For non-seam faces where all rings carry only one interior u-point
                 // (n_k rounds to 1, bumped to 2), the uniform v-step grid is typically
@@ -1317,8 +1438,11 @@ UvTessResult uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_ste
                 // close-pair levels that split_border_edges can produce (~0.28 mm apart
                 // for torus/complex faces) which would otherwise create sliver triangles.
                 {
+                    // Skip for revolution: this narrow-face snap reasons in param-space
+                    // gaps (uv_dv_step), which are not metric for a non-constant-|dS/dv|
+                    // profile; the arc-length rows above are already metric-correct.
                     const bool could_be_seam_row = seam_skipped && u_per && u_period > 1e-9;
-                    if (!could_be_seam_row) {
+                    if (!could_be_seam_row && !is_revolution) {
                         const double u_span_sc = std::max(u_max_g - u_min_g, 1e-12);
                         const double r_at_mid = row_radius((v_lo_ring + v_hi_ring) / 2.0);
                         const int n_k_mid = std::max(1, (int)std::round(u_span_sc * r_at_mid / target));

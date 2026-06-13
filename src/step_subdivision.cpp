@@ -14,6 +14,7 @@
 #include <BRepTools.hxx>
 #include <Geom_Curve.hxx>
 #include <Geom2d_Line.hxx>
+#include <GeomLProp_CLProps.hxx>
 #include <gp_Pnt.hxx>
 #include <gp_Vec.hxx>
 #include <ShapeFix_Edge.hxx>
@@ -254,7 +255,50 @@ std::pair<int,int> compute_revolution_steps(const Geom_SurfaceOfRevolution& revo
         }
     }
 
-    return {u_steps, 1};
+    // V (profile) subdivision.  Unlike a cylinder/cone whose V is a straight ruling,
+    // the revolution profile is a general curve: its arc length is NOT proportional to
+    // the parameter, and it carries its own curvature.  The UV-grid CDT path owns the
+    // interior (it does not lean on isotropic remeshing for V), so size V rows from
+    // BOTH the profile arc length (edge-length budget) and the profile's tightest
+    // radius of curvature (sagitta) — mirroring compute_torus_steps for the tube.
+    // (The old subdivision path left V to remeshing and returned v_steps=1; that path
+    // is now bypassed for revolution faces, which are CDT-eligible.)
+    int v_steps = 1;
+    {
+        const int num_v_samples = 40;
+        double profile_len = 0.0;
+        double rho_min = std::numeric_limits<double>::max();
+        gp_Vec d_prev;
+        GeomLProp_CLProps clp(basis_curve, 2, 1e-7);
+        for (int i = 0; i <= num_v_samples; i++) {
+            double v = v1 + (v2 - v1) * i / num_v_samples;
+            gp_Pnt p; gp_Vec d1;
+            basis_curve->D1(v, p, d1);
+            if (i > 0) profile_len += 0.5 * (d1.Magnitude() + d_prev.Magnitude())
+                                          * (v2 - v1) / num_v_samples;
+            d_prev = d1;
+            clp.SetParameter(v);
+            if (clp.IsTangentDefined()) {
+                double k = clp.Curvature();
+                if (k > 1e-12) rho_min = std::min(rho_min, 1.0 / k);
+            }
+        }
+        spdlog::debug("  profile arc length: {}", profile_len);
+        spdlog::debug("  profile min radius of curvature: {}", rho_min);
+
+        double v_chord = max_edge_length;
+        if (rho_min < std::numeric_limits<double>::max() &&
+            max_surface_error / rho_min <= 2) {
+            double v_angle = 2 * std::acos(1 - max_surface_error / rho_min);
+            v_chord = std::min(v_chord, 2 * rho_min * std::sin(v_angle / 2));
+        }
+        if (v_chord > 0 && profile_len > v_chord) {
+            v_steps = static_cast<int>(std::ceil(profile_len / v_chord));
+            spdlog::debug("  V steps: {}", v_steps);
+        }
+    }
+
+    return {u_steps, v_steps};
 }
 
 std::pair<int,int> compute_extrusion_steps(const Geom_SurfaceOfLinearExtrusion& /*extrusion*/,
