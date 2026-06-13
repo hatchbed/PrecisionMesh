@@ -1698,6 +1698,254 @@ UvTessResult uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_ste
             return UvTessResult::Failed;
         }
 
+        // ----------------------------------------------------------------------
+        // Degenerate border-fan repair.
+        //
+        // When this curved face shares an edge with a thin/sliver neighbour face,
+        // the neighbour's BRepMesh samples the shared edge densely (many nearly
+        // collinear vertices spaced far below the ring pitch).  Those vertices are
+        // frozen border constraints here, so CDT triangulates the thin strip near
+        // them as a fan of near-zero-area triangles anchored at one run endpoint.
+        // The neighbour produced the identical degenerate fan on its side, so the
+        // fan's interior chord edges end up incident to 4 triangles → non-manifold
+        // (turbine blade faces 544/136/128).  The marking pass above only drops
+        // truly machine-zero slivers; these survive because they have a tiny but
+        // non-zero area, and raising that threshold would merely notch the border
+        // into open edges.
+        //
+        // Repair: find each connected group of degenerate all-border triangles,
+        // treat it as a collinear border run r0..rk closed by one good triangle
+        // whose third vertex W is the fan apex, and replace {fan ∪ closing tri}
+        // with a fan from W: (W, r_i, r_{i+1}).  W is off the run line, so the new
+        // triangles are non-degenerate and each border segment is covered exactly
+        // once — manifold with the neighbour, matching what BRepMesh produces.  If
+        // a group is not a clean single-apex run, or the result fails the within-
+        // face manifold check, return Failed so the caller falls back to BRepMesh.
+        {
+            const size_t N_b = border_mesh_verts.size();
+            const size_t N_t = N_b + interior_info.size();
+            auto is_border = [&](size_t i) { return i < N_b; };
+
+            // Development-plane (u,v) and 3D position per combined vertex index.
+            std::vector<std::array<double, 2>> dev_xy(N_t, {{0.0, 0.0}});
+            for (auto v = cdt.finite_vertices_begin(); v != cdt.finite_vertices_end(); ++v) {
+                auto it = vh_to_idx.find(v);
+                if (it != vh_to_idx.end() && it->second < N_t)
+                    dev_xy[it->second] = {v->point().x(), v->point().y()};
+            }
+            std::vector<gp_Pnt> pt3d(N_t);
+            for (size_t i = 0; i < N_b; i++) {
+                auto p = mesh.point(border_mesh_verts[i]);
+                pt3d[i] = gp_Pnt(CGAL::to_double(p.x()), CGAL::to_double(p.y()),
+                                 CGAL::to_double(p.z()));
+            }
+            for (size_t i = 0; i < interior_info.size(); i++)
+                pt3d[N_b + i] = interior_info[i].first;
+
+            // Shape quality 4*sqrt(3)*Area / sum(edge^2) in 3D: 1 = equilateral,
+            // -> 0 = degenerate sliver.  Map-independent (works for the torus best-
+            // effort development too).  Slivers measure < 0.03, the thin fan-closing
+            // triangles ~0.07, healthy triangles > 0.4 — so 0.05 isolates slivers.
+            auto quality = [&](size_t a, size_t b, size_t c) -> double {
+                const gp_Pnt &A = pt3d[a], &B = pt3d[b], &C = pt3d[c];
+                double ux = B.X()-A.X(), uy = B.Y()-A.Y(), uz = B.Z()-A.Z();
+                double vx = C.X()-A.X(), vy = C.Y()-A.Y(), vz = C.Z()-A.Z();
+                double wx = C.X()-B.X(), wy = C.Y()-B.Y(), wz = C.Z()-B.Z();
+                double cx = uy*vz-uz*vy, cy = uz*vx-ux*vz, cz = ux*vy-uy*vx;
+                double two_area = std::sqrt(cx*cx + cy*cy + cz*cz);
+                double sum_e2 = (ux*ux+uy*uy+uz*uz) + (vx*vx+vy*vy+vz*vz)
+                              + (wx*wx+wy*wy+wz*wz);
+                if (sum_e2 < 1e-30) return 0.0;
+                return 2.0 * 1.7320508075688772 * two_area / sum_e2;
+            };
+            const double kSliverQuality = 0.05;
+
+            // Border-loop segments in combined-index space (consecutive pairs,
+            // excluding each loop's closing/seam-wrap edge — matches the constraint
+            // insertion rule above).  Used to tell a run's border edges from chords.
+            auto edge_key = [](size_t x, size_t y) {
+                return x < y ? std::make_pair(x, y) : std::make_pair(y, x);
+            };
+            std::set<std::pair<size_t, size_t>> border_seg;
+            std::vector<std::vector<size_t>> bl(loops.size());
+            for (size_t li = 0; li < loops.size(); li++) {
+                for (auto vh : loop_vhs[li]) bl[li].push_back(vh_to_idx[vh]);
+                for (size_t p = 0; p + 1 < bl[li].size(); p++)
+                    if (bl[li][p] != bl[li][p + 1])
+                        border_seg.insert(edge_key(bl[li][p], bl[li][p + 1]));
+            }
+
+            // Edge -> incident cdt_tris indices, over the current triangle set.
+            auto build_edge_map = [&]() {
+                std::map<std::pair<size_t, size_t>, std::vector<size_t>> em;
+                for (size_t ti = 0; ti < cdt_tris.size(); ti++) {
+                    const auto& t = cdt_tris[ti];
+                    em[edge_key(t.a, t.b)].push_back(ti);
+                    em[edge_key(t.b, t.c)].push_back(ti);
+                    em[edge_key(t.c, t.a)].push_back(ti);
+                }
+                return em;
+            };
+
+            // Identify degenerate all-border triangles (the sliver fans).
+            std::vector<size_t> sliver;
+            for (size_t ti = 0; ti < cdt_tris.size(); ti++) {
+                const auto& t = cdt_tris[ti];
+                if (is_border(t.a) && is_border(t.b) && is_border(t.c)
+                    && quality(t.a, t.b, t.c) < kSliverQuality)
+                    sliver.push_back(ti);
+            }
+
+            bool repair_failed = false;
+            if (!sliver.empty()) {
+                auto em = build_edge_map();
+                std::set<size_t> sliver_set(sliver.begin(), sliver.end());
+                std::vector<char> visited(cdt_tris.size(), 0);
+                std::set<size_t> to_remove;
+                std::vector<CdtTri> to_add;
+                int n_runs = 0;
+
+                for (size_t s : sliver) {
+                    if (visited[s]) continue;
+                    // Grow the connected component of slivers sharing edges.
+                    std::vector<size_t> comp;
+                    std::vector<size_t> stack{s};
+                    visited[s] = 1;
+                    while (!stack.empty()) {
+                        size_t ti = stack.back(); stack.pop_back();
+                        comp.push_back(ti);
+                        const auto& t = cdt_tris[ti];
+                        std::array<std::pair<size_t,size_t>,3> es = {{
+                            edge_key(t.a,t.b), edge_key(t.b,t.c), edge_key(t.c,t.a)}};
+                        for (auto& e : es)
+                            for (size_t nb : em[e])
+                                if (sliver_set.count(nb) && !visited[nb]) {
+                                    visited[nb] = 1; stack.push_back(nb);
+                                }
+                    }
+
+                    // Boundary edges of the component (incident to exactly one of
+                    // its triangles).  Split into border-loop segments vs chords.
+                    std::map<std::pair<size_t,size_t>, int> ecnt;
+                    for (size_t ti : comp) {
+                        const auto& t = cdt_tris[ti];
+                        ecnt[edge_key(t.a,t.b)]++;
+                        ecnt[edge_key(t.b,t.c)]++;
+                        ecnt[edge_key(t.c,t.a)]++;
+                    }
+                    std::vector<std::pair<size_t,size_t>> run_edges, chords;
+                    for (auto& [e, c] : ecnt) {
+                        if (c != 1) continue;            // interior to the component
+                        if (border_seg.count(e)) run_edges.push_back(e);
+                        else chords.push_back(e);
+                    }
+
+                    // A clean run: the border-segment boundary edges form a single
+                    // simple path (two degree-1 endpoints, the rest degree 2) and
+                    // there is exactly one chord closing it.
+                    std::map<size_t,int> deg;
+                    for (auto& e : run_edges) { deg[e.first]++; deg[e.second]++; }
+                    std::vector<size_t> ends;
+                    bool path_ok = !run_edges.empty();
+                    for (auto& [v, d] : deg) {
+                        if (d == 1) ends.push_back(v);
+                        else if (d != 2) path_ok = false;
+                    }
+                    if (!path_ok || ends.size() != 2 || chords.size() != 1) {
+                        repair_failed = true; break;
+                    }
+                    // Walk the path from one endpoint to the other.
+                    std::map<size_t, std::vector<size_t>> adj;
+                    for (auto& e : run_edges) {
+                        adj[e.first].push_back(e.second);
+                        adj[e.second].push_back(e.first);
+                    }
+                    std::vector<size_t> run;
+                    {
+                        size_t prev = (size_t)-1, cur = ends[0];
+                        run.push_back(cur);
+                        while (true) {
+                            size_t nxt = (size_t)-1;
+                            for (size_t w : adj[cur]) if (w != prev) { nxt = w; break; }
+                            if (nxt == (size_t)-1) break;
+                            run.push_back(nxt); prev = cur; cur = nxt;
+                        }
+                    }
+                    // The chord must join the two run endpoints.
+                    auto chord = chords[0];
+                    if (edge_key(run.front(), run.back()) != chord) {
+                        repair_failed = true; break;
+                    }
+                    // Apex = third vertex of the single good triangle on the chord.
+                    size_t apex = (size_t)-1; int n_good_on_chord = 0;
+                    for (size_t ti : em[chord]) {
+                        if (sliver_set.count(ti)) continue;
+                        const auto& t = cdt_tris[ti];
+                        size_t third = t.a;
+                        if (third == chord.first || third == chord.second) third = t.b;
+                        if (third == chord.first || third == chord.second) third = t.c;
+                        apex = third; n_good_on_chord++;
+                        to_remove.insert(ti);            // closing tri is replaced too
+                    }
+                    if (n_good_on_chord != 1 || apex == run.front() || apex == run.back()) {
+                        repair_failed = true; break;
+                    }
+
+                    // Replace: drop the fan, fan the run from the apex instead.
+                    for (size_t ti : comp) to_remove.insert(ti);
+                    for (size_t i = 0; i + 1 < run.size(); i++) {
+                        size_t ra = run[i], rb = run[i + 1];
+                        // Orient CCW in development coords (CGAL finite faces are
+                        // CCW; the uniform winding flip below relies on that).
+                        const auto& W = dev_xy[apex];
+                        const auto& Pa = dev_xy[ra];
+                        const auto& Pb = dev_xy[rb];
+                        double sgn = (Pa[0]-W[0])*(Pb[1]-W[1]) - (Pb[0]-W[0])*(Pa[1]-W[1]);
+                        if (sgn < 0) std::swap(ra, rb);
+                        to_add.push_back({apex, ra, rb});
+                    }
+                    n_runs++;
+                }
+
+                if (!repair_failed) {
+                    std::vector<CdtTri> rebuilt;
+                    rebuilt.reserve(cdt_tris.size() - to_remove.size() + to_add.size());
+                    for (size_t ti = 0; ti < cdt_tris.size(); ti++)
+                        if (!to_remove.count(ti)) rebuilt.push_back(cdt_tris[ti]);
+                    for (auto& t : to_add) rebuilt.push_back(t);
+
+                    // Within-face manifold check: every edge incident to <=2 tris,
+                    // and any edge with a single incident tri must be a border edge
+                    // (a dangling interior edge means the refan opened a hole).
+                    std::map<std::pair<size_t,size_t>, int> chk;
+                    for (auto& t : rebuilt) {
+                        chk[edge_key(t.a,t.b)]++;
+                        chk[edge_key(t.b,t.c)]++;
+                        chk[edge_key(t.c,t.a)]++;
+                    }
+                    for (auto& [e, c] : chk) {
+                        if (c > 2) { repair_failed = true; break; }
+                        if (c == 1 && !(is_border(e.first) && is_border(e.second))) {
+                            repair_failed = true; break;
+                        }
+                    }
+                    if (!repair_failed) {
+                        spdlog::debug("uv_grid_retessellate [face {}]: border-fan repair "
+                                      "fixed {} run(s) ({} sliver tris -> {} fan tris)",
+                                      face_idx, n_runs, to_remove.size(), to_add.size());
+                        cdt_tris.swap(rebuilt);
+                    }
+                }
+            }
+
+            if (repair_failed) {
+                spdlog::info("uv_grid_retessellate [face {}]: degenerate border slivers "
+                             "could not be cleanly repaired — falling back to BRepMesh",
+                             face_idx);
+                return UvTessResult::Failed;
+            }
+        }
+
         // Diagnostic export of the 2D CDT (--dump-cdt-obj <dir>).
         if (!dump_dir.empty()) {
             std::string obj_path = (std::filesystem::path(dump_dir) /
