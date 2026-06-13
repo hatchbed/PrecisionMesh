@@ -2001,7 +2001,8 @@ UvTessResult uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_ste
                         repair_failed = true; break;
                     }
                     // Apex = third vertex of the single good triangle on the chord.
-                    size_t apex = (size_t)-1; int n_good_on_chord = 0;
+                    size_t apex = (size_t)-1, closing_ti = (size_t)-1;
+                    int n_good_on_chord = 0;
                     for (size_t ti : em[chord]) {
                         if (sliver_set.count(ti)) continue;
                         const auto& t = cdt_tris[ti];
@@ -2009,13 +2010,59 @@ UvTessResult uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_ste
                         if (third == chord.first || third == chord.second) third = t.b;
                         if (third == chord.first || third == chord.second) third = t.c;
                         apex = third; n_good_on_chord++;
-                        to_remove.insert(ti);            // closing tri is replaced too
+                        closing_ti = ti;                 // closing tri would be replaced too
                     }
                     if (n_good_on_chord != 1 || apex == run.front() || apex == run.back()) {
                         repair_failed = true; break;
                     }
 
-                    // Replace: drop the fan, fan the run from the apex instead.
+                    // Refan vs. keep-original decision — hinges on whether the run lies
+                    // along a single BREP edge or wraps a corner between two edges:
+                    //
+                    //  • Single-edge (collinear) run: the densely-sampled cluster and the
+                    //    sliver-fan apex are all on the *same* shared edge, so the fan's
+                    //    interior chords run along that edge and coincide with the
+                    //    neighbour's identical fan → a cross-face non-manifold edge.  This
+                    //    is the defect the repair exists to remove (turbine 544/136/128),
+                    //    so we MUST refan to a different apex to break the shared chords.
+                    //
+                    //  • Corner-wrapping run: the run turns from one edge onto another
+                    //    (e.g. propeller face 78 — a right-edge vertex followed by a
+                    //    collinear cluster on the bottom edge).  Its chords join vertices
+                    //    on *different* edges, so no single neighbour shares both endpoints
+                    //    and they cannot go non-manifold.  Refanning here is pointless and
+                    //    in fact degenerate (the chord-apex lands collinear with the
+                    //    cluster), so we KEEP the original CDT triangulation — already the
+                    //    only valid, manifold, cross-face-safe option — and skip this run.
+                    //
+                    // Detect the corner by a sharp turn (> 45°) between consecutive run
+                    // segments in development coordinates; the over-sampled cluster bends
+                    // only by sampling noise, a real edge-to-edge corner turns sharply.
+                    bool wraps_corner = false;
+                    for (size_t i = 1; i + 1 < run.size() && !wraps_corner; i++) {
+                        const auto& P0 = dev_xy[run[i - 1]];
+                        const auto& P1 = dev_xy[run[i]];
+                        const auto& P2 = dev_xy[run[i + 1]];
+                        double ax = P1[0]-P0[0], ay = P1[1]-P0[1];
+                        double bx = P2[0]-P1[0], by = P2[1]-P1[1];
+                        double la = std::hypot(ax, ay), lb = std::hypot(bx, by);
+                        if (la < 1e-12 || lb < 1e-12) continue;
+                        double cos_turn = (ax*bx + ay*by) / (la * lb);
+                        if (cos_turn < 0.70710678)   // > 45° turn
+                            wraps_corner = true;
+                    }
+                    if (wraps_corner) {
+                        spdlog::debug("uv_grid_retessellate [face {}]: sliver run wraps a corner — "
+                                      "keeping the original (cross-face-safe) triangulation",
+                                      face_idx);
+                        continue;                        // leave original tris in place
+                    }
+
+                    // Single-edge run: commit the refan — drop the sliver fan and its
+                    // closing triangle, fan the run from the apex instead.  (If the refan
+                    // itself comes out degenerate and add_face later rejects it, the retry
+                    // passes and watertightness gate fall the face back to BRepMesh.)
+                    to_remove.insert(closing_ti);
                     for (size_t ti : comp) to_remove.insert(ti);
                     for (size_t i = 0; i + 1 < run.size(); i++) {
                         size_t ra = run[i], rb = run[i + 1];
@@ -2031,7 +2078,9 @@ UvTessResult uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_ste
                     n_runs++;
                 }
 
-                if (!repair_failed) {
+                // n_runs == 0 means every run wrapped a corner and was kept as-is, so
+                // the original triangulation already stands — nothing to rebuild.
+                if (!repair_failed && n_runs > 0) {
                     std::vector<CdtTri> rebuilt;
                     rebuilt.reserve(cdt_tris.size() - to_remove.size() + to_add.size());
                     for (size_t ti = 0; ti < cdt_tris.size(); ti++)
@@ -2177,7 +2226,8 @@ UvTessResult uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_ste
         // same new-mesh vertex.  CDT triangles adjacent to both handles become identical
         // mesh faces → pre-filter with a vertex-triple deduplication set.
         std::set<std::array<size_t, 3>> seen_faces;
-        int added = 0, rejected = 0;
+        std::vector<std::array<Mesh::Vertex_index, 3>> oriented_tris;
+        oriented_tris.reserve(cdt_tris.size());
         for (const auto& tri : cdt_tris) {
             if (tri.a >= vert_new.size() || tri.b >= vert_new.size() || tri.c >= vert_new.size()) continue;
             auto va = vert_new[tri.a], vb = vert_new[tri.b], vc = vert_new[tri.c];
@@ -2197,52 +2247,103 @@ UvTessResult uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_ste
             if ((face.Orientation() == TopAbs_REVERSED) != dev_map_reverses) {
                 std::swap(vb, vc);
             }
-            if (new_mesh.add_face(va, vb, vc) != Mesh::null_face()) added++;
-            else rejected++;
+            oriented_tris.push_back({va, vb, vc});
         }
-        if (rejected > 0)
-            spdlog::warn("uv_grid_retessellate [face {}]: add_face rejected {} triangles"
-                         " (non-manifold)", face_idx, rejected);
+
+        // Insert the triangles.  CGAL Surface_mesh::add_face is order-sensitive: a
+        // triangle that is perfectly manifold in the *final* mesh can be rejected when
+        // it is attempted before its neighbours exist, because the intermediate state
+        // around a shared vertex is momentarily non-manifold (a face touching the
+        // vertex only at a point, with no incident edge yet).  This bites the
+        // border-fan repair fans, whose triangles all share one apex vertex
+        // (propeller face 78): whichever fan triangle is attempted first, before the
+        // apex has an incident edge into the fan, is rejected and leaves a one-triangle
+        // hole.  Heal it by retrying rejected triangles in additional passes — once a
+        // neighbour has been added the apex has an edge to attach to and the retry
+        // succeeds.  No triangulation change, just insertion order.  Only a genuinely
+        // non-manifold triangle survives all passes; those are caught by the gate below.
+        int added = 0;
+        std::vector<std::array<Mesh::Vertex_index, 3>> rejected_tris;
+        for (auto& t : oriented_tris)
+            if (new_mesh.add_face(t[0], t[1], t[2]) != Mesh::null_face()) added++;
+            else rejected_tris.push_back(t);
+
+        int healed = 0, retry_passes = 0;
+        while (!rejected_tris.empty()) {
+            std::vector<std::array<Mesh::Vertex_index, 3>> still;
+            for (auto& t : rejected_tris)
+                if (new_mesh.add_face(t[0], t[1], t[2]) != Mesh::null_face()) { added++; healed++; }
+                else still.push_back(t);
+            retry_passes++;
+            if (still.size() == rejected_tris.size()) break;  // no progress this pass
+            rejected_tris.swap(still);
+        }
+        int rejected = (int)rejected_tris.size();
+        if (healed > 0)
+            spdlog::debug("uv_grid_retessellate [face {}]: healed {} order-rejected triangle(s) "
+                          "in {} retry pass(es)",
+                          face_idx, healed, retry_passes);
+
         if (added == 0) {
             spdlog::warn("uv_grid_retessellate: 0 faces added");
             return UvTessResult::Failed;
         }
-        spdlog::debug("uv_grid_retessellate [face {}]: {} border verts, {} interior Steiner, {} triangles",
-                      face_idx, N_border, interior_info.size(), added);
-        mesh = std::move(new_mesh);
 
-        // Border halfedge audit: actual count must equal the sum of border loop sizes.
-        // A mismatch means the CDT left gaps (open edges that aren't part of the BREP wire).
-        {
-            size_t expected_he = 0;
-            // Periodic loops carry the duplicated seam vertex (front == back), which is
-            // the same mesh vertex: it adds an unrolled point but no mesh border edge.
-            for (const auto& lp : loops)
-                expected_he += (lp.size() > 1 && lp.front() == lp.back()) ? lp.size() - 1
-                                                                          : lp.size();
-            size_t actual_he = 0;
-            for (auto h : mesh.halfedges())
-                if (mesh.is_border(h)) actual_he++;
+        // Watertightness gate.  The result is only usable if it is watertight *within
+        // the face*: every CDT triangle made it into the mesh, and the resulting
+        // border is exactly the BREP wire (no interior holes).  Two independent
+        // checks, evaluated on new_mesh *before* it is moved into `mesh` so that a
+        // failure leaves the original BRepMesh tessellation untouched for fallback:
+        //
+        //  (a) add_face rejected one or more triangles even after the retry passes
+        //      above.  Seam/duplicate triangles are pre-filtered by `seen_faces` and
+        //      order-dependent rejections are healed by the retries, so a rejection
+        //      that survives here is a genuine, order-independent non-manifold defect,
+        //      which drops a triangle and opens a hole.
+        //  (b) border-halfedge audit: the actual border-halfedge count must equal the
+        //      sum of the border loop sizes.  A mismatch means the CDT (or the refan)
+        //      left a gap — an open edge that is not part of the BREP wire.
+        //
+        // Either failure → return Failed so the caller falls back to BRepMesh, which
+        // is watertight for these faces.  "Skip don't guess": a face we cannot
+        // tessellate watertightly is not worth a hole in the global mesh.
+        size_t expected_he = 0;
+        // Periodic loops carry the duplicated seam vertex (front == back), which is
+        // the same mesh vertex: it adds an unrolled point but no mesh border edge.
+        for (const auto& lp : loops)
+            expected_he += (lp.size() > 1 && lp.front() == lp.back()) ? lp.size() - 1
+                                                                      : lp.size();
+        size_t actual_he = 0;
+        for (auto h : new_mesh.halfedges())
+            if (new_mesh.is_border(h)) actual_he++;
+
+        if (rejected > 0 || actual_he != expected_he) {
+            if (rejected > 0)
+                spdlog::warn("uv_grid_retessellate [face {}]: add_face rejected {} triangles"
+                             " (non-manifold) — falling back to BRepMesh", face_idx, rejected);
             if (actual_he != expected_he) {
-                spdlog::debug("uv_grid_retessellate [face {}]: border halfedge mismatch — "
-                              "expected {} got {}",
-                              face_idx, expected_he, actual_he);
+                spdlog::warn("uv_grid_retessellate [face {}]: border halfedge mismatch — "
+                             "expected {} got {} — falling back to BRepMesh",
+                             face_idx, expected_he, actual_he);
                 // Dump UV of every border halfedge so we can locate the holes.
-                auto dump_uv = mesh.property_map<Mesh::Vertex_index,
-                                                  std::pair<double,double>>("v:uv").value();
-                for (auto h : mesh.halfedges()) {
-                    if (!mesh.is_border(h)) continue;
-                    auto s = mesh.source(h), t = mesh.target(h);
+                auto dump_uv = new_mesh.property_map<Mesh::Vertex_index,
+                                                     std::pair<double,double>>("v:uv").value();
+                for (auto h : new_mesh.halfedges()) {
+                    if (!new_mesh.is_border(h)) continue;
+                    auto s = new_mesh.source(h), t = new_mesh.target(h);
                     auto [su, sv] = dump_uv[s];
                     auto [tu, tv] = dump_uv[t];
                     spdlog::debug("  bhe: ({:.4f},{:.4f})→({:.4f},{:.4f}) dU={:.4f} dV={:.4f}",
                                   su, sv, tu, tv, tu - su, tv - sv);
                 }
-            } else
-                spdlog::debug("uv_grid_retessellate [face {}]: border halfedges OK ({})",
-                              face_idx, actual_he);
+            }
+            return UvTessResult::Failed;
         }
 
+        spdlog::debug("uv_grid_retessellate [face {}]: {} border verts, {} interior Steiner, "
+                      "{} triangles, border halfedges OK ({})",
+                      face_idx, N_border, interior_info.size(), added, actual_he);
+        mesh = std::move(new_mesh);
         return UvTessResult::Ok;
     }
 }
