@@ -18,6 +18,7 @@ struct ViewerSegment {
     int         subdiv_count;        // total number of tessellation segments for this CAD face
     float       area;                // surface area in model units
     std::string surface_desc;        // human-readable surface description
+    std::string tess_approach;       // tessellation method used for this segment
     // Pre-tessellation BRep wire samples for hover overlays (GL_LINES xyz pairs).
     // Sampled directly from the STEP geometry, not derived from the mesh.
     std::vector<float> subseg_wire;    // boundary of this sub-face (red hover)

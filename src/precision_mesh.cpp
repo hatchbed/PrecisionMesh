@@ -95,7 +95,8 @@ static void push_to_viewer(Viewer* viewer,
                             const std::string& label,
                             double wire_deflection,
                             const std::vector<float>& free_edge_lines = {},
-                            const std::vector<float>& healed_edge_lines = {})
+                            const std::vector<float>& healed_edge_lines = {},
+                            const std::vector<std::string>* approaches = nullptr)
 {
     if (!viewer) return;
 
@@ -133,8 +134,9 @@ static void push_to_viewer(Viewer* viewer,
                 orig_face_wire = orig_wire_cache[orig_idx];
         }
         int sdivs = subdiv_counts.count(orig_idx) ? subdiv_counts[orig_idx] : 1;
+        std::string approach = (approaches && i < approaches->size()) ? (*approaches)[i] : "";
         vsegs.push_back({&meshes[i], ft, (int)i, orig_idx, sdivs, area, desc,
-                         std::move(subseg_wire), std::move(orig_face_wire)});
+                         std::move(approach), std::move(subseg_wire), std::move(orig_face_wire)});
     }
     viewer->update(vsegs, label, free_edge_lines, healed_edge_lines);
 }
@@ -868,6 +870,8 @@ int main(int argc, char **argv) {
     // CDT engagement counters, reported by --validate-report.
     size_t cdt_faces_attempted = 0;
     size_t cdt_faces_succeeded = 0;
+    // Per-segment tessellation approach string, shown in the viewer hover tooltip.
+    std::vector<std::string> tess_approaches(meshes.size(), "BRepMesh+remesh");
 
     if (iterations > 0) {
         split_border_edges(meshes, max_edge_length);
@@ -882,7 +886,8 @@ int main(int argc, char **argv) {
 
 #ifdef PRECISION_MESH_HAS_VIEWER
         push_to_viewer(viewer_ptr, meshes, segments, original_faces, component_map, is_step,
-                       "After Border Splitting", max_surface_error, free_edge_lines, healed_edge_lines);
+                       "After Border Splitting", max_surface_error, free_edge_lines,
+                       healed_edge_lines, &tess_approaches);
 #endif
 
         // UV-grid CDT tessellation for regularly-curved STEP faces (cylinder, and later
@@ -912,14 +917,19 @@ int main(int argc, char **argv) {
                 auto res = uv_grid_retessellate(meshes[f.idx], segments[f.idx],
                                                 f.u_steps, f.v_steps, min_edge_length,
                                                 max_edge_length, f.idx, dump_cdt_dir);
-                if (res != UvTessResult::Ok) {
+                if (res == UvTessResult::Ok) {
+                    tess_approaches[f.idx] = "UV-grid CDT";
+                } else {
                     use_uv_tess[f.idx] = false;
-                    if (res == UvTessResult::Failed)
+                    if (res == UvTessResult::Failed) {
+                        tess_approaches[f.idx] = "BRepMesh+remesh (CDT failed)";
                         spdlog::warn("  seg {}: uv_grid_retessellate failed, falling back to "
                                      "isotropic remeshing", f.idx);
-                    else
+                    } else {
+                        tess_approaches[f.idx] = "BRepMesh+remesh (CDT skipped)";
                         spdlog::debug("  seg {}: UV-grid CDT not applicable, using BRepMesh "
                                       "interior + isotropic remeshing", f.idx);
+                    }
                 }
             }
             cdt_faces_succeeded = std::count(use_uv_tess.begin(), use_uv_tess.end(), true);
@@ -928,7 +938,7 @@ int main(int argc, char **argv) {
 #ifdef PRECISION_MESH_HAS_VIEWER
             push_to_viewer(viewer_ptr, meshes, segments, original_faces, component_map, is_step,
                            "After UV-grid CDT", max_surface_error, free_edge_lines,
-                           healed_edge_lines);
+                           healed_edge_lines, &tess_approaches);
 #endif
         }
 
@@ -958,7 +968,8 @@ int main(int argc, char **argv) {
                 push_to_viewer(viewer_ptr, meshes, segments, original_faces, component_map, is_step,
                                "Iteration " + std::to_string(iter) +
                                "/" + std::to_string(iterations),
-                               max_surface_error, free_edge_lines, healed_edge_lines);
+                               max_surface_error, free_edge_lines, healed_edge_lines,
+                               &tess_approaches);
             };
         }
 #endif
@@ -970,7 +981,8 @@ int main(int argc, char **argv) {
 
 #ifdef PRECISION_MESH_HAS_VIEWER
     push_to_viewer(viewer_ptr, meshes, segments, original_faces, component_map, is_step,
-                   "Final Result", max_surface_error, free_edge_lines, healed_edge_lines);
+                   "Final Result", max_surface_error, free_edge_lines, healed_edge_lines,
+                   &tess_approaches);
     if (viewer_ptr) viewer_ptr->notify_done();
 #endif
 

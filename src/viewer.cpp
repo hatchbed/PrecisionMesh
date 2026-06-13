@@ -219,11 +219,13 @@ struct Viewer::Impl {
     GLsizei border_vert_count = 0;
 
     // Free BREP boundary edges (bold yellow), open triangle-soup edges (bold magenta),
-    // and healed edges -- previously-open edges closed by loop repair (bold green).
+    // non-manifold edges (bold orange), and healed edges (bold green).
     GLuint free_edge_vao = 0, free_edge_vbo = 0;
     GLsizei free_edge_vert_count = 0;
     GLuint open_edge_vao = 0, open_edge_vbo = 0;
     GLsizei open_edge_vert_count = 0;
+    GLuint nm_edge_vao = 0, nm_edge_vbo = 0;
+    GLsizei nm_edge_vert_count = 0;
     GLuint healed_edge_vao = 0, healed_edge_vbo = 0;
     GLsizei healed_edge_vert_count = 0;
 
@@ -235,6 +237,7 @@ struct Viewer::Impl {
         int         subdiv_count;
         float       area;
         std::string surface_desc;
+        std::string tess_approach;
     };
 
     // ── Pending snapshot (worker → render) ───────────────────────────────────
@@ -244,6 +247,7 @@ struct Viewer::Impl {
         std::vector<float>        border_xyz;  // x,y,z triples
         std::vector<float>        free_edge_xyz;   // free BREP boundary edges (yellow)
         std::vector<float>        open_edge_xyz;   // open triangle-soup edges (magenta)
+        std::vector<float>        nm_edge_xyz;     // non-manifold edges (orange, count > 2)
         std::vector<float>        healed_edge_xyz; // loop-repaired edges (green)
         // segment_index → all border edges (for hover red wire)
         std::unordered_map<int, std::vector<float>> seg_borders;
@@ -272,6 +276,7 @@ struct Viewer::Impl {
     int         hover_subdiv_count = 0;
     float       hover_area         = 0.0f;
     std::string hover_surface_desc;
+    std::string hover_tess_approach;
     double      last_pick_mx = -1e9, last_pick_my = -1e9;
 
     // ── Hover wire overlay GL objects ─────────────────────────────────────────
@@ -312,6 +317,7 @@ struct Viewer::Impl {
     bool show_borders    = true;
     bool show_free_edges   = true;  // yellow: input BREP free boundary edges
     bool show_open_edges   = true;  // magenta: open triangle-soup edges (cracks)
+    bool show_nm_edges     = true;  // orange: non-manifold edges (incident to 3+ triangles)
     bool show_healed_edges = true;  // green: edges closed by loop repair
 
     // ── Camera state ─────────────────────────────────────────────────────────
@@ -540,6 +546,14 @@ Viewer::Viewer(int width, int height, const std::string& title)
     glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), nullptr);
     glBindVertexArray(0);
 
+    glGenVertexArrays(1, &impl_->nm_edge_vao);
+    glGenBuffers(1, &impl_->nm_edge_vbo);
+    glBindVertexArray(impl_->nm_edge_vao);
+    glBindBuffer(GL_ARRAY_BUFFER, impl_->nm_edge_vbo);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), nullptr);
+    glBindVertexArray(0);
+
     // Hover subsegment border (red)
     glGenVertexArrays(1, &impl_->hover_subseg_vao);
     glGenBuffers(1, &impl_->hover_subseg_vbo);
@@ -585,6 +599,8 @@ Viewer::~Viewer() {
     glDeleteBuffers(1, &impl_->open_edge_vbo);
     glDeleteVertexArrays(1, &impl_->healed_edge_vao);
     glDeleteBuffers(1, &impl_->healed_edge_vbo);
+    glDeleteVertexArrays(1, &impl_->nm_edge_vao);
+    glDeleteBuffers(1, &impl_->nm_edge_vbo);
     glDeleteVertexArrays(1, &impl_->hover_subseg_vao);
     glDeleteBuffers(1, &impl_->hover_subseg_vbo);
     glDeleteVertexArrays(1, &impl_->hover_face_vao);
@@ -636,10 +652,13 @@ void Viewer::update(const std::vector<ViewerSegment>& segments,
             }
         }
         for (const auto& kv : ecount) {
-            if (kv.second != 1) continue;
             const auto& A = pos[kv.first.first]; const auto& B = pos[kv.first.second];
-            snap.open_edge_xyz.push_back((float)A[0]); snap.open_edge_xyz.push_back((float)A[1]); snap.open_edge_xyz.push_back((float)A[2]);
-            snap.open_edge_xyz.push_back((float)B[0]); snap.open_edge_xyz.push_back((float)B[1]); snap.open_edge_xyz.push_back((float)B[2]);
+            auto emit = [&](std::vector<float>& dst) {
+                dst.push_back((float)A[0]); dst.push_back((float)A[1]); dst.push_back((float)A[2]);
+                dst.push_back((float)B[0]); dst.push_back((float)B[1]); dst.push_back((float)B[2]);
+            };
+            if (kv.second == 1) emit(snap.open_edge_xyz);
+            if (kv.second  > 2) emit(snap.nm_edge_xyz);
         }
     }
 
@@ -745,7 +764,8 @@ void Viewer::update(const std::vector<ViewerSegment>& segments,
                 snap.verts.push_back({fx, fy, fz, nx, ny, nz, ft, orig_m, subdiv_m});
             }
             snap.meta.push_back({seg.face_type, seg.original_face_index, seg.segment_index,
-                                 seg.subdiv_count, seg.area, seg.surface_desc});
+                                 seg.subdiv_count, seg.area, seg.surface_desc,
+                                 seg.tess_approach});
         }
         snap.tri_count += mesh.number_of_faces();
     }
@@ -808,6 +828,16 @@ static void upload_snapshot(Viewer::Impl& impl, const Viewer::Impl::Snapshot& s)
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     impl.open_edge_vert_count = (GLsizei)(s.open_edge_xyz.size() / 3);
 
+    // Non-manifold edges (orange)
+    glBindBuffer(GL_ARRAY_BUFFER, impl.nm_edge_vbo);
+    if (!s.nm_edge_xyz.empty())
+        glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(s.nm_edge_xyz.size() * sizeof(float)),
+                     s.nm_edge_xyz.data(), GL_DYNAMIC_DRAW);
+    else
+        glBufferData(GL_ARRAY_BUFFER, 0, nullptr, GL_DYNAMIC_DRAW);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    impl.nm_edge_vert_count = (GLsizei)(s.nm_edge_xyz.size() / 3);
+
     // Healed edges (green)
     glBindBuffer(GL_ARRAY_BUFFER, impl.healed_edge_vbo);
     if (!s.healed_edge_xyz.empty())
@@ -833,6 +863,7 @@ static void upload_snapshot(Viewer::Impl& impl, const Viewer::Impl::Snapshot& s)
     impl.hover_subdiv_count = 0;
     impl.hover_area         = 0.0f;
     impl.hover_surface_desc.clear();
+    impl.hover_tess_approach.clear();
     impl.last_pick_mx = impl.last_pick_my = -1e9;
 
     // Copy border maps for hover queries and clear hover GL buffers
@@ -924,17 +955,19 @@ static void pick_under_cursor(Viewer::Impl& impl, int fb_w, int fb_h,
 
     if (hit_tri >= 0) {
         const auto& m           = impl.pick_meta[hit_tri];
-        impl.hover_face_type    = m.face_type;
-        impl.hover_orig_face    = m.original_face_index;
-        impl.hover_subdiv       = m.segment_index;
-        impl.hover_subdiv_count = m.subdiv_count;
-        impl.hover_area         = m.area;
-        impl.hover_surface_desc = m.surface_desc;
+        impl.hover_face_type     = m.face_type;
+        impl.hover_orig_face     = m.original_face_index;
+        impl.hover_subdiv        = m.segment_index;
+        impl.hover_subdiv_count  = m.subdiv_count;
+        impl.hover_area          = m.area;
+        impl.hover_surface_desc  = m.surface_desc;
+        impl.hover_tess_approach = m.tess_approach;
     } else {
         impl.hover_face_type    = impl.hover_orig_face = impl.hover_subdiv = -1;
         impl.hover_subdiv_count = 0;
         impl.hover_area         = 0.0f;
         impl.hover_surface_desc.clear();
+        impl.hover_tess_approach.clear();
     }
 }
 
@@ -1099,7 +1132,7 @@ static void render_frame(Viewer::Impl& impl) {
             glLineWidth(1.0f);
         }
 
-        // Open triangle-soup edges (bold magenta) -- remaining cracks; drawn last so they win.
+        // Open triangle-soup edges (bold magenta) -- remaining cracks.
         if (impl.show_open_edges && impl.open_edge_vert_count > 0) {
             glUseProgram(impl.line_prog);
             glUniformMatrix4fv(glGetUniformLocation(impl.line_prog, "u_mvp"), 1, GL_FALSE, mvp.data());
@@ -1108,6 +1141,20 @@ static void render_frame(Viewer::Impl& impl) {
             glDisable(GL_DEPTH_TEST);
             glBindVertexArray(impl.open_edge_vao);
             glDrawArrays(GL_LINES, 0, impl.open_edge_vert_count);
+            glBindVertexArray(0);
+            glEnable(GL_DEPTH_TEST);
+            glLineWidth(1.0f);
+        }
+
+        // Non-manifold edges (bold orange) -- edges incident to 3+ triangles; drawn last.
+        if (impl.show_nm_edges && impl.nm_edge_vert_count > 0) {
+            glUseProgram(impl.line_prog);
+            glUniformMatrix4fv(glGetUniformLocation(impl.line_prog, "u_mvp"), 1, GL_FALSE, mvp.data());
+            glUniform4f(glGetUniformLocation(impl.line_prog, "u_color"), 1.0f, 0.5f, 0.0f, 1.0f);
+            glLineWidth(4.0f);
+            glDisable(GL_DEPTH_TEST);
+            glBindVertexArray(impl.nm_edge_vao);
+            glDrawArrays(GL_LINES, 0, impl.nm_edge_vert_count);
             glBindVertexArray(0);
             glEnable(GL_DEPTH_TEST);
             glLineWidth(1.0f);
@@ -1182,6 +1229,7 @@ static void render_frame(Viewer::Impl& impl) {
     ImGui::Checkbox("CAD Boundaries", &impl.show_borders);
     ImGui::Checkbox("Free Edges (yellow)", &impl.show_free_edges);
     ImGui::Checkbox("Open Edges (magenta)", &impl.show_open_edges);
+    ImGui::Checkbox("Non-Manifold (orange)", &impl.show_nm_edges);
     ImGui::Checkbox("Healed Edges (green)", &impl.show_healed_edges);
     ImGui::Separator();
 
@@ -1200,6 +1248,9 @@ static void render_frame(Viewer::Impl& impl) {
         } else {
             ImGui::TextDisabled("  (no subdivisions)");
         }
+        // Tessellation approach
+        if (!impl.hover_tess_approach.empty())
+            ImGui::Text("  Method:  %s", impl.hover_tess_approach.c_str());
         // Area
         if (impl.hover_area > 0.0f)
             ImGui::Text("  Area:    %.4g", impl.hover_area);
