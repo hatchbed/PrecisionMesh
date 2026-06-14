@@ -802,11 +802,15 @@ UvTessResult uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_ste
     auto uv_map = mesh.add_property_map<Mesh::Vertex_index, std::pair<double,double>>(
         "v:uv", {kNaNuv, kNaNuv}).first;
     // Verify at least one border vertex has a valid (non-NaN) UV — proxy for map existence.
-    bool uv_ok = false;
+    // A fully-closed face (no border vertices at all — e.g. the donut torus) legitimately
+    // has none; let it through so the fully-closed branch can build a structured grid.
+    bool uv_ok = false, has_border = false;
     for (auto v : mesh.vertices()) {
-        if (mesh.is_border(v) && !std::isnan(uv_map[v].first)) { uv_ok = true; break; }
+        if (!mesh.is_border(v)) continue;
+        has_border = true;
+        if (!std::isnan(uv_map[v].first)) { uv_ok = true; break; }
     }
-    if (!uv_ok) {
+    if (has_border && !uv_ok) {
         spdlog::warn("uv_grid_retessellate: mesh has no valid v:uv values on border vertices");
         return UvTessResult::Failed;
     }
@@ -1230,6 +1234,65 @@ UvTessResult uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_ste
         if (loop.size() >= 3) { loops.push_back(loop); loop_hes.push_back(hes); }
     }
     if (loops.empty()) {
+        // Fully-closed doubly-periodic torus (donut): no border loops, so there is nothing
+        // to constrain or domain-mark — every triangle is interior.  Build a structured
+        // wrapping grid directly: a uniform u x v lattice whose faces wrap in BOTH
+        // directions (i+1 mod Nu, j+1 mod Nv), so the mesh is watertight by construction
+        // (each edge is shared by exactly two faces through the wrap — no CDT, no weld).
+        // Uniform Nu sized from the outer equator (R+r) slightly over-tessellates the
+        // inner equator; acceptable for a closed torus.  Other fully-closed surfaces keep
+        // the BRepMesh interior.
+        if (is_torus && u_per && u_period > 1e-9 && v_per && v_period > 1e-9) {
+            double u0 = surf.FirstUParameter(), v0 = surf.FirstVParameter();
+            double r_outer = torus_R + torus_r;
+            int Nu = std::max(3, (int)std::round(u_period * r_outer / target));
+            int Nv = std::max(3, (int)std::round(v_period * torus_r  / target));
+            Mesh nm;
+            auto nm_uv = nm.add_property_map<Mesh::Vertex_index,
+                std::pair<double,double>>("v:uv", {kNaNuv, kNaNuv}).first;
+            auto nm_lock = nm.add_property_map<Mesh::Vertex_index, bool>(
+                "v:border_locked", false).first;
+            std::vector<std::vector<Mesh::Vertex_index>> grid(
+                Nu, std::vector<Mesh::Vertex_index>(Nv));
+            for (int i = 0; i < Nu; i++) {
+                double u = u0 + u_period * i / Nu;
+                for (int j = 0; j < Nv; j++) {
+                    double v = v0 + v_period * j / Nv;
+                    gp_Pnt p = surf.Value(u, v);
+                    auto nv = nm.add_vertex(K::Point_3(p.X(), p.Y(), p.Z()));
+                    nm_uv[nv] = {u, v};
+                    grid[i][j] = nv;
+                }
+            }
+            // Torus rectangular map preserves orientation (dev_map_reverses=false); flip
+            // only for a REVERSED face.  The winding validator (--validate) is the backstop.
+            const bool flip = (face.Orientation() == TopAbs_REVERSED);
+            int added = 0;
+            auto add_tri = [&](Mesh::Vertex_index a, Mesh::Vertex_index b,
+                               Mesh::Vertex_index c) {
+                if (flip) std::swap(b, c);
+                if (nm.add_face(a, b, c) != Mesh::null_face()) added++;
+            };
+            for (int i = 0; i < Nu; i++)
+                for (int j = 0; j < Nv; j++) {
+                    auto a = grid[i][j], b = grid[(i + 1) % Nu][j],
+                         c = grid[i][(j + 1) % Nv], d = grid[(i + 1) % Nu][(j + 1) % Nv];
+                    add_tri(a, b, d);
+                    add_tri(a, d, c);
+                }
+            size_t open = 0;
+            for (auto h : nm.halfedges()) if (nm.is_border(h)) open++;
+            if (added != 2 * Nu * Nv || open != 0) {
+                spdlog::warn("uv_grid_retessellate [face {}]: closed-torus grid not "
+                             "watertight (added {}/{}, open {}) — keeping BRepMesh interior",
+                             face_idx, added, 2 * Nu * Nv, open);
+                return UvTessResult::Failed;
+            }
+            spdlog::debug("uv_grid_retessellate [face {}]: closed-torus structured grid "
+                          "{}x{} ({} triangles), watertight", face_idx, Nu, Nv, added);
+            mesh = std::move(nm);
+            return UvTessResult::Ok;
+        }
         spdlog::info("uv_grid_retessellate [face {}]: no border loops found "
                      "(fully-closed face) — keeping BRepMesh interior", face_idx);
         return UvTessResult::Skipped;
