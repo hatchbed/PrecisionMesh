@@ -1141,20 +1141,9 @@ UvTessResult uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_ste
         // azimuthal map can place only one pole at the origin).  A fully-closed sphere
         // (a ball: no real borders) is handled by the UV-sphere structured grid in the
         // no-border-loops branch below; a both-pole face WITH real borders (a lune wedge,
-        // whose meridian edges are shared/frozen) needs the two-chart CDT, not yet
-        // implemented — keep its BRepMesh interior.
-        if (sphere_both_poles) {
-            bool has_border = false;
-            for (auto h : mesh.halfedges())
-                if (mesh.is_border(h)) { has_border = true; break; }
-            if (has_border) {
-                spdlog::info("uv_grid_retessellate [face {}]: sphere face spans both poles "
-                             "with real borders (lune) — two-chart CDT not yet implemented, "
-                             "keeping BRepMesh interior", face_idx);
-                return UvTessResult::Skipped;
-            }
-            // else: fully-closed ball — fall through to the no-border-loops branch.
-        }
+        // whose meridian edges are shared/frozen) is handled by the structured-lune branch
+        // (rings on the frozen meridian samples + interior u-points + apex fans) further
+        // down — both fall through here.
         apex_touch = sphere_apex_touch;
         v_apex = sphere_v_apex;
     }
@@ -1384,6 +1373,138 @@ UvTessResult uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_ste
         return UvTessResult::Skipped;
     }
 
+    // Structured lune: a sphere face spanning BOTH poles WITH real (frozen) meridian borders
+    // (a wedge whose two meridian edges are shared with the planar wedge faces).  No single
+    // chart holds both poles, but the two meridians are the only real borders and a symmetric
+    // lune samples them identically, so build rings on the shared meridian v-samples
+    // (endpoints = the frozen meridian vertices) + interior u-points, joined by open
+    // transition strips, with an apex fan at each border-corner pole.  Watertight by
+    // construction; honours the frozen meridian vertices.  Pole UVs are unreliable
+    // (parametric singularity), so work from 3D positions and v-values — NOT the seam unroll.
+    // Any structural surprise (not a clean bigon, mismatched meridian sampling) -> Skip.
+    if (is_sphere && sphere_both_poles) {
+        const double half_pi = std::acos(0.0);
+        ShapeAnalysis_Surface sa(BRep_Tool::Surface(face));
+        if (loops.size() != 1) {
+            spdlog::info("uv_grid_retessellate [face {}]: lune has {} border loops (expected 1) "
+                         "— keeping BRepMesh interior", face_idx, loops.size());
+            return UvTessResult::Skipped;
+        }
+        const auto& lp = loops[0];
+        int N = (int)lp.size();
+        std::vector<double> lv(N), lu(N);
+        for (int i = 0; i < N; i++) {
+            auto p = mesh.point(lp[i]);
+            gp_Pnt p3(CGAL::to_double(p.x()), CGAL::to_double(p.y()), CGAL::to_double(p.z()));
+            gp_Pnt2d uv = sa.ValueOfUV(p3, 1e-7);
+            lu[i] = uv.X(); lv[i] = uv.Y();
+        }
+        int iN = 0, iS = 0;
+        for (int i = 1; i < N; i++) { if (lv[i] > lv[iN]) iN = i; if (lv[i] < lv[iS]) iS = i; }
+        if (lv[iN] < half_pi - 1e-3 || lv[iS] > -half_pi + 1e-3) {
+            spdlog::info("uv_grid_retessellate [face {}]: lune poles not at +/-pi/2 (vN={:.4f} "
+                         "vS={:.4f}) — keeping BRepMesh interior", face_idx, lv[iN], lv[iS]);
+            return UvTessResult::Skipped;
+        }
+        auto arc_between = [&](int from, int to) {       // loop indices strictly between
+            std::vector<int> a;
+            for (int i = (from + 1) % N; i != to; i = (i + 1) % N) a.push_back(i);
+            return a;
+        };
+        std::vector<int> arcA = arc_between(iS, iN);     // one meridian, ascending v
+        std::vector<int> arcB = arc_between(iN, iS);     // the other, descending v
+        std::reverse(arcB.begin(), arcB.end());          // -> ascending v
+        int M = (int)arcA.size();
+        bool aligned = (M == (int)arcB.size()) && M > 0;
+        for (int k = 0; aligned && k < M; k++)
+            if (std::abs(lv[arcA[k]] - lv[arcB[k]]) > 1e-3) aligned = false;
+        if (!aligned) {
+            spdlog::info("uv_grid_retessellate [face {}]: lune meridians not identically sampled "
+                         "— keeping BRepMesh interior", face_idx);
+            return UvTessResult::Skipped;
+        }
+        if (M > 0 && lu[arcA[0]] > lu[arcB[0]]) std::swap(arcA, arcB);  // arcA = low-u (left)
+
+        Mesh nm;
+        auto nm_uv = nm.add_property_map<Mesh::Vertex_index,
+            std::pair<double,double>>("v:uv", {kNaNuv, kNaNuv}).first;
+        auto nm_lock = nm.add_property_map<Mesh::Vertex_index, bool>(
+            "v:border_locked", false).first;
+        std::map<size_t, Mesh::Vertex_index> frozen;
+        auto add_frozen = [&](Mesh::Vertex_index ov) {
+            auto it = frozen.find(ov.idx());
+            if (it != frozen.end()) return it->second;
+            auto p = mesh.point(ov);
+            auto nv = nm.add_vertex(p);
+            gp_Pnt p3(CGAL::to_double(p.x()), CGAL::to_double(p.y()), CGAL::to_double(p.z()));
+            gp_Pnt2d uv = sa.ValueOfUV(p3, 1e-7);
+            nm_uv[nv] = {uv.X(), uv.Y()};
+            nm_lock[nv] = true;
+            frozen[ov.idx()] = nv;
+            return nv;
+        };
+        auto add_interior = [&](double u, double v) {
+            gp_Pnt p = surf.Value(u, v);
+            auto nv = nm.add_vertex(K::Point_3(p.X(), p.Y(), p.Z()));
+            nm_uv[nv] = {u, v};
+            return nv;
+        };
+        Mesh::Vertex_index southv = add_frozen(lp[iS]);
+        Mesh::Vertex_index northv = add_frozen(lp[iN]);
+        std::vector<std::vector<Mesh::Vertex_index>> ring(M);
+        std::vector<std::vector<double>> ringu(M);
+        for (int k = 0; k < M; k++) {
+            double v_k = lv[arcA[k]], uA = lu[arcA[k]], uB = lu[arcB[k]];
+            ring[k].push_back(add_frozen(lp[arcA[k]])); ringu[k].push_back(uA);
+            int n_int = std::max(0, (int)std::round(
+                std::abs(uB - uA) * sphere_R * std::cos(v_k) / target) - 1);
+            for (int t = 1; t <= n_int; t++) {
+                double u = uA + (uB - uA) * t / (n_int + 1);
+                ring[k].push_back(add_interior(u, v_k)); ringu[k].push_back(u);
+            }
+            ring[k].push_back(add_frozen(lp[arcB[k]])); ringu[k].push_back(uB);
+        }
+        const bool flip = (face.Orientation() == TopAbs_REVERSED);
+        int added = 0, expected = 0;
+        auto add_tri = [&](Mesh::Vertex_index a, Mesh::Vertex_index b, Mesh::Vertex_index c) {
+            ++expected;
+            if (flip) std::swap(b, c);
+            if (nm.add_face(a, b, c) != Mesh::null_face()) added++;
+        };
+        for (int i = 0; i + 1 < (int)ring[0].size(); i++)            // south apex fan
+            add_tri(southv, ring[0][i + 1], ring[0][i]);
+        auto open_strip = [&](int ka, int kb) {                      // open ring-to-ring strip
+            const auto& A = ring[ka]; const auto& B = ring[kb];
+            const auto& Au = ringu[ka]; const auto& Bu = ringu[kb];
+            int nA = (int)A.size(), nB = (int)B.size(), i = 0, j = 0;
+            while (i < nA - 1 || j < nB - 1) {
+                double aN = (i + 1 < nA) ? Au[i + 1] : 1e18;
+                double bN = (j + 1 < nB) ? Bu[j + 1] : 1e18;
+                if (i < nA - 1 && (j >= nB - 1 || aN <= bN)) {
+                    add_tri(A[i], A[i + 1], B[j]); ++i;
+                } else {
+                    add_tri(A[i], B[j + 1], B[j]); ++j;
+                }
+            }
+        };
+        for (int k = 0; k + 1 < M; k++) open_strip(k, k + 1);
+        int kt = M - 1;
+        for (int i = 0; i + 1 < (int)ring[kt].size(); i++)           // north apex fan
+            add_tri(ring[kt][i], ring[kt][i + 1], northv);
+        size_t open = 0;
+        for (auto h : nm.halfedges()) if (nm.is_border(h)) open++;
+        if (added != expected || open != (size_t)N) {
+            spdlog::warn("uv_grid_retessellate [face {}]: structured lune not clean (added {}/{}, "
+                         "open {} expected {}) — keeping BRepMesh interior",
+                         face_idx, added, expected, open, N);
+            return UvTessResult::Failed;
+        }
+        spdlog::debug("uv_grid_retessellate [face {}]: structured lune ({} rings, {} triangles), "
+                      "border halfedges OK ({})", face_idx, M, added, open);
+        mesh = std::move(nm);
+        return UvTessResult::Ok;
+    }
+
     // Bail out on a self-touching wire: two DISTINCT border vertices at the same 3D point
     // (a sliver pinching to a model vertex where the boundary touches itself).  There the
     // CDT's convex-hull fill over-covers the thin outside lens between the two tangent
@@ -1480,6 +1601,18 @@ UvTessResult uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_ste
 
             double u_curr = uv2d.X();
             double v_curr = uv2d.Y();
+
+            // Partial-v periodic face (e.g. torus_half, v in [-pi/2,pi/2]): ValueOfUV returns
+            // v in the surface's natural period [0,2pi), so a face trimmed to NEGATIVE v lands
+            // on the wrong side (v=-pi/2 -> 3pi/2).  The rings would then be placed outside the
+            // face's real v-domain and every Steiner point gets BRepClass-filtered.  Wrap v
+            // into the face's actual v-range.  (Full-v-period faces use the v-seam path; their
+            // v already spans the whole period, so this is gated to !v_seam_dir.)
+            if (v_per && v_period > 1e-9 && !v_seam_dir) {
+                double fv1 = surf.FirstVParameter(), fv2 = surf.LastVParameter();
+                while (v_curr > fv2 + 1e-9) v_curr -= v_period;
+                while (v_curr < fv1 - 1e-9) v_curr += v_period;
+            }
 
             // Canonicalize the unroll seed with the SAME snap used for anchor selection
             // above.  For a vertex exactly on the seam, ValueOfUV may return u=0 for one
