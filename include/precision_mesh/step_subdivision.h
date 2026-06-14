@@ -40,7 +40,8 @@ inline bool cdt_eligible(const FaceTessellationSteps& steps)
     return steps.type == CurvedFaceType::Cylinder ||
            steps.type == CurvedFaceType::Cone ||
            steps.type == CurvedFaceType::Torus ||
-           steps.type == CurvedFaceType::Revolution;
+           steps.type == CurvedFaceType::Revolution ||
+           steps.type == CurvedFaceType::Extrusion;
 }
 
 // Compute the number of U (angular) and V (axial) parametric subdivisions for a
@@ -70,12 +71,16 @@ std::pair<int,int> compute_revolution_steps(const Geom_SurfaceOfRevolution& surf
                                             double max_edge_length,
                                             double max_surface_error);
 
-// Compute V (extrusion direction) subdivision steps for a linear extrusion face.
-// The extrusion direction is always straight so only the edge length constraint
-// applies.  Returns {1, v_steps}.
+// Compute subdivision steps for a surface of linear extrusion S(u,v)=C(u)+v*Dir.
+// U is the (generally curved) profile curve and V is the straight extrusion ruling.
+// V is sized purely by the edge-length budget (zero surface error along a straight
+// line); U is sized from the profile arc length AND its tightest radius of curvature
+// (sagitta), mirroring the revolution profile.  Returns {u_steps, v_steps}, both >= 1.
 std::pair<int,int> compute_extrusion_steps(const Geom_SurfaceOfLinearExtrusion& surface,
                                            const TopoDS_Face& face,
-                                           double max_edge_length);
+                                           double min_edge_length,
+                                           double max_edge_length,
+                                           double max_surface_error);
 
 // Compute subdivision steps for a toroidal face using the outer equator radius for
 // U and the tube cross-section radius for V, with a shared diagonal budget.

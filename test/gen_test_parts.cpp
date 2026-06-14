@@ -21,6 +21,15 @@
 //                 plus planar side caps, the simplest revolution CDT case (no seam).
 //   cube          20mm box, all planar faces.  Exercises the all-planar early-return
 //                 path in find_surface_error_param (no arc-forced nodes to calibrate).
+//   channel       Constant-thickness wavy slab: parallel wavy B-spline top/bottom edges
+//                 closed by straight ends, extruded +Y into a watertight SOLID.  Two
+//                 Geom_SurfaceOfLinearExtrusion faces (top/bottom walls) + planar ends/caps.
+//   ext_arch      Closed B-spline arch over a flat base extruded +Y into a SOLID.  Arch
+//                 wall = extrusion face (arc-length U development), planar base + caps.
+//   ext_skew      ext_arch extruded along an OBLIQUE direction (+Y+Z) — non-perpendicular
+//                 Dir gives a best-effort (non-isometric) development map.
+//   ext_lens      Closed two-arc lens profile extruded +Y — two extrusion faces meeting at
+//                 sharp tip rulings, exercising corner/sliver handling between them.
 
 
 #include <cmath>
@@ -35,6 +44,7 @@
 #include <BRepBuilderAPI_Transform.hxx>
 #include <BRepPrimAPI_MakeBox.hxx>
 #include <BRepPrimAPI_MakeCone.hxx>
+#include <BRepPrimAPI_MakePrism.hxx>
 #include <BRepPrimAPI_MakeRevol.hxx>
 #include <BRepPrimAPI_MakeTorus.hxx>
 #include <Geom_BSplineCurve.hxx>
@@ -158,6 +168,88 @@ TopoDS_Shape make_cube()
     return BRepPrimAPI_MakeBox(20.0, 20.0, 20.0).Shape();
 }
 
+// ---- Surfaces of linear extrusion S(u,v) = C(u) + v*Dir --------------------------
+// A curved (B-spline) profile edge swept along a straight direction becomes a
+// Geom_SurfaceOfLinearExtrusion (analytic profiles like lines/arcs would downcast to
+// plane/cylinder and never reach the extrusion path).  U is the curved profile (needs
+// arc-length development), V is the straight ruling.  Extruding perpendicular to the
+// profile plane gives an exact-isometry development; an oblique direction gives a
+// best-effort map.  Unlike a revolved bare edge (degenerate pole), an extruded bare
+// wire is a clean developable face, so the open-wall case is well-formed.
+
+TopoDS_Shape make_channel()
+{
+    // Constant-thickness wavy slab: a closed XZ profile whose top and bottom edges are
+    // parallel wavy B-splines (the bottom is the top translated down by a fixed
+    // thickness, so they never touch), closed by two straight end edges, extruded +Y
+    // into a SOLID.  Gives TWO Geom_SurfaceOfLinearExtrusion faces (the wavy top and
+    // bottom walls) plus two planar end walls and two planar Y caps.  Watertight —
+    // matching the assumption that all input STEPs are closed.
+    const double thickness = 12.0;
+    TColgp_Array1OfPnt top(1, 6), bot(1, 6);
+    const double xs[6] = {-15.0, -9.0, -3.0, 3.0, 9.0, 15.0};
+    const double zs[6] = {  0.0,  8.0, -4.0, 6.0, -3.0, 5.0};
+    for (int i = 0; i < 6; i++) {
+        top.SetValue(i + 1, gp_Pnt(xs[i], 0.0, zs[i]));
+        bot.SetValue(i + 1, gp_Pnt(xs[i], 0.0, zs[i] - thickness));
+    }
+    Handle(Geom_BSplineCurve) top_c = GeomAPI_PointsToBSpline(top).Curve();
+    Handle(Geom_BSplineCurve) bot_c = GeomAPI_PointsToBSpline(bot).Curve();
+    BRepBuilderAPI_MakeWire mw;
+    mw.Add(BRepBuilderAPI_MakeEdge(top_c).Edge());                                  // top wall
+    mw.Add(BRepBuilderAPI_MakeEdge(gp_Pnt( 15.0, 0.0, zs[5]),
+                                   gp_Pnt( 15.0, 0.0, zs[5] - thickness)).Edge());  // right end
+    mw.Add(BRepBuilderAPI_MakeEdge(bot_c).Edge());                                  // bottom wall
+    mw.Add(BRepBuilderAPI_MakeEdge(gp_Pnt(-15.0, 0.0, zs[0] - thickness),
+                                   gp_Pnt(-15.0, 0.0, zs[0])).Edge());              // left end
+    TopoDS_Face profile = BRepBuilderAPI_MakeFace(mw.Wire(), /*OnlyPlane=*/true).Face();
+    return BRepPrimAPI_MakePrism(profile, gp_Vec(0, 40, 0)).Shape();
+}
+
+// Closed profile (B-spline arch over a flat base, in XZ) extruded into a SOLID along an
+// axis.  perp=true extrudes +Y (exact isometry); perp=false extrudes obliquely (+Y+Z,
+// best-effort development with non-zero F).  The arch wall is the extrusion face; the
+// base and the two end caps are planar.  Watertight.
+TopoDS_Shape make_arch_prism(bool perp)
+{
+    TColgp_Array1OfPnt pts(1, 5);
+    pts.SetValue(1, gp_Pnt(-12.0, 0.0,  0.0));
+    pts.SetValue(2, gp_Pnt( -7.0, 0.0, 14.0));
+    pts.SetValue(3, gp_Pnt(  0.0, 0.0, 18.0));
+    pts.SetValue(4, gp_Pnt(  7.0, 0.0, 14.0));
+    pts.SetValue(5, gp_Pnt( 12.0, 0.0,  0.0));
+    Handle(Geom_BSplineCurve) arch = GeomAPI_PointsToBSpline(pts).Curve();
+    BRepBuilderAPI_MakeWire mw;
+    mw.Add(BRepBuilderAPI_MakeEdge(arch).Edge());
+    mw.Add(BRepBuilderAPI_MakeEdge(gp_Pnt(12.0, 0.0, 0.0), gp_Pnt(-12.0, 0.0, 0.0)).Edge());
+    TopoDS_Face profile = BRepBuilderAPI_MakeFace(mw.Wire(), /*OnlyPlane=*/true).Face();
+    gp_Vec dir = perp ? gp_Vec(0, 30, 0) : gp_Vec(0, 30, 12);
+    return BRepPrimAPI_MakePrism(profile, dir).Shape();
+}
+
+TopoDS_Shape make_ext_arch() { return make_arch_prism(/*perp=*/true); }
+TopoDS_Shape make_ext_skew() { return make_arch_prism(/*perp=*/false); }
+
+TopoDS_Shape make_ext_lens()
+{
+    // Closed lens/leaf profile in XZ from TWO B-spline arcs meeting at sharp tips at
+    // (±14,0,0), extruded +Y into a SOLID.  Gives TWO Geom_SurfaceOfLinearExtrusion faces
+    // meeting along the two tip rulings — exercises the corner/sliver handling between
+    // adjacent extrusion faces — plus two planar end caps.  Watertight.
+    TColgp_Array1OfPnt top(1, 4), bot(1, 4);
+    top.SetValue(1, gp_Pnt(-14.0, 0.0, 0.0)); top.SetValue(2, gp_Pnt(-5.0, 0.0,  6.0));
+    top.SetValue(3, gp_Pnt(  5.0, 0.0, 6.0));  top.SetValue(4, gp_Pnt(14.0, 0.0,  0.0));
+    bot.SetValue(1, gp_Pnt(-14.0, 0.0, 0.0)); bot.SetValue(2, gp_Pnt(-5.0, 0.0, -6.0));
+    bot.SetValue(3, gp_Pnt(  5.0, 0.0, -6.0)); bot.SetValue(4, gp_Pnt(14.0, 0.0,  0.0));
+    Handle(Geom_BSplineCurve) up = GeomAPI_PointsToBSpline(top).Curve();
+    Handle(Geom_BSplineCurve) dn = GeomAPI_PointsToBSpline(bot).Curve();
+    BRepBuilderAPI_MakeWire mw;
+    mw.Add(BRepBuilderAPI_MakeEdge(up).Edge());
+    mw.Add(BRepBuilderAPI_MakeEdge(dn).Edge());
+    TopoDS_Face profile = BRepBuilderAPI_MakeFace(mw.Wire(), /*OnlyPlane=*/true).Face();
+    return BRepPrimAPI_MakePrism(profile, gp_Vec(0, 30, 0)).Shape();
+}
+
 }  // namespace
 
 int main(int argc, char** argv)
@@ -171,6 +263,10 @@ int main(int argc, char** argv)
         {"vase",          make_vase},
         {"vase_wedge",    make_vase_wedge},
         {"cube",          make_cube},
+        {"channel",       make_channel},
+        {"ext_arch",      make_ext_arch},
+        {"ext_skew",      make_ext_skew},
+        {"ext_lens",      make_ext_lens},
     };
 
     if (argc < 2 || !shapes.count(argv[1])) {

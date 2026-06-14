@@ -301,12 +301,12 @@ std::pair<int,int> compute_revolution_steps(const Geom_SurfaceOfRevolution& revo
     return {u_steps, v_steps};
 }
 
-std::pair<int,int> compute_extrusion_steps(const Geom_SurfaceOfLinearExtrusion& /*extrusion*/,
+std::pair<int,int> compute_extrusion_steps(const Geom_SurfaceOfLinearExtrusion& extrusion,
                                            const TopoDS_Face& face,
-                                           double max_edge_length)
+                                           double min_edge_length,
+                                           double max_edge_length,
+                                           double max_surface_error)
 {
-    int v_steps = 1;
-
     Standard_Real u1, u2, v1, v2;
     BRepTools::UVBounds(face, u1, u2, v1, v2);
 
@@ -314,14 +314,57 @@ std::pair<int,int> compute_extrusion_steps(const Geom_SurfaceOfLinearExtrusion& 
     spdlog::debug("  U (profile): {} -> {} ({})", u1, u2, u2 - u1);
     spdlog::debug("  V (extrusion): {} -> {} ({})", v1, v2, v2 - v1);
 
-    // V is the extrusion direction — always a straight line with zero surface error.
-    // Subdivide purely by max_edge_length.
+    // V is the extrusion direction — a straight ruling with zero surface error.
+    // Subdivide purely by max_edge_length (|Dir| is unit, so v IS the 3D distance).
+    int v_steps = 1;
     if ((v2 - v1) > max_edge_length) {
         v_steps = static_cast<int>(std::ceil((v2 - v1) / max_edge_length));
         spdlog::debug("  V steps: {}", v_steps);
     }
 
-    return {1, v_steps};
+    // U is the profile curve C(u): a general curve like the revolution profile, so size
+    // U rows from BOTH the profile arc length (edge-length budget) and the profile's
+    // tightest radius of curvature (sagitta).  The UV-grid CDT path owns the interior
+    // for extrusion faces, so U is no longer left to isotropic remeshing.  (Mirrors the
+    // V-profile branch of compute_revolution_steps.)
+    int u_steps = 1;
+    Handle(Geom_Curve) basis_curve = extrusion.BasisCurve();
+    if (!basis_curve.IsNull()) {
+        const int num_u_samples = 40;
+        double profile_len = 0.0;
+        double rho_min = std::numeric_limits<double>::max();
+        gp_Vec d_prev;
+        GeomLProp_CLProps clp(basis_curve, 2, 1e-7);
+        for (int i = 0; i <= num_u_samples; i++) {
+            double u = u1 + (u2 - u1) * i / num_u_samples;
+            gp_Pnt p; gp_Vec d1;
+            basis_curve->D1(u, p, d1);
+            if (i > 0) profile_len += 0.5 * (d1.Magnitude() + d_prev.Magnitude())
+                                          * (u2 - u1) / num_u_samples;
+            d_prev = d1;
+            clp.SetParameter(u);
+            if (clp.IsTangentDefined()) {
+                double k = clp.Curvature();
+                if (k > 1e-12) rho_min = std::min(rho_min, 1.0 / k);
+            }
+        }
+        spdlog::debug("  profile arc length: {}", profile_len);
+        spdlog::debug("  profile min radius of curvature: {}", rho_min);
+
+        double u_chord = max_edge_length;
+        if (rho_min < std::numeric_limits<double>::max() &&
+            max_surface_error / rho_min <= 2) {
+            double u_angle = 2 * std::acos(1 - max_surface_error / rho_min);
+            u_chord = std::min(u_chord, 2 * rho_min * std::sin(u_angle / 2));
+        }
+        u_chord = std::max(u_chord, min_edge_length);
+        if (u_chord > 0 && profile_len > u_chord) {
+            u_steps = static_cast<int>(std::ceil(profile_len / u_chord));
+            spdlog::debug("  U steps: {}", u_steps);
+        }
+    }
+
+    return {u_steps, v_steps};
 }
 
 std::pair<int,int> compute_torus_steps(const Geom_ToroidalSurface& torus,
@@ -530,7 +573,8 @@ FaceTessellationSteps get_face_tessellation_steps(const TopoDS_Face& face,
                                                                              max_edge_length, max_surface_error);
     } else if (auto h = Handle(Geom_SurfaceOfLinearExtrusion)::DownCast(surface); !h.IsNull()) {
         result.type = CurvedFaceType::Extrusion;
-        std::tie(result.u_steps, result.v_steps) = compute_extrusion_steps(*h, face, max_edge_length);
+        std::tie(result.u_steps, result.v_steps) = compute_extrusion_steps(*h, face, min_edge_length,
+                                                                            max_edge_length, max_surface_error);
     } else if (auto h = Handle(Geom_ToroidalSurface)::DownCast(surface); !h.IsNull()) {
         result.type = CurvedFaceType::Torus;
         std::tie(result.u_steps, result.v_steps) = compute_torus_steps(*h, face, min_edge_length,

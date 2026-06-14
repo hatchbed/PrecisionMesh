@@ -37,6 +37,7 @@
 #include <Geom_Surface.hxx>
 #include <Geom_Curve.hxx>
 #include <Geom_SurfaceOfRevolution.hxx>
+#include <Geom_SurfaceOfLinearExtrusion.hxx>
 #include <GeomAbs_SurfaceType.hxx>
 #include <GeomAPI_ProjectPointOnCurve.hxx>
 #include <gp_Ax1.hxx>
@@ -958,6 +959,64 @@ UvTessResult uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_ste
         return rev_v_tab[k-1] + t * (rev_v_tab[k] - rev_v_tab[k-1]);
     };
 
+    // Surface of linear extrusion: S(u,v) = C(u) + v*Dir.  This is the developable
+    // sibling of the revolution with U and V roles SWAPPED — U is the (curved) profile
+    // C(u) and V is the straight extrusion ruling.  So, unlike every other type, |dS/du|
+    // = |C'(u)| is the non-constant one and U must develop as the profile ARC LENGTH
+    // s(u) (dense monotone table), while V develops linearly as v*|Dir|.  The surface is
+    // developable (zero Gaussian curvature: parallel rulings), so for a profile whose
+    // tangent stays perpendicular to Dir the (s(u), v*|Dir|) rectangle is an exact
+    // isometry; for an oblique Dir it is a best-effort map (still correct — vertices come
+    // from surf.Value — only quality degrades, like the torus/revolution maps).
+    const bool is_extrusion = surf.GetType() == GeomAbs_SurfaceOfExtrusion;
+    Handle(Geom_Curve) ext_curve;
+    std::vector<double> ext_u_tab, ext_s_tab;   // monotone u -> cumulative profile arc length
+    double ext_min_speed = std::numeric_limits<double>::max();
+    if (is_extrusion) {
+        Handle(Geom_SurfaceOfLinearExtrusion) gext =
+            Handle(Geom_SurfaceOfLinearExtrusion)::DownCast(BRep_Tool::Surface(face));
+        // A trimmed/offset wrapper downcasts to null; leaving the table empty makes the
+        // singular-profile gate below Skip cleanly (no crash).
+        if (!gext.IsNull()) {
+            ext_curve = gext->BasisCurve();
+            double u0 = surf.FirstUParameter(), u1 = surf.LastUParameter();
+            const int NS = 256;
+            ext_u_tab.reserve(NS + 1);
+            ext_s_tab.reserve(NS + 1);
+            double acc = 0.0, prev_speed = 0.0;
+            for (int i = 0; i <= NS; i++) {
+                double u = u0 + (u1 - u0) * i / NS;
+                gp_Pnt p; gp_Vec d1;
+                ext_curve->D1(u, p, d1);
+                double speed = d1.Magnitude();
+                if (i > 0) acc += 0.5 * (speed + prev_speed) * (u1 - u0) / NS;
+                prev_speed = speed;
+                ext_u_tab.push_back(u);
+                ext_s_tab.push_back(acc);
+                ext_min_speed = std::min(ext_min_speed, speed);
+            }
+        }
+    }
+    auto ext_s_of_u = [&](double u) -> double {
+        if (ext_u_tab.empty()) return 0.0;
+        if (u <= ext_u_tab.front()) return ext_s_tab.front();
+        if (u >= ext_u_tab.back())  return ext_s_tab.back();
+        auto it = std::lower_bound(ext_u_tab.begin(), ext_u_tab.end(), u);
+        size_t k = it - ext_u_tab.begin();
+        double t = (u - ext_u_tab[k-1]) / (ext_u_tab[k] - ext_u_tab[k-1]);
+        return ext_s_tab[k-1] + t * (ext_s_tab[k] - ext_s_tab[k-1]);
+    };
+    auto ext_u_of_s = [&](double s) -> double {
+        if (ext_s_tab.empty()) return 0.0;
+        if (s <= ext_s_tab.front()) return ext_u_tab.front();
+        if (s >= ext_s_tab.back())  return ext_u_tab.back();
+        auto it = std::lower_bound(ext_s_tab.begin(), ext_s_tab.end(), s);
+        size_t k = it - ext_s_tab.begin();
+        double ds = ext_s_tab[k] - ext_s_tab[k-1];
+        double t = ds > 0 ? (s - ext_s_tab[k-1]) / ds : 0.0;
+        return ext_u_tab[k-1] + t * (ext_u_tab[k] - ext_u_tab[k-1]);
+    };
+
     auto to2d = [&](double u, double v) -> std::array<double, 2> {
         if (is_cone) {
             double rho = v + cone_apex_s;
@@ -968,6 +1027,11 @@ UvTessResult uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_ste
             // Rectangular best-effort: u scaled by the midpoint radius, v as profile arc
             // length.  Jacobian = uv_u_scale * s'(v) > 0, so dev_map_reverses = false.
             return {u * uv_u_scale, rev_s_of_v(v)};
+        }
+        if (is_extrusion) {
+            // U as profile arc length, V linear (the straight ruling).  Jacobian =
+            // s'(u) * uv_v_scale > 0, so dev_map_reverses = false.
+            return {ext_s_of_u(u), v * uv_v_scale};
         }
         // Cylinder and torus both use a rectangular product embedding:
         //   cylinder: (u*r, v)    exact isometry, row_radius = r constant
@@ -1059,6 +1123,32 @@ UvTessResult uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_ste
             spdlog::info("uv_grid_retessellate [face {}]: revolution profile is singular/cusped "
                          "(min speed={:.4g}) — arc-length development ill-defined, keeping "
                          "BRepMesh interior", face_idx, rev_min_speed);
+            return UvTessResult::Skipped;
+        }
+    }
+
+    // Extrusion corner cases — keep the BRepMesh interior (never guess):
+    //   - Closed profile (u-periodic): the profile curve closes on itself, so U is the
+    //     periodic/seam direction.  The u-seam machinery has only been exercised on the
+    //     analytic angular seam (cylinder/cone/torus/revolution); a profile-curve seam is
+    //     not yet validated, so defer it (open profiles — the common extrusion — are
+    //     unaffected since they are not u-periodic).
+    //   - Singular/cusped profile: arc length is not strictly increasing, so the s<->u
+    //     inversion is ill-defined (also catches the null-downcast empty-table case).
+    if (is_extrusion) {
+        if (u_per && u_period > 1e-9) {
+            double u_span = std::abs(surf.LastUParameter() - surf.FirstUParameter());
+            if (u_span >= u_period * 0.99) {
+                spdlog::info("uv_grid_retessellate [face {}]: extrusion profile is closed "
+                             "(full u-period) — profile-seam machinery not yet validated, "
+                             "keeping BRepMesh interior", face_idx);
+                return UvTessResult::Skipped;
+            }
+        }
+        if (ext_min_speed < 1e-7 || ext_s_tab.empty() || ext_s_tab.back() <= 1e-9) {
+            spdlog::info("uv_grid_retessellate [face {}]: extrusion profile is singular/cusped "
+                         "(min speed={:.4g}) — arc-length development ill-defined, keeping "
+                         "BRepMesh interior", face_idx, ext_min_speed);
             return UvTessResult::Skipped;
         }
     }
@@ -1223,9 +1313,9 @@ UvTessResult uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_ste
     }
 
     spdlog::debug("uv_grid_retessellate [face {}]: u_scale={:.4f} v_scale={:.4f} "
-                  "target={:.4f} dv_step={:.4f} u_per={} cone={} rev={} loops={}",
+                  "target={:.4f} dv_step={:.4f} u_per={} cone={} rev={} ext={} loops={}",
                   face_idx, uv_u_scale, uv_v_scale, target, uv_dv_step,
-                  u_per, is_cone, is_revolution, (int)loops.size());
+                  u_per, is_cone, is_revolution, is_extrusion, (int)loops.size());
 
     // 3. Build CDT. vertex handle → index in unified vertex table.
     //    Border vertices:  index 0 .. N_border-1  → border_mesh_verts[i]
@@ -1442,7 +1532,7 @@ UvTessResult uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_ste
                     // gaps (uv_dv_step), which are not metric for a non-constant-|dS/dv|
                     // profile; the arc-length rows above are already metric-correct.
                     const bool could_be_seam_row = seam_skipped && u_per && u_period > 1e-9;
-                    if (!could_be_seam_row && !is_revolution) {
+                    if (!could_be_seam_row && !is_revolution && !is_extrusion) {
                         const double u_span_sc = std::max(u_max_g - u_min_g, 1e-12);
                         const double r_at_mid = row_radius((v_lo_ring + v_hi_ring) / 2.0);
                         const int n_k_mid = std::max(1, (int)std::round(u_span_sc * r_at_mid / target));
@@ -1510,14 +1600,24 @@ UvTessResult uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_ste
                     double r_k = row_radius(v);
                     const bool seam_row = seam_skipped && u_per && u_period > 1e-9;
                     double du_k;
-                    int j_begin, j_end;   // inclusive index range of ring points
+                    int j_begin, j_end, n_k;   // inclusive index range of ring points
                     if (seam_row) {
-                        int n_k = std::max(1, (int)std::round(u_period * r_k / target));
+                        n_k = std::max(1, (int)std::round(u_period * r_k / target));
                         du_k = u_period / n_k;
                         j_begin = 0; j_end = n_k;   // j==0 / j==n_k = the seam pair
                     } else {
                         double span = std::max(u_max_g - u_min_g, 1e-12);
-                        int n_k = std::max(1, (int)std::round(span * r_k / target));
+                        if (is_extrusion) {
+                            // U is the curved profile: size the ring by the profile ARC
+                            // LENGTH across the face's u-span (not the parameter span).
+                            // The points are placed at uniform arc length below, so 3D
+                            // spacing is uniform regardless of |C'(u)| variation (mirrors
+                            // revolution's arc-length V rings, transposed to U).
+                            double s_span = std::abs(ext_s_of_u(u_max_g) - ext_s_of_u(u_min_g));
+                            n_k = std::max(1, (int)std::round(s_span / target));
+                        } else {
+                            n_k = std::max(1, (int)std::round(span * r_k / target));
+                        }
                         if (n_k == 1) n_k = 2;  // narrow-span: one centered midpoint
                         du_k = span / n_k;
                         j_begin = 1; j_end = n_k - 1;   // strictly interior
@@ -1559,7 +1659,14 @@ UvTessResult uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_ste
                         // Checkerboard micro-perturbation against co-circular/collinear
                         // degeneracy (a ring at constant v maps to a circle/line in the
                         // development — perturbing v per point breaks it).
-                        double u = u_min_g + j * du_k;
+                        // For extrusion the interior point sits at uniform PROFILE arc
+                        // length (j/n_k of the way across the face's arc span), inverted
+                        // back to the u parameter; du_k remains the nominal parameter
+                        // spacing, used only for the perturbation magnitude.
+                        double u = is_extrusion
+                            ? ext_u_of_s(ext_s_of_u(u_min_g) +
+                                  (ext_s_of_u(u_max_g) - ext_s_of_u(u_min_g)) * j / n_k)
+                            : u_min_g + j * du_k;
                         double pert_u = u + (((j + i_v) % 2 == 0) ? 1e-5 : -1e-5) * du_k;
                         double pert_v = v + ((j % 2 == 0) ? 1e-5 : -1e-5) * uv_dv_step;
 
