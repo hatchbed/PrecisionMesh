@@ -1138,11 +1138,22 @@ UvTessResult uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_ste
     }
     if (is_sphere) {
         // A face spanning pole to pole cannot be developed onto a single sheet (one
-        // azimuthal map can place only one pole at the origin) — leave it to BRepMesh.
+        // azimuthal map can place only one pole at the origin).  A fully-closed sphere
+        // (a ball: no real borders) is handled by the UV-sphere structured grid in the
+        // no-border-loops branch below; a both-pole face WITH real borders (a lune wedge,
+        // whose meridian edges are shared/frozen) needs the two-chart CDT, not yet
+        // implemented — keep its BRepMesh interior.
         if (sphere_both_poles) {
-            spdlog::info("uv_grid_retessellate [face {}]: sphere face spans both poles — "
-                         "no single-sheet development, keeping BRepMesh interior", face_idx);
-            return UvTessResult::Skipped;
+            bool has_border = false;
+            for (auto h : mesh.halfedges())
+                if (mesh.is_border(h)) { has_border = true; break; }
+            if (has_border) {
+                spdlog::info("uv_grid_retessellate [face {}]: sphere face spans both poles "
+                             "with real borders (lune) — two-chart CDT not yet implemented, "
+                             "keeping BRepMesh interior", face_idx);
+                return UvTessResult::Skipped;
+            }
+            // else: fully-closed ball — fall through to the no-border-loops branch.
         }
         apex_touch = sphere_apex_touch;
         v_apex = sphere_v_apex;
@@ -1290,6 +1301,81 @@ UvTessResult uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_ste
             }
             spdlog::debug("uv_grid_retessellate [face {}]: closed-torus structured grid "
                           "{}x{} ({} triangles), watertight", face_idx, Nu, Nv, added);
+            mesh = std::move(nm);
+            return UvTessResult::Ok;
+        }
+        // Fully-closed sphere (a ball): no real borders, both poles.  A single development
+        // chart can't hold both poles, but with no borders to honour we build a graduated
+        // UV-sphere directly: rings at uniform meridian arc (uniform v, since |dS/dv|=R) with
+        // PER-RING point counts (n_j = 2*pi*R*cos(v_j)/target) so the rings taper toward the
+        // poles and the triangles stay near-uniform (a uniform-u UV-sphere pinches at the
+        // poles).  Adjacent rings of differing counts are joined by a transition strip; each
+        // pole by an apex fan.  Watertight by construction (u-wrap + matched strips + fans).
+        if (is_sphere && sphere_both_poles && u_per && u_period > 1e-9) {
+            const double half_pi = std::acos(0.0);
+            double u0 = surf.FirstUParameter();
+            int Nrows = std::max(2, (int)std::round(2.0 * half_pi * sphere_R / target));
+            Mesh nm;
+            auto nm_uv = nm.add_property_map<Mesh::Vertex_index,
+                std::pair<double,double>>("v:uv", {kNaNuv, kNaNuv}).first;
+            auto nm_lock = nm.add_property_map<Mesh::Vertex_index, bool>(
+                "v:border_locked", false).first;
+            auto add_v = [&](double u, double v) {
+                gp_Pnt p = surf.Value(u, v);
+                auto nv = nm.add_vertex(K::Point_3(p.X(), p.Y(), p.Z()));
+                nm_uv[nv] = {u, v};
+                return nv;
+            };
+            Mesh::Vertex_index south = add_v(u0, -half_pi);
+            Mesh::Vertex_index north = add_v(u0,  half_pi);
+            std::vector<std::vector<Mesh::Vertex_index>> ring(Nrows);  // ring[1..Nrows-1]
+            for (int j = 1; j <= Nrows - 1; j++) {
+                double v = -half_pi + 2.0 * half_pi * j / Nrows;
+                int n_j = std::max(3, (int)std::round(u_period * sphere_R * std::cos(v) / target));
+                ring[j].resize(n_j);
+                for (int i = 0; i < n_j; i++)
+                    ring[j][i] = add_v(u0 + u_period * i / n_j, v);
+            }
+            const bool flip = (face.Orientation() == TopAbs_REVERSED);
+            int added = 0, expected = 0;
+            auto add_tri = [&](Mesh::Vertex_index a, Mesh::Vertex_index b,
+                               Mesh::Vertex_index c) {
+                ++expected;
+                if (flip) std::swap(b, c);
+                if (nm.add_face(a, b, c) != Mesh::null_face()) added++;
+            };
+            // Transition strip between a lower ring A and an upper ring B (both full circles,
+            // u-wrap): walk both by u-angle, advancing whichever is behind, so every point on
+            // both rings is used exactly once (nA + nB triangles).
+            auto strip = [&](const std::vector<Mesh::Vertex_index>& A,
+                             const std::vector<Mesh::Vertex_index>& B) {
+                int nA = (int)A.size(), nB = (int)B.size(), i = 0, j = 0;
+                while (i < nA || j < nB) {
+                    double aN = (double)(i + 1) / nA, bN = (double)(j + 1) / nB;
+                    if (i < nA && (j >= nB || aN <= bN)) {
+                        add_tri(A[i % nA], A[(i + 1) % nA], B[j % nB]); ++i;
+                    } else {
+                        add_tri(A[i % nA], B[(j + 1) % nB], B[j % nB]); ++j;
+                    }
+                }
+            };
+            for (int i = 0; i < (int)ring[1].size(); i++)         // south apex fan
+                add_tri(south, ring[1][(i + 1) % ring[1].size()], ring[1][i]);
+            for (int j = 1; j <= Nrows - 2; j++)                  // ring-to-ring strips
+                strip(ring[j], ring[j + 1]);
+            int nt = (int)ring[Nrows - 1].size();
+            for (int i = 0; i < nt; i++)                          // north apex fan
+                add_tri(ring[Nrows - 1][i], ring[Nrows - 1][(i + 1) % nt], north);
+            size_t open = 0;
+            for (auto h : nm.halfedges()) if (nm.is_border(h)) open++;
+            if (added != expected || open != 0) {
+                spdlog::warn("uv_grid_retessellate [face {}]: UV-sphere grid not watertight "
+                             "(added {}/{}, open {}) — keeping BRepMesh interior",
+                             face_idx, added, expected, open);
+                return UvTessResult::Failed;
+            }
+            spdlog::debug("uv_grid_retessellate [face {}]: graduated UV-sphere ({} rings, "
+                          "{} triangles), watertight", face_idx, Nrows, added);
             mesh = std::move(nm);
             return UvTessResult::Ok;
         }
