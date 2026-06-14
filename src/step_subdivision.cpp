@@ -1,29 +1,20 @@
 #include <precision_mesh/step_subdivision.h>
 #include <precision_mesh/step_tessellation.h>
 
+#include <algorithm>
 #include <cmath>
-#include <vector>
+#include <limits>
+#include <tuple>
+#include <utility>
 
 #include <spdlog/spdlog.h>
 
-#include <BRep_Builder.hxx>
 #include <BRep_Tool.hxx>
-#include <BRepAlgoAPI_Splitter.hxx>
-#include <BRepBuilderAPI_MakeEdge.hxx>
-#include <BRepBuilderAPI_Sewing.hxx>
 #include <BRepTools.hxx>
 #include <Geom_Curve.hxx>
-#include <Geom2d_Line.hxx>
 #include <GeomLProp_CLProps.hxx>
 #include <gp_Pnt.hxx>
 #include <gp_Vec.hxx>
-#include <ShapeFix_Edge.hxx>
-#include <TopoDS.hxx>
-#include <TopoDS_Compound.hxx>
-#include <TopoDS_Edge.hxx>
-#include <TopExp.hxx>
-#include <TopExp_Explorer.hxx>
-#include <TopTools_ListOfShape.hxx>
 
 std::pair<int,int> compute_cylinder_steps(const Geom_CylindricalSurface& cylinder,
                                           const TopoDS_Face& face,
@@ -255,14 +246,12 @@ std::pair<int,int> compute_revolution_steps(const Geom_SurfaceOfRevolution& revo
         }
     }
 
-    // V (profile) subdivision.  Unlike a cylinder/cone whose V is a straight ruling,
-    // the revolution profile is a general curve: its arc length is NOT proportional to
-    // the parameter, and it carries its own curvature.  The UV-grid CDT path owns the
+    // V (profile) sizing.  Unlike a cylinder/cone whose V is a straight ruling, the
+    // revolution profile is a general curve: its arc length is NOT proportional to the
+    // parameter, and it carries its own curvature.  The UV-grid CDT path owns the
     // interior (it does not lean on isotropic remeshing for V), so size V rows from
     // BOTH the profile arc length (edge-length budget) and the profile's tightest
     // radius of curvature (sagitta) — mirroring compute_torus_steps for the tube.
-    // (The old subdivision path left V to remeshing and returned v_steps=1; that path
-    // is now bypassed for revolution faces, which are CDT-eligible.)
     int v_steps = 1;
     {
         const int num_v_samples = 40;
@@ -457,100 +446,6 @@ std::pair<int,int> compute_torus_steps(const Geom_ToroidalSurface& torus,
     return {u_steps, v_steps};
 }
 
-std::vector<TopoDS_Face> subdivide_face(const TopoDS_Face& face, int u_steps, int v_steps)
-{
-    if (u_steps < 2 && v_steps < 2) {
-        return { face };
-    }
-
-    Standard_Real u_first, u_last, v_first, v_last;
-    BRepTools::UVBounds(face, u_first, u_last, v_first, v_last);
-
-    auto surface = BRep_Tool::Surface(face);
-
-    double u_range = u_last - u_first;
-    double v_range = v_last - v_first;
-
-    double u_step_size = u_range / u_steps;
-    double v_step_size = v_range / v_steps;
-
-    spdlog::debug("subdividing face ({}-{}[{}], {}-{}[{}])", u_first, u_last, u_steps,
-                  v_first, v_last, v_steps);
-
-    ShapeFix_Edge edge_fix;
-
-    // Cut extent in each direction: extend a little past the face bounds so the cut fully
-    // crosses non-periodic boundaries.  In a PERIODIC direction, however, the cut span must
-    // never reach a full period: on a face that wraps (or nearly wraps) the whole period, an
-    // extended cut runs past the seam and overlaps itself, and the splitter then leaves the
-    // seam-adjacent cells un-split (collapsing a whole band into one giant cell).  Cap the
-    // extension by the gap to the period.  This subsumes every case with no special-casing:
-    //  - full-period face (gap 0)        -> extension 0 -> span [first,last], closes cleanly;
-    //  - almost-full face (tiny gap)     -> tiny extension, span stays just under a period;
-    //  - small arc (large gap)           -> full 0.01 extension as before.
-    // It also handles faces that span ~2pi-eps with NO seam edge (a STEP 359.98-degree
-    // cylinder), which neither a UPeriod-tolerance test nor seam detection catches.
-    double u_ext = 0.01, v_ext = 0.01;
-    if (!surface.IsNull() && surface->IsUPeriodic())
-        u_ext = std::min(0.01, std::max(0.0, (surface->UPeriod() - u_range) * 0.49));
-    if (!surface.IsNull() && surface->IsVPeriodic())
-        v_ext = std::min(0.01, std::max(0.0, (surface->VPeriod() - v_range) * 0.49));
-    // U-cut lines (constant U) span V; V-cut lines (constant V) span U.
-    double v_span_lo = v_first - v_ext;
-    double v_span_len = v_range + 2 * v_ext;
-    double u_span_lo = u_first - u_ext;
-    double u_span_len = u_range + 2 * u_ext;
-
-    TopTools_ListOfShape cut_tools;
-    for (int u_step = 1; u_step < u_steps; u_step++) {
-        double u_val = u_first + u_step * u_step_size;
-        auto v_line = new Geom2d_Line(gp_Pnt2d(u_val, v_span_lo), gp_Dir2d(0, 1));
-        TopoDS_Edge v_edge = BRepBuilderAPI_MakeEdge(v_line, surface, 0, v_span_len);
-        edge_fix.FixAddCurve3d(v_edge);
-        cut_tools.Append(v_edge);
-    }
-    for (int v_step = 1; v_step < v_steps; v_step++) {
-        double v_val = v_first + v_step * v_step_size;
-        auto u_line = new Geom2d_Line(gp_Pnt2d(u_span_lo, v_val), gp_Dir2d(1, 0));
-        TopoDS_Edge u_edge = BRepBuilderAPI_MakeEdge(u_line, surface, 0, u_span_len);
-        edge_fix.FixAddCurve3d(u_edge);
-        cut_tools.Append(u_edge);
-    }
-
-    TopTools_ListOfShape cut_args;
-    cut_args.Append(face);
-
-    BRepAlgoAPI_Splitter splitter;
-    splitter.SetNonDestructive(true);
-    splitter.SetRunParallel(true);
-    splitter.SetArguments(cut_args);
-    splitter.SetTools(cut_tools);
-    splitter.Build();
-
-    const TopAbs_Orientation orig_orient = face.Orientation();
-    std::vector<TopoDS_Face> subdivs;
-    auto modified = splitter.Modified(face);
-    for (const auto& shape: modified) {
-        if (shape.ShapeType() == TopAbs_FACE) {
-            TopoDS_Face subface = TopoDS::Face(shape);
-            if (subface.Orientation() != orig_orient) {
-                subface = TopoDS::Face(subface.Reversed());
-            }
-            subdivs.push_back(subface);
-        }
-        else {
-            spdlog::warn("Modified shape is not a face.");
-        }
-    }
-
-    // Note: subdivs.size() < u_steps*v_steps is normal for trimmed faces — grid cells
-    // outside the trimmed UV region produce no sub-face.  Logged at debug only.
-    spdlog::debug("subdivs created: {} (full-grid would be {}, u_steps={} v_steps={})",
-                  subdivs.size(), u_steps * v_steps, u_steps, v_steps);
-
-    return subdivs;
-}
-
 FaceTessellationSteps get_face_tessellation_steps(const TopoDS_Face& face,
                                                    double min_edge_length,
                                                    double max_edge_length,
@@ -582,67 +477,4 @@ FaceTessellationSteps get_face_tessellation_steps(const TopoDS_Face& face,
     }
 
     return result;
-}
-
-std::tuple<TopoDS_Shape, FaceMap> subdivide_step_shape(TopoDS_Shape& shape,
-                                                        double min_edge_length,
-                                                        double max_edge_length,
-                                                        double max_surface_error)
-{
-    BRep_Builder builder;
-    TopoDS_Compound new_shape;
-    builder.MakeCompound(new_shape);
-
-    FaceMap pre_sewn_face_map;
-
-    int original_face_id = 0;
-    for (TopExp_Explorer iter(shape, TopAbs_FACE); iter.More(); iter.Next()) {
-        TopoDS_Face face = TopoDS::Face(iter.Current());
-
-        auto steps = get_face_tessellation_steps(face, min_edge_length, max_edge_length, max_surface_error);
-        int u_steps = steps.u_steps;
-        int v_steps = steps.v_steps;
-
-        // CDT-eligible face types bypass the BRepAlgoAPI_Splitter subdivision path.
-        // Their interior is filled by uv_grid_retessellate() after tessellation.
-        if (cdt_eligible(steps)) {
-            u_steps = 1;
-            v_steps = 1;
-        }
-
-        auto subdivs = subdivide_face(face, u_steps, v_steps);
-        spdlog::debug("face {}: {} sub-faces, u_steps={} v_steps={} face_orient={}",
-                      original_face_id, subdivs.size(), u_steps, v_steps, (int)face.Orientation());
-        for (const auto& subdiv: subdivs) {
-            builder.Add(new_shape, subdiv);
-            pre_sewn_face_map[subdiv] = original_face_id;
-        }
-
-        original_face_id++;
-    }
-
-    // Sewing tolerance must scale with the model (geometry is in native STEP units here).
-    // A hardcoded 0.1 was unit-agnostic (0.1 m for a metre-unit file) and, even in mm, was
-    // coarse enough to mis-merge tiny tip-region edges and break cross-strip adjacency,
-    // which fed BRepMesh inconsistent shared-edge nodes and produced twisted tessellations.
-    double sew_tolerance = min_edge_length * 0.01;
-    spdlog::debug("sewing tolerance: {} (native units)", sew_tolerance);
-    BRepBuilderAPI_Sewing sewing;
-    sewing.SetTolerance(sew_tolerance);
-    sewing.Add(new_shape);
-    sewing.Perform();
-
-    auto sewed = sewing.SewedShape();
-
-    FaceMap face_map;
-    for (const auto& [face, id] : pre_sewn_face_map) {
-        TopoDS_Shape modified = sewing.ModifiedSubShape(face);
-        if (!modified.IsNull()) {
-            for (TopExp_Explorer face_exp(modified, TopAbs_FACE); face_exp.More(); face_exp.Next()) {
-                face_map[TopoDS::Face(face_exp.Current())] = id;
-            }
-        }
-    }
-
-    return std::make_tuple(sewed, face_map);
 }

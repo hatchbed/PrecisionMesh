@@ -15,7 +15,6 @@
 #include <cstring>
 #include <map>
 #include <mutex>
-#include <set>
 #include <string>
 #include <thread>
 #include <tuple>
@@ -37,15 +36,14 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-// ── Vertex layout (9 floats = 36 bytes) ─────────────────────────────────────
+// ── Vertex layout (8 floats = 32 bytes) ─────────────────────────────────────
 struct GpuVertex {
     float x, y, z;
     float nx, ny, nz;
     float face_type;   // 0–5 (CAD primitive type)
-    float orig_mod;    // original_face_index % 12  (for "By Segment" = original CAD face)
-    float subdiv_mod;  // segment_index % 12         (for "By Subdivision" = tessellation sub-face)
+    float face_mod;    // segment_index % 12  (for "By CAD Face" coloring)
 };
-static_assert(sizeof(GpuVertex) == 36, "GpuVertex layout changed");
+static_assert(sizeof(GpuVertex) == 32, "GpuVertex layout changed");
 
 // ── Color palettes ───────────────────────────────────────────────────────────
 static const float kFaceTypeColors[6][3] = {
@@ -69,23 +67,20 @@ static const char* kTriVertSrc = R"glsl(
 layout(location=0) in vec3  a_pos;
 layout(location=1) in vec3  a_normal;
 layout(location=2) in float a_face_type;
-layout(location=3) in float a_orig_mod;
-layout(location=4) in float a_subdiv_mod;
+layout(location=3) in float a_face_mod;
 
 uniform mat4 u_mvp;
 uniform mat3 u_normal_mat;
 
 out vec3  v_normal_view;
 out float v_face_type;
-out float v_orig_mod;
-out float v_subdiv_mod;
+out float v_face_mod;
 
 void main() {
     gl_Position   = u_mvp * vec4(a_pos, 1.0);
     v_normal_view = normalize(u_normal_mat * a_normal);
     v_face_type   = a_face_type;
-    v_orig_mod    = a_orig_mod;
-    v_subdiv_mod  = a_subdiv_mod;
+    v_face_mod    = a_face_mod;
 }
 )glsl";
 
@@ -93,10 +88,9 @@ static const char* kTriFragSrc = R"glsl(
 #version 330 core
 in vec3  v_normal_view;
 in float v_face_type;
-in float v_orig_mod;
-in float v_subdiv_mod;
+in float v_face_mod;
 
-// color_mode: 0=uniform  1=face_type  2=by_segment(orig CAD face)  3=by_subdivision
+// color_mode: 0=uniform  1=face_type  2=by_cad_face
 uniform int   u_color_mode;
 uniform vec3  u_light_dir;
 uniform float u_ambient;
@@ -112,9 +106,7 @@ void main() {
     if (u_color_mode == 1)
         base = u_face_type_colors[clamp(int(v_face_type), 0, 5)];
     else if (u_color_mode == 2)
-        base = u_palette[clamp(int(v_orig_mod),   0, 11)];
-    else if (u_color_mode == 3)
-        base = u_palette[clamp(int(v_subdiv_mod), 0, 11)];
+        base = u_palette[clamp(int(v_face_mod), 0, 11)];
     else
         base = u_uniform_color;
 
@@ -232,9 +224,7 @@ struct Viewer::Impl {
     // ── Per-triangle metadata (one entry per face) ───────────────────────────
     struct TriangleMeta {
         int         face_type;
-        int         original_face_index;
-        int         segment_index;
-        int         subdiv_count;
+        int         segment_index;   // CAD face index (one segment per face)
         float       area;
         std::string surface_desc;
         std::string tess_approach;
@@ -249,10 +239,8 @@ struct Viewer::Impl {
         std::vector<float>        open_edge_xyz;   // open triangle-soup edges (magenta)
         std::vector<float>        nm_edge_xyz;     // non-manifold edges (orange, count > 2)
         std::vector<float>        healed_edge_xyz; // loop-repaired edges (green)
-        // segment_index → all border edges (for hover red wire)
+        // segment_index → this face's boundary wire (for the hover overlay)
         std::unordered_map<int, std::vector<float>> seg_borders;
-        // original_face_index → CAD-boundary border edges (for hover green wire)
-        std::unordered_map<int, std::vector<float>> orig_face_borders;
         std::string               label;
         size_t                    tri_count  = 0;
         size_t                    seg_count  = 0;
@@ -271,27 +259,21 @@ struct Viewer::Impl {
 
     // ── Hover state ───────────────────────────────────────────────────────────
     int         hover_face_type    = -1;
-    int         hover_orig_face    = -1;
-    int         hover_subdiv       = -1;
-    int         hover_subdiv_count = 0;
+    int         hover_subdiv       = -1;   // hovered CAD face index
     float       hover_area         = 0.0f;
     std::string hover_surface_desc;
     std::string hover_tess_approach;
     double      last_pick_mx = -1e9, last_pick_my = -1e9;
 
     // ── Hover wire overlay GL objects ─────────────────────────────────────────
-    GLuint  hover_subseg_vao = 0, hover_subseg_vbo = 0;   // red: hovered subsegment border
+    GLuint  hover_subseg_vao = 0, hover_subseg_vbo = 0;   // hovered face boundary
     GLsizei hover_subseg_vert_count = 0;
-    GLuint  hover_face_vao = 0, hover_face_vbo = 0;       // green: hovered original face border
-    GLsizei hover_face_vert_count = 0;
 
-    // CPU-side border data (segment_index / orig_face_index → xyz triples)
+    // CPU-side border data (segment_index → xyz triples)
     std::unordered_map<int, std::vector<float>> seg_border_lines;
-    std::unordered_map<int, std::vector<float>> face_border_lines;
 
     // Track last-uploaded hover state to avoid redundant GL uploads
     int last_uploaded_hover_subdiv    = -1;
-    int last_uploaded_hover_orig_face = -1;
 
     // Current stats (updated after upload)
     std::string current_label = "Waiting...";
@@ -313,7 +295,7 @@ struct Viewer::Impl {
 
     // ── UI state ─────────────────────────────────────────────────────────────
     int  display_mode  = 2;     // 0=solid 1=wireframe 2=solid+edges
-    int  color_mode    = 1;     // 0=uniform 1=face_type 2=segment
+    int  color_mode    = 1;     // 0=uniform 1=face_type 2=cad_face
     bool show_borders    = true;
     bool show_free_edges   = true;  // yellow: input BREP free boundary edges
     bool show_open_edges   = true;  // magenta: open triangle-soup edges (cracks)
@@ -506,10 +488,7 @@ Viewer::Viewer(int width, int height, const std::string& title)
                           (void*)offsetof(GpuVertex, face_type));
     glEnableVertexAttribArray(3);
     glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, sizeof(GpuVertex),
-                          (void*)offsetof(GpuVertex, orig_mod));
-    glEnableVertexAttribArray(4);
-    glVertexAttribPointer(4, 1, GL_FLOAT, GL_FALSE, sizeof(GpuVertex),
-                          (void*)offsetof(GpuVertex, subdiv_mod));
+                          (void*)offsetof(GpuVertex, face_mod));
     glBindVertexArray(0);
 
     // Allocate VAO/VBO for border lines (vec3 positions only)
@@ -554,20 +533,11 @@ Viewer::Viewer(int width, int height, const std::string& title)
     glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), nullptr);
     glBindVertexArray(0);
 
-    // Hover subsegment border (red)
+    // Hover face boundary overlay
     glGenVertexArrays(1, &impl_->hover_subseg_vao);
     glGenBuffers(1, &impl_->hover_subseg_vbo);
     glBindVertexArray(impl_->hover_subseg_vao);
     glBindBuffer(GL_ARRAY_BUFFER, impl_->hover_subseg_vbo);
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), nullptr);
-    glBindVertexArray(0);
-
-    // Hover original-face border (green)
-    glGenVertexArrays(1, &impl_->hover_face_vao);
-    glGenBuffers(1, &impl_->hover_face_vbo);
-    glBindVertexArray(impl_->hover_face_vao);
-    glBindBuffer(GL_ARRAY_BUFFER, impl_->hover_face_vbo);
     glEnableVertexAttribArray(0);
     glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), nullptr);
     glBindVertexArray(0);
@@ -603,8 +573,6 @@ Viewer::~Viewer() {
     glDeleteBuffers(1, &impl_->nm_edge_vbo);
     glDeleteVertexArrays(1, &impl_->hover_subseg_vao);
     glDeleteBuffers(1, &impl_->hover_subseg_vbo);
-    glDeleteVertexArrays(1, &impl_->hover_face_vao);
-    glDeleteBuffers(1, &impl_->hover_face_vbo);
     glDeleteProgram(impl_->tri_prog);
     glDeleteProgram(impl_->line_prog);
 
@@ -665,70 +633,24 @@ void Viewer::update(const std::vector<ViewerSegment>& segments,
     float bmin[3] = {1e30f, 1e30f, 1e30f};
     float bmax[3] = {-1e30f,-1e30f,-1e30f};
 
-    // ── Detect subdivision boundary edges ──────────────────────────────────
-    // A border edge shared between two segments of the SAME original CAD face
-    // is a subdivision boundary.  All other border edges are real CAD boundaries
-    // and are the only ones rendered in the border line overlay.
-    //
-    // Key: canonicalized (sorted) pair of float-precision endpoint coordinates.
-    // Border edges shared within a face group appear twice (once per segment),
-    // so a count > 1 identifies them as subdivision boundaries.
-
-    using Vec3f   = std::array<float, 3>;
-    using EdgeKey = std::pair<Vec3f, Vec3f>;
-
-    auto make_edge_key = [](const Mesh::Point& a, const Mesh::Point& b) -> EdgeKey {
-        Vec3f pa = {(float)a.x(), (float)a.y(), (float)a.z()};
-        Vec3f pb = {(float)b.x(), (float)b.y(), (float)b.z()};
-        if (pa > pb) std::swap(pa, pb);
-        return {pa, pb};
-    };
-
-    std::set<EdgeKey> subdiv_edges;
-    {
-        // Group segment indices by original_face_index
-        std::unordered_map<int, std::vector<size_t>> face_groups;
-        for (size_t i = 0; i < segments.size(); i++)
-            face_groups[segments[i].original_face_index].push_back(i);
-
-        for (auto& [orig_idx, group] : face_groups) {
-            if (group.size() <= 1) continue;
-            std::map<EdgeKey, int> edge_count;
-            for (size_t si : group) {
-                if (!segments[si].mesh) continue;
-                const Mesh& m = *segments[si].mesh;
-                for (auto e : m.edges()) {
-                    if (!m.is_border(e)) continue;
-                    auto h = m.halfedge(e, 0);
-                    edge_count[make_edge_key(m.point(m.source(h)), m.point(m.target(h)))]++;
-                }
-            }
-            for (auto& [key, cnt] : edge_count)
-                if (cnt > 1) subdiv_edges.insert(key);
-        }
-    }
-
     // ── Build vertex and border-line data ──────────────────────────────────
     for (const auto& seg : segments) {
         if (!seg.mesh) continue;
         const Mesh& mesh = *seg.mesh;
 
-        float ft       = (float)std::max(0, std::min(5, seg.face_type));
-        float orig_m   = (float)(((seg.original_face_index % 12) + 12) % 12);
-        float subdiv_m = (float)(((seg.segment_index       % 12) + 12) % 12);
+        float ft     = (float)std::max(0, std::min(5, seg.face_type));
+        float face_m = (float)(((seg.segment_index % 12) + 12) % 12);
 
-        // Hover wire overlays come from pre-sampled BRep geometry, not mesh border edges.
-        snap.seg_borders[seg.segment_index] = seg.subseg_wire;
-        if (!snap.orig_face_borders.count(seg.original_face_index))
-            snap.orig_face_borders[seg.original_face_index] = seg.orig_face_wire;
+        // Hover wire overlay comes from pre-sampled BRep geometry, not mesh border edges.
+        snap.seg_borders[seg.segment_index] = seg.face_wire;
 
-        // Global CAD-boundary overlay (cyan): mesh border edges that are not subdivision seams.
+        // Global CAD-boundary overlay (cyan): every mesh border edge is a real CAD
+        // boundary now (one segment per face — no subdivision seams to exclude).
         for (auto e : mesh.edges()) {
             if (!mesh.is_border(e)) continue;
             auto h  = mesh.halfedge(e, 0);
             auto p0 = mesh.point(mesh.source(h));
             auto p1 = mesh.point(mesh.target(h));
-            if (subdiv_edges.count(make_edge_key(p0, p1))) continue;
             snap.border_xyz.push_back((float)p0.x());
             snap.border_xyz.push_back((float)p0.y());
             snap.border_xyz.push_back((float)p0.z());
@@ -761,11 +683,10 @@ void Viewer::update(const std::vector<ViewerSegment>& segments,
                 float fx = (float)p.x(), fy = (float)p.y(), fz = (float)p.z();
                 bmin[0] = std::min(bmin[0], fx); bmin[1] = std::min(bmin[1], fy); bmin[2] = std::min(bmin[2], fz);
                 bmax[0] = std::max(bmax[0], fx); bmax[1] = std::max(bmax[1], fy); bmax[2] = std::max(bmax[2], fz);
-                snap.verts.push_back({fx, fy, fz, nx, ny, nz, ft, orig_m, subdiv_m});
+                snap.verts.push_back({fx, fy, fz, nx, ny, nz, ft, face_m});
             }
-            snap.meta.push_back({seg.face_type, seg.original_face_index, seg.segment_index,
-                                 seg.subdiv_count, seg.area, seg.surface_desc,
-                                 seg.tess_approach});
+            snap.meta.push_back({seg.face_type, seg.segment_index,
+                                 seg.area, seg.surface_desc, seg.tess_approach});
         }
         snap.tri_count += mesh.number_of_faces();
     }
@@ -859,24 +780,18 @@ static void upload_snapshot(Viewer::Impl& impl, const Viewer::Impl::Snapshot& s)
     // Copy for CPU ray picking
     impl.pick_verts = s.verts;
     impl.pick_meta  = s.meta;
-    impl.hover_face_type    = impl.hover_orig_face = impl.hover_subdiv = -1;
-    impl.hover_subdiv_count = 0;
+    impl.hover_face_type    = impl.hover_subdiv = -1;
     impl.hover_area         = 0.0f;
     impl.hover_surface_desc.clear();
     impl.hover_tess_approach.clear();
     impl.last_pick_mx = impl.last_pick_my = -1e9;
 
-    // Copy border maps for hover queries and clear hover GL buffers
+    // Copy border map for hover queries and clear the hover GL buffer
     impl.seg_border_lines  = s.seg_borders;
-    impl.face_border_lines = s.orig_face_borders;
-    impl.last_uploaded_hover_subdiv    = -1;
-    impl.last_uploaded_hover_orig_face = -1;
+    impl.last_uploaded_hover_subdiv = -1;
     glBindBuffer(GL_ARRAY_BUFFER, impl.hover_subseg_vbo);
     glBufferData(GL_ARRAY_BUFFER, 0, nullptr, GL_DYNAMIC_DRAW);
     impl.hover_subseg_vert_count = 0;
-    glBindBuffer(GL_ARRAY_BUFFER, impl.hover_face_vbo);
-    glBufferData(GL_ARRAY_BUFFER, 0, nullptr, GL_DYNAMIC_DRAW);
-    impl.hover_face_vert_count = 0;
     glBindBuffer(GL_ARRAY_BUFFER, 0);
 }
 
@@ -919,7 +834,7 @@ static void pick_under_cursor(Viewer::Impl& impl, int fb_w, int fb_h,
 
     // Mouse is over the ImGui panel — clear hover
     if (mx >= fb_w - kPanelW) {
-        impl.hover_face_type = impl.hover_orig_face = impl.hover_subdiv = -1;
+        impl.hover_face_type = impl.hover_subdiv = -1;
         return;
     }
 
@@ -956,15 +871,12 @@ static void pick_under_cursor(Viewer::Impl& impl, int fb_w, int fb_h,
     if (hit_tri >= 0) {
         const auto& m           = impl.pick_meta[hit_tri];
         impl.hover_face_type     = m.face_type;
-        impl.hover_orig_face     = m.original_face_index;
         impl.hover_subdiv        = m.segment_index;
-        impl.hover_subdiv_count  = m.subdiv_count;
         impl.hover_area          = m.area;
         impl.hover_surface_desc  = m.surface_desc;
         impl.hover_tess_approach = m.tess_approach;
     } else {
-        impl.hover_face_type    = impl.hover_orig_face = impl.hover_subdiv = -1;
-        impl.hover_subdiv_count = 0;
+        impl.hover_face_type    = impl.hover_subdiv = -1;
         impl.hover_area         = 0.0f;
         impl.hover_surface_desc.clear();
         impl.hover_tess_approach.clear();
@@ -973,44 +885,22 @@ static void pick_under_cursor(Viewer::Impl& impl, int fb_w, int fb_h,
 
 // ── Upload hover border overlays (render thread, called after pick) ───────────
 static void upload_hover_overlays(Viewer::Impl& impl) {
-    bool subdiv_changed = (impl.hover_subdiv != impl.last_uploaded_hover_subdiv);
-    bool face_changed   = (impl.hover_orig_face != impl.last_uploaded_hover_orig_face);
-    if (!subdiv_changed && !face_changed) return;
+    if (impl.hover_subdiv == impl.last_uploaded_hover_subdiv) return;
 
-    if (subdiv_changed) {
-        impl.last_uploaded_hover_subdiv = impl.hover_subdiv;
-        glBindBuffer(GL_ARRAY_BUFFER, impl.hover_subseg_vbo);
-        auto it = (impl.hover_subdiv >= 0)
-                  ? impl.seg_border_lines.find(impl.hover_subdiv)
-                  : impl.seg_border_lines.end();
-        if (it != impl.seg_border_lines.end() && !it->second.empty()) {
-            glBufferData(GL_ARRAY_BUFFER,
-                         (GLsizeiptr)(it->second.size() * sizeof(float)),
-                         it->second.data(), GL_DYNAMIC_DRAW);
-            impl.hover_subseg_vert_count = (GLsizei)(it->second.size() / 3);
-        } else {
-            glBufferData(GL_ARRAY_BUFFER, 0, nullptr, GL_DYNAMIC_DRAW);
-            impl.hover_subseg_vert_count = 0;
-        }
+    impl.last_uploaded_hover_subdiv = impl.hover_subdiv;
+    glBindBuffer(GL_ARRAY_BUFFER, impl.hover_subseg_vbo);
+    auto it = (impl.hover_subdiv >= 0)
+              ? impl.seg_border_lines.find(impl.hover_subdiv)
+              : impl.seg_border_lines.end();
+    if (it != impl.seg_border_lines.end() && !it->second.empty()) {
+        glBufferData(GL_ARRAY_BUFFER,
+                     (GLsizeiptr)(it->second.size() * sizeof(float)),
+                     it->second.data(), GL_DYNAMIC_DRAW);
+        impl.hover_subseg_vert_count = (GLsizei)(it->second.size() / 3);
+    } else {
+        glBufferData(GL_ARRAY_BUFFER, 0, nullptr, GL_DYNAMIC_DRAW);
+        impl.hover_subseg_vert_count = 0;
     }
-
-    if (face_changed) {
-        impl.last_uploaded_hover_orig_face = impl.hover_orig_face;
-        glBindBuffer(GL_ARRAY_BUFFER, impl.hover_face_vbo);
-        auto it = (impl.hover_orig_face >= 0 && impl.hover_subdiv_count > 1)
-                  ? impl.face_border_lines.find(impl.hover_orig_face)
-                  : impl.face_border_lines.end();
-        if (it != impl.face_border_lines.end() && !it->second.empty()) {
-            glBufferData(GL_ARRAY_BUFFER,
-                         (GLsizeiptr)(it->second.size() * sizeof(float)),
-                         it->second.data(), GL_DYNAMIC_DRAW);
-            impl.hover_face_vert_count = (GLsizei)(it->second.size() / 3);
-        } else {
-            glBufferData(GL_ARRAY_BUFFER, 0, nullptr, GL_DYNAMIC_DRAW);
-            impl.hover_face_vert_count = 0;
-        }
-    }
-
     glBindBuffer(GL_ARRAY_BUFFER, 0);
 }
 
@@ -1160,23 +1050,7 @@ static void render_frame(Viewer::Impl& impl) {
             glLineWidth(1.0f);
         }
 
-        // Hover original-face border (green) — drawn before subseg so red is on top
-        if (impl.hover_face_vert_count > 0) {
-            glUseProgram(impl.line_prog);
-            glUniformMatrix4fv(glGetUniformLocation(impl.line_prog, "u_mvp"),
-                               1, GL_FALSE, mvp.data());
-            glUniform4f(glGetUniformLocation(impl.line_prog, "u_color"),
-                        0.15f, 1.0f, 0.15f, 1.0f);
-            glLineWidth(3.0f);
-            glDisable(GL_DEPTH_TEST);
-            glBindVertexArray(impl.hover_face_vao);
-            glDrawArrays(GL_LINES, 0, impl.hover_face_vert_count);
-            glBindVertexArray(0);
-            glEnable(GL_DEPTH_TEST);
-            glLineWidth(1.0f);
-        }
-
-        // Hover subsegment border (red)
+        // Hover face boundary (red)
         if (impl.hover_subseg_vert_count > 0) {
             glUseProgram(impl.line_prog);
             glUniformMatrix4fv(glGetUniformLocation(impl.line_prog, "u_mvp"),
@@ -1220,10 +1094,9 @@ static void render_frame(Viewer::Impl& impl) {
     ImGui::Separator();
 
     ImGui::TextUnformatted("Color");
-    ImGui::RadioButton("Uniform",        &impl.color_mode, 0);
-    ImGui::RadioButton("By Face Type",   &impl.color_mode, 1);
-    ImGui::RadioButton("By Segment",     &impl.color_mode, 2);
-    ImGui::RadioButton("By Subdivision", &impl.color_mode, 3);
+    ImGui::RadioButton("Uniform",      &impl.color_mode, 0);
+    ImGui::RadioButton("By Face Type", &impl.color_mode, 1);
+    ImGui::RadioButton("By CAD Face",  &impl.color_mode, 2);
     ImGui::Separator();
 
     ImGui::Checkbox("CAD Boundaries", &impl.show_borders);
@@ -1240,14 +1113,8 @@ static void render_frame(Viewer::Impl& impl) {
     if (impl.hover_face_type >= 0) {
         // Surface description (wraps if long)
         ImGui::TextWrapped("  %s", impl.hover_surface_desc.c_str());
-        // Segment = original CAD face
-        ImGui::Text("  Segment: %d", impl.hover_orig_face);
-        // Subdivisions of that face
-        if (impl.hover_subdiv_count > 1) {
-            ImGui::Text("  Subdiv:  %d  (%d total)", impl.hover_subdiv, impl.hover_subdiv_count);
-        } else {
-            ImGui::TextDisabled("  (no subdivisions)");
-        }
+        // CAD face index
+        ImGui::Text("  CAD face: %d", impl.hover_subdiv);
         // Tessellation approach
         if (!impl.hover_tess_approach.empty())
             ImGui::Text("  Method:  %s", impl.hover_tess_approach.c_str());

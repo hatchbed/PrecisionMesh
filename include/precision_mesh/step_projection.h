@@ -28,15 +28,6 @@ struct StepProjector {
     BRepExtrema_DistShapeShape extrema;
 };
 
-// Projects mesh border vertices onto the wire boundary of a STEP face.
-struct StepBorderProjector {
-    StepBorderProjector();
-    StepBorderProjector(const TopoDS_Face& face);
-    void setFace(const TopoDS_Shape& face);
-    Mesh::Point operator()(const Mesh::Point& p);
-    TopoDS_Compound border;
-    BRepExtrema_DistShapeShape extrema;
-};
 
 // Per-face map from STEP vertex hash -> wire projector, shared across all segments.
 using WireProjectorCachePtr =
@@ -101,7 +92,6 @@ struct ProjectionStats {
 void project_to_step(const TopoDS_Face& face, Mesh& mesh,
                      WireProjectorCachePtr wire_projectors,
                      StepProjector& surface_projector,
-                     StepBorderProjector& border_projector,
                      double weight = 1.0,
                      size_t segment_index = 0,
                      ProjectionStats* stats_out = nullptr,
@@ -139,13 +129,10 @@ struct TessellationValidation {
 // dominates the cost on large meshes); vertex placement, watertightness, and winding
 // are always checked.  Intended as an opt-in validation pass -- BRep distance queries
 // make it slow on large meshes.
-// `edge_faces` is parallel to `segments`: the ORIGINAL (pre-subdivision) face each segment
-// came from.  Vertices are classified against that face's REAL edges (seam edges excluded) --
-// not the segment mesh's border -- so periodic seams and subdivision cuts (which are interior
-// to the continuous surface, not true part boundaries) are validated against the surface, not
-// against a boundary.  Pass `segments` itself when there was no subdivision.
+// Vertices are classified against each face's REAL edges (seam edges excluded) -- not the
+// mesh border -- so periodic seams (interior to the continuous surface, not true part
+// boundaries) are validated against the surface, not against a boundary.
 TessellationValidation validate_tessellation(const std::vector<Mesh>& meshes,
                                              const std::vector<TopoDS_Face>& segments,
-                                             const std::vector<TopoDS_Face>& edge_faces,
                                              double tolerance,
                                              int samples_per_tri = 4);

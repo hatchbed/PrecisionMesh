@@ -8,7 +8,7 @@
 #include <map>
 #include <string>
 #include <thread>
-#include <unordered_map>
+#include <tuple>
 #include <unordered_set>
 #include <vector>
 
@@ -89,8 +89,6 @@ std::unordered_set<std::string> mesh_formats = {".obj", ".off", ".ply", ".stl", 
 static void push_to_viewer(Viewer* viewer,
                             const std::vector<Mesh>& meshes,
                             const std::vector<TopoDS_Face>& segments,
-                            const std::vector<TopoDS_Face>& original_faces,
-                            const std::unordered_map<size_t, int>& component_map,
                             bool is_step,
                             const std::string& label,
                             double wire_deflection,
@@ -100,51 +98,31 @@ static void push_to_viewer(Viewer* viewer,
 {
     if (!viewer) return;
 
-    // Count how many tessellation segments belong to each original face
-    std::unordered_map<int, int> subdiv_counts;
-    for (size_t i = 0; i < meshes.size(); i++) {
-        int orig = component_map.count(i) ? component_map.at(i) : (int)i;
-        subdiv_counts[orig]++;
-    }
-
-    // Pre-sample original face wires once per unique original face index
-    std::unordered_map<int, std::vector<float>> orig_wire_cache;
-    if (is_step) {
-        for (size_t i = 0; i < meshes.size(); i++) {
-            int orig_idx = component_map.count(i) ? component_map.at(i) : (int)i;
-            if (!orig_wire_cache.count(orig_idx) && orig_idx < (int)original_faces.size())
-                orig_wire_cache[orig_idx] = sample_face_wire(original_faces[orig_idx], wire_deflection);
-        }
-    }
-
+    // One mesh per CAD face (no subdivision), so segment index == CAD face index and
+    // every face has exactly one tessellation segment.
     std::vector<ViewerSegment> vsegs;
     vsegs.reserve(meshes.size());
     for (size_t i = 0; i < meshes.size(); i++) {
-        int orig_idx = component_map.count(i) ? component_map.at(i) : (int)i;
         int ft       = 0;
         float area   = 0.0f;
         std::string desc = "Mesh";
-        std::vector<float> subseg_wire, orig_face_wire;
+        std::vector<float> face_wire;
         if (is_step && i < segments.size()) {
             ft   = get_face_type(segments[i]);
             area = get_face_area(segments[i]);
             desc = get_face_description(segments[i]);
-            subseg_wire = sample_face_wire(segments[i], wire_deflection);
-            if (orig_wire_cache.count(orig_idx))
-                orig_face_wire = orig_wire_cache[orig_idx];
+            face_wire = sample_face_wire(segments[i], wire_deflection);
         }
-        int sdivs = subdiv_counts.count(orig_idx) ? subdiv_counts[orig_idx] : 1;
         std::string approach = (approaches && i < approaches->size()) ? (*approaches)[i] : "";
-        vsegs.push_back({&meshes[i], ft, (int)i, orig_idx, sdivs, area, desc,
-                         std::move(approach), std::move(subseg_wire), std::move(orig_face_wire)});
+        vsegs.push_back({&meshes[i], ft, (int)i, area, desc,
+                         std::move(approach), std::move(face_wire)});
     }
     viewer->update(vsegs, label, free_edge_lines, healed_edge_lines);
 }
 #endif
 
 bool saveOutput(const std::vector<std::string>& outputs, const std::vector<Mesh>& meshes,
-                const std::vector<TopoDS_Face>& faces,
-                const std::unordered_map<size_t, int>& component_map, float scale=1)
+                const std::vector<TopoDS_Face>& faces, float scale=1)
 {
     bool ok = true;
     for (const auto& output: outputs) {
@@ -154,7 +132,7 @@ bool saveOutput(const std::vector<std::string>& outputs, const std::vector<Mesh>
 
         if (extension == ".ply") {
             spdlog::info("saving mesh to: {}", output);
-            ok = saveComponentsToPly<Point_traits>(output, meshes, faces, component_map, scale) && ok;
+            ok = saveComponentsToPly<Point_traits>(output, meshes, faces, scale) && ok;
         }
         else if (extension == ".stl") {
             spdlog::info("saving mesh to: {}", output);
@@ -235,12 +213,9 @@ int main(int argc, char **argv) {
     int iterations = -1;
     app.add_option("--iterations", iterations, "Iterations (0 = skip remeshing)")->check(CLI::NonNegativeNumber);
 
-    bool no_subdivision = false;
-    app.add_flag("--no-subdivision",  no_subdivision, "Skip STEP shape subdivision.");
-
     bool boundary_mesh_mode = false;
     app.add_flag("--boundary-mesh", boundary_mesh_mode,
-                 "Visualise raw sub-face boundaries (fan-polygon meshes, no BRepMesh).");
+                 "Visualise raw CAD face boundaries (fan-polygon meshes, no BRepMesh).");
 
     bool no_projection = false;
     app.add_flag("--no-projection",  no_projection, "Skip vertex reprojection.");
@@ -630,8 +605,6 @@ int main(int argc, char **argv) {
     }
 
     std::vector<TopoDS_Face> segments;
-    std::vector<TopoDS_Face> original_faces;
-    std::unordered_map<size_t, int> component_map;
     [[maybe_unused]] std::vector<float> free_edge_lines;    // input BREP free boundary edges, for the viewer (yellow)
     [[maybe_unused]] std::vector<float> healed_edge_lines; // pre-repair open edges, for the viewer (green)
 
@@ -648,8 +621,6 @@ int main(int argc, char **argv) {
                                                                            conversion_scale);
             max_surface_error = max_surface_error_auto;
         }
-
-        original_faces = get_faces(selected_component->shape);
 
         // DEBUG: report non-conformal topology in the INPUT shape -- edges adjacent to !=2
         // faces are free (open shell / un-stitched import) and tessellate to cracks that no
@@ -774,21 +745,11 @@ int main(int argc, char **argv) {
         }
 
 #ifdef PRECISION_MESH_HAS_VIEWER
-        // Sample the input's free boundary edges once (pre-subdivision) for the viewer overlay.
+        // Sample the input's free boundary edges once for the viewer overlay.
         free_edge_lines = sample_free_edges(selected_component->shape, max_surface_error);
         spdlog::info("    free-edge overlay: {} GL_LINES segments (0 = no renderable free edges)",
                      free_edge_lines.size() / 6);
 #endif
-
-        FaceMap face_map;
-        if (!no_subdivision && !raw_step_mesh) {
-            spdlog::info("  subdividing faces ...");
-
-
-            std::tie(selected_component->shape, face_map) = 
-                subdivide_step_shape(selected_component->shape, min_edge_length, max_edge_length, 
-                                     max_surface_error);
-        }
 
         spdlog::info("  tessellating ...");
 
@@ -842,16 +803,12 @@ int main(int argc, char **argv) {
 
         spdlog::info("  tessellated component into {} faces over {} segments.", total_faces, meshes.size());
 #ifdef PRECISION_MESH_HAS_VIEWER
-        push_to_viewer(viewer_ptr, meshes, segments, original_faces, component_map, is_step,
+        push_to_viewer(viewer_ptr, meshes, segments, is_step,
                        "After Tessellation", max_surface_error, free_edge_lines, healed_edge_lines);
 #endif
 
-        // Create mapping of subdivided components to the original components prior to subdivision
-        if (!face_map.empty()) {
-            for (size_t i = 0; i < segments.size(); i++) {
-                component_map[i] = face_map[segments[i]];
-            }
-        }
+        // Faces are tessellated directly from the original shape (no subdivision step),
+        // so each segment is exactly one CAD face.
     }
 
 
@@ -864,7 +821,7 @@ int main(int argc, char **argv) {
     spdlog::info("    faces: {}", total_faces_init);
 
     if (is_step && raw_step_mesh) {
-        return saveOutput(outputs, meshes, segments, {}, conversion_scale) ? 0 : 1;
+        return saveOutput(outputs, meshes, segments, conversion_scale) ? 0 : 1;
     }
 
     // CDT engagement counters, reported by --validate-report.
@@ -881,11 +838,11 @@ int main(int argc, char **argv) {
         }
 
         if (is_step) {
-            snap_border_midpoints_to_brep(meshes, segments, max_edge_length);
+            snap_border_midpoints_to_brep(meshes, segments);
         }
 
 #ifdef PRECISION_MESH_HAS_VIEWER
-        push_to_viewer(viewer_ptr, meshes, segments, original_faces, component_map, is_step,
+        push_to_viewer(viewer_ptr, meshes, segments, is_step,
                        "After Border Splitting", max_surface_error, free_edge_lines,
                        healed_edge_lines, &tess_approaches);
 #endif
@@ -936,7 +893,7 @@ int main(int argc, char **argv) {
             spdlog::info("  {} segments tessellated via UV-grid CDT", cdt_faces_succeeded);
 
 #ifdef PRECISION_MESH_HAS_VIEWER
-            push_to_viewer(viewer_ptr, meshes, segments, original_faces, component_map, is_step,
+            push_to_viewer(viewer_ptr, meshes, segments, is_step,
                            "After UV-grid CDT", max_surface_error, free_edge_lines,
                            healed_edge_lines, &tess_approaches);
 #endif
@@ -946,7 +903,6 @@ int main(int argc, char **argv) {
 
         WireProjectorCachePtr wire_projectors;
         std::vector<std::unique_ptr<StepProjector>> surface_projectors;
-        std::vector<std::unique_ptr<StepBorderProjector>> border_projectors;
         if (is_step) {
             spdlog::info("    creating edge projectors ...");
             wire_projectors = get_edge_vertex_wire_projectors(selected_component->shape);
@@ -955,7 +911,6 @@ int main(int argc, char **argv) {
                 spdlog::info("    initializing surface projectors ...");
                 for (const auto& segment : segments) {
                     surface_projectors.push_back(std::make_unique<StepProjector>(segment));
-                    border_projectors.push_back(std::make_unique<StepBorderProjector>(segment));
                 }
             }
         }
@@ -965,7 +920,7 @@ int main(int argc, char **argv) {
 #ifdef PRECISION_MESH_HAS_VIEWER
         if (viewer_ptr) {
             rparams.on_iteration_done = [&](int iter) {
-                push_to_viewer(viewer_ptr, meshes, segments, original_faces, component_map, is_step,
+                push_to_viewer(viewer_ptr, meshes, segments, is_step,
                                "Iteration " + std::to_string(iter) +
                                "/" + std::to_string(iterations),
                                max_surface_error, free_edge_lines, healed_edge_lines,
@@ -973,14 +928,14 @@ int main(int argc, char **argv) {
             };
         }
 #endif
-        remesh_and_project(meshes, segments, wire_projectors, surface_projectors, border_projectors,
+        remesh_and_project(meshes, segments, wire_projectors, surface_projectors,
                            rparams, use_uv_tess);
     } else {
         spdlog::info("  skipping remeshing (--iterations 0).");
     }
 
 #ifdef PRECISION_MESH_HAS_VIEWER
-    push_to_viewer(viewer_ptr, meshes, segments, original_faces, component_map, is_step,
+    push_to_viewer(viewer_ptr, meshes, segments, is_step,
                    "Final Result", max_surface_error, free_edge_lines, healed_edge_lines,
                    &tess_approaches);
     if (viewer_ptr) viewer_ptr->notify_done();
@@ -989,15 +944,7 @@ int main(int argc, char **argv) {
     if (validate && is_step) {
         spdlog::info("validating tessellation (this may be slow) ...");
         double vtol = std::max(min_edge_length * 0.1, 1e-9);
-        // Each segment validates against the REAL edges of the ORIGINAL face it came from
-        // (so seams and subdivision cuts aren't treated as boundaries).
-        std::vector<TopoDS_Face> edge_faces(segments.size());
-        for (size_t i = 0; i < segments.size(); i++) {
-            int orig = component_map.count(i) ? component_map.at(i) : (int)i;
-            edge_faces[i] = (orig >= 0 && orig < (int)original_faces.size())
-                            ? original_faces[orig] : segments[i];
-        }
-        auto vr = validate_tessellation(meshes, segments, edge_faces, vtol,
+        auto vr = validate_tessellation(meshes, segments, vtol,
                                         validate_surface_error ? 4 : 0);
         spdlog::info("  validation ({} segments, {} triangles, tol={:.4g} {}):",
                      vr.segments, vr.total_tris, vtol * conversion_scale, output_unit);
@@ -1052,7 +999,6 @@ int main(int argc, char **argv) {
                 report << fmt::format("  max_surface_error: {:.6g}\n", max_surface_error * cs);
                 report << fmt::format("  max_boundary_surface_error: {:.6g}\n",
                                       max_boundary_surface_error * cs);
-                report << fmt::format("  no_subdivision: {}\n", no_subdivision);
                 report << fmt::format("  no_projection: {}\n", no_projection);
                 report << fmt::format("  no_uv_tess: {}\n", no_uv_tess);
                 report << fmt::format("  no_tess_repair: {}\n", no_tess_repair);
@@ -1097,7 +1043,7 @@ int main(int argc, char **argv) {
         spdlog::warn("--validate-report requires a STEP input; no report written.");
     }
 
-    return saveOutput(outputs, meshes, original_faces, component_map, conversion_scale) ? 0 : 1;
+    return saveOutput(outputs, meshes, segments, conversion_scale) ? 0 : 1;
 
     }; // end do_pipeline lambda
 

@@ -61,7 +61,7 @@ namespace PMP = CGAL::Polygon_mesh_processing;
 
 
 // -- Inverted-face repair (A2-detect-fix) ------------------------------------
-// Some valid sub-faces with extreme UV-parameter anisotropy are mis-triangulated by
+// Some valid faces with extreme UV-parameter anisotropy are mis-triangulated by
 // BRepMesh (folded / crossed triangles).  We detect triangles whose winding opposes
 // the face's outward normal and rebuild the face's connectivity from its EXISTING
 // boundary + interior nodes via a constrained Delaunay triangulation on the best-fit
@@ -276,10 +276,9 @@ static std::vector<std::array<size_t,3>> cr_retriangulate_face(
     bool planar = (max_dev <= 0.1 * ext);
 
     // Near-planar faces triangulate on the best-fit PLANE -- robust even when the
-    // surface's UV parameterization is folded/non-injective over the sub-face (as on
-    // some subdivided faces, where the cap and far edges run in opposite U directions
-    // so the seams become crossing diagonals in UV).  Only genuinely curved faces fall
-    // back to the (normalized) UV domain.
+    // surface's UV parameterization is folded/non-injective over the face (e.g. cap and
+    // far edges running in opposite U directions, so the seams become crossing diagonals
+    // in UV).  Only genuinely curved faces fall back to the (normalized) UV domain.
     bool use_uv = false;
     std::unordered_map<size_t, std::pair<double,double>> uv_of;
     if (!planar) {
@@ -292,10 +291,10 @@ static std::vector<std::array<size_t,3>> cr_retriangulate_face(
                 vmin = std::min(vmin, p.Y()); vmax = std::max(vmax, p.Y());
             }
             double du = umax - umin, dvv = vmax - vmin;
-            // Reject seam-straddling sub-faces: across a periodic seam the UV nodes split to
+            // Reject seam-straddling faces: across a periodic seam the UV nodes split to
             // both ends of the period, so the UV box spans ~a full period and a UV-domain
             // triangulation maps to overlapping/crossed triangles in 3D.  A non-straddling
-            // sub-face spans only its (sub-)sector, well under half a period.
+            // face spans only its sector, well under half a period.
             Handle(Geom_Surface) psurf = BRep_Tool::Surface(face);
             bool seam_straddle = false;
             if (!psurf.IsNull()) {
@@ -303,7 +302,7 @@ static std::vector<std::array<size_t,3>> cr_retriangulate_face(
                 if (psurf->IsVPeriodic() && dvv > 0.5 * psurf->VPeriod()) seam_straddle = true;
             }
             if (seam_straddle) {
-                spdlog::debug("    seg {} retri bail: seam-straddling sub-face (UV span {:.4g} x {:.4g})",
+                spdlog::debug("    seg {} retri bail: seam-straddling face (UV span {:.4g} x {:.4g})",
                               seg_idx, du, dvv);
                 reason = CrBail::SelfIntersect;
                 return {};
@@ -558,10 +557,10 @@ std::vector<std::pair<Mesh, TopoDS_Face>> tessellate_shape(const TopoDS_Shape& s
                 //  (1) it doesn't drop coverage (count >= original; a hole would reduce it);
                 //  (2) it has no folded triangles of its own (catches overlapping/crossed
                 //      triangulations the count alone can't see, e.g. seam-straddling
-                //      sub-faces whose UV is discontinuous);
+                //      faces whose UV is discontinuous);
                 //  (3) it doesn't introduce a much thinner triangle than the original -- a
-                //      sliver, typically from incorporating near-duplicate vertices left by
-                //      inconsistent subdivision/sewing, which the repair can't cleanly fix.
+                //      sliver, typically from incorporating near-duplicate vertices on a
+                //      densely-sampled shared edge, which the repair can't cleanly fix.
                 auto min_edge_sq = [&](const auto& tris) {
                     double m = std::numeric_limits<double>::max();
                     for (const auto& t : tris) {

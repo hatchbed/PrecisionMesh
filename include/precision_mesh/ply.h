@@ -2,7 +2,7 @@
 
 #include <fstream>
 #include <iostream>
-#include <unordered_map>
+#include <map>
 
 #include <tinyply.h>
 #include <TopoDS_Face.hxx>
@@ -11,10 +11,9 @@
 #include <precision_mesh/step_face_util.h>
 
 template <typename Traits>
-bool saveComponentsToPly(const std::string& path, const std::vector<Mesh>& components, 
+bool saveComponentsToPly(const std::string& path, const std::vector<Mesh>& components,
                          const std::vector<TopoDS_Face>& step_faces,
-                         const std::unordered_map<size_t, int>& component_map, 
-                         float scale=1) 
+                         float scale=1)
 {
     Traits traits;
 
@@ -30,11 +29,8 @@ bool saveComponentsToPly(const std::string& path, const std::vector<Mesh>& compo
     VertexIndex vertex_lookup(traits.less_xyz_3_object());
 
     for (size_t i = 0; i < components.size(); i++) {
+        // One mesh per CAD face (no subdivision), so the component id is the index.
         int component_id = i;
-        auto component_id_it = component_map.find(i);
-        if (component_id_it != component_map.end()) {
-            component_id = component_id_it->second;
-        }
 
         const auto& mesh = components[i];
         for (const auto& f : mesh.faces()) {

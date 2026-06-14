@@ -12,17 +12,14 @@
 
 struct ViewerSegment {
     const Mesh* mesh;
-    int         face_type;           // 0=Other 1=Plane 2=Cylinder 3=Sphere 4=Torus 5=Cone
-    int         segment_index;       // index within the subdivided tessellation
-    int         original_face_index; // index of the original un-subdivided CAD face
-    int         subdiv_count;        // total number of tessellation segments for this CAD face
-    float       area;                // surface area in model units
-    std::string surface_desc;        // human-readable surface description
-    std::string tess_approach;       // tessellation method used for this segment
-    // Pre-tessellation BRep wire samples for hover overlays (GL_LINES xyz pairs).
-    // Sampled directly from the STEP geometry, not derived from the mesh.
-    std::vector<float> subseg_wire;    // boundary of this sub-face (red hover)
-    std::vector<float> orig_face_wire; // boundary of the original un-subdivided face (green hover)
+    int         face_type;       // 0=Other 1=Plane 2=Cylinder 3=Sphere 4=Torus 5=Cone
+    int         segment_index;   // index of the CAD face (one segment per face)
+    float       area;            // surface area in model units
+    std::string surface_desc;    // human-readable surface description
+    std::string tess_approach;   // tessellation method used for this segment
+    // Pre-tessellation BRep wire of this face's boundary for the hover overlay
+    // (GL_LINES xyz pairs, sampled from the STEP geometry, not the mesh).
+    std::vector<float> face_wire;
 };
 
 class Viewer {

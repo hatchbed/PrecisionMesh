@@ -134,8 +134,7 @@ void split_crease_edges(std::vector<Mesh>& meshes, double crease_angle, double m
 }
 
 void snap_border_midpoints_to_brep(std::vector<Mesh>& meshes,
-                                   const std::vector<TopoDS_Face>& segments,
-                                   double max_edge_length)
+                                   const std::vector<TopoDS_Face>& segments)
 {
     if (segments.empty()) return;
 
@@ -247,7 +246,6 @@ void remesh_and_project(
     const std::vector<TopoDS_Face>& segments,
     WireProjectorCachePtr wire_projectors,
     std::vector<std::unique_ptr<StepProjector>>& surface_projectors,
-    std::vector<std::unique_ptr<StepBorderProjector>>& border_projectors,
     const RemeshParams& params,
     const std::vector<bool>& skip_mask)
 {
@@ -616,7 +614,7 @@ void remesh_and_project(
                     for (size_t m = r.begin(); m != r.end(); ++m) {
                         if (skip(m)) continue;
                         project_to_step(segments[m], meshes[m], wire_projectors,
-                                        *surface_projectors[m], *border_projectors[m],
+                                        *surface_projectors[m],
                                         weight, m, &seg_stats[m],
                                         params.max_edge_length);
                     }});

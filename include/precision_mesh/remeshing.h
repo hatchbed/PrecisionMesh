@@ -32,8 +32,7 @@ void split_border_edges(std::vector<Mesh>& meshes, double max_edge_length);
 // midpoints (sagitta=0) are already on the edge and skipped; curved-edge midpoints
 // (0 < sagitta <= max_edge_length/2) are snapped.
 void snap_border_midpoints_to_brep(std::vector<Mesh>& meshes,
-                                   const std::vector<TopoDS_Face>& segments,
-                                   double max_edge_length);
+                                   const std::vector<TopoDS_Face>& segments);
 
 // Detect sharp crease edges and split those longer than max_edge_length.
 // Only meaningful for generic (non-STEP) meshes; the crease property map is
@@ -50,6 +49,5 @@ void remesh_and_project(
     const std::vector<TopoDS_Face>& segments,
     WireProjectorCachePtr wire_projectors,
     std::vector<std::unique_ptr<StepProjector>>& surface_projectors,
-    std::vector<std::unique_ptr<StepBorderProjector>>& border_projectors,
     const RemeshParams& params,
     const std::vector<bool>& skip_mask = {});

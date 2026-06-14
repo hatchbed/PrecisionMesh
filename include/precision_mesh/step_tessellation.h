@@ -17,7 +17,7 @@ std::vector<std::pair<Mesh, TopoDS_Face>> tessellate_shape(const TopoDS_Shape& s
                                                             bool repair_inverted_faces = true);
 
 // Build minimal fan-polygon meshes from each face's boundary wire vertices,
-// bypassing BRepMesh entirely.  Useful for visualising raw subdivision geometry.
+// bypassing BRepMesh entirely.  Useful for visualising raw CAD face boundaries.
 std::vector<std::pair<Mesh, TopoDS_Face>> boundary_meshes(const TopoDS_Shape& shape);
 
 // Count border edges shorter than min_edge_length, ignoring planar faces.

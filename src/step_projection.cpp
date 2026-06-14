@@ -57,34 +57,6 @@ Mesh::Point StepProjector::operator()(const Mesh::Point& p) {
     return Mesh::Point(nearest.X(), nearest.Y(), nearest.Z());
 }
 
-StepBorderProjector::StepBorderProjector() {}
-
-StepBorderProjector::StepBorderProjector(const TopoDS_Face& face) {
-    BRep_Builder builder;
-    builder.MakeCompound(border);
-    for (TopExp_Explorer wire_exp(face, TopAbs_WIRE); wire_exp.More(); wire_exp.Next()) {
-        builder.Add(border, TopoDS::Wire(wire_exp.Current()));
-    }
-    extrema.LoadS1(border);
-}
-
-void StepBorderProjector::setFace(const TopoDS_Shape& face) {
-    BRep_Builder builder;
-    builder.MakeCompound(border);
-    for (TopExp_Explorer wire_exp(face, TopAbs_WIRE); wire_exp.More(); wire_exp.Next()) {
-        builder.Add(border, TopoDS::Wire(wire_exp.Current()));
-    }
-    extrema.LoadS1(border);
-}
-
-Mesh::Point StepBorderProjector::operator()(const Mesh::Point& p) {
-    TopoDS_Vertex vertex = BRepBuilderAPI_MakeVertex(gp_Pnt(p[0], p[1], p[2]));
-    extrema.LoadS2(vertex);
-    extrema.Perform();
-    auto nearest = extrema.PointOnShape1(1);
-    return Mesh::Point(nearest.X(), nearest.Y(), nearest.Z());
-}
-
 TopoDS_Wire get_border_loop_wire(
     const TopoDS_Vertex& vertex,
     const TopTools_IndexedDataMapOfShapeListOfShape& vertex_to_edge_map,
@@ -371,7 +343,6 @@ void ProjectionStats::merge(const ProjectionStats& other)
 void project_to_step(const TopoDS_Face& face, Mesh& mesh,
                      WireProjectorCachePtr wire_projectors,
                      StepProjector& surface_projector,
-                     StepBorderProjector& border_projector,
                      double weight,
                      size_t segment_index,
                      ProjectionStats* stats_out,
@@ -387,10 +358,9 @@ void project_to_step(const TopoDS_Face& face, Mesh& mesh,
 
     // Build a compound of real (non-seam) BREP edges for geometry-based vertex
     // classification — same pattern as validate_tessellation.  mesh.is_border(v)
-    // conflates two classes: true BREP boundary / subdivision cut (→ wire) and
-    // periodic seam (interior to the surface → surface).  Seam vertices routed
-    // to the wire fallback drift to the wrong edge over iterations.
-    // Subdivision cut edges are intentional boundaries and are deliberately included.
+    // conflates two classes: true BREP boundary (→ wire) and periodic seam (interior
+    // to the surface → surface).  Seam vertices routed to the wire fallback drift to
+    // the wrong edge over iterations, so they must be classified to the surface.
     BRep_Builder ec_builder;
     TopoDS_Compound edge_comp;
     ec_builder.MakeCompound(edge_comp);
@@ -462,8 +432,8 @@ void project_to_step(const TopoDS_Face& face, Mesh& mesh,
                pz = CGAL::to_double(input.z());
 
         // All vertices that were on the mesh border when remesh_and_project set up the
-        // constraint maps are immutable: exact BRepMesh placements, consistent chord
-        // midpoints from split_border_edges, or subdivision-cut boundary vertices.
+        // constraint maps are immutable: exact BRepMesh placements, or consistent chord
+        // midpoints from split_border_edges.
         // Projecting them independently per segment causes adjacent segments to diverge.
         // This is a fast identity check — no OCCT distance queries needed.
         if (border_locked[v]) {
@@ -602,7 +572,6 @@ double get_distance_to_face(const TopoDS_Face& face, double x, double y, double 
 
 TessellationValidation validate_tessellation(const std::vector<Mesh>& meshes,
                                              const std::vector<TopoDS_Face>& segments,
-                                             const std::vector<TopoDS_Face>& edge_faces,
                                              double tolerance, int samples_per_tri)
 {
     auto dist_to = [](BRepExtrema_DistShapeShape& ext, const Mesh::Point& p) -> double {
@@ -626,17 +595,15 @@ TessellationValidation validate_tessellation(const std::vector<Mesh>& meshes,
             TessellationValidation& p = partials[m];
             double err_sum = 0.0;
 
-            // Validate against the ORIGINAL face's REAL edges, excluding the periodic seam
-            // (a seam is interior to the continuous surface, not a part boundary) -- and NOT
-            // against the segment's mesh border, which also includes subdivision cuts.  When
-            // there was no subdivision, edge_faces[m] == segments[m].
-            const TopoDS_Face& edge_face = (m < edge_faces.size()) ? edge_faces[m] : face;
+            // Validate against the face's REAL edges, excluding the periodic seam (a seam
+            // is interior to the continuous surface, not a part boundary) -- NOT against the
+            // mesh border, which also includes seam edges.
             BRep_Builder builder;
             TopoDS_Compound edge_comp;
             builder.MakeCompound(edge_comp);
-            for (TopExp_Explorer ee(edge_face, TopAbs_EDGE); ee.More(); ee.Next()) {
+            for (TopExp_Explorer ee(face, TopAbs_EDGE); ee.More(); ee.Next()) {
                 const TopoDS_Edge& e = TopoDS::Edge(ee.Current());
-                if (BRep_Tool::IsClosed(e, edge_face)) continue;   // seam edge -- not a boundary
+                if (BRep_Tool::IsClosed(e, face)) continue;   // seam edge -- not a boundary
                 builder.Add(edge_comp, e);
             }
             BRepExtrema_DistShapeShape edge_ext;
@@ -646,9 +613,9 @@ TessellationValidation validate_tessellation(const std::vector<Mesh>& meshes,
 
             for (auto v : mesh.vertices()) {
                 const auto& pt = mesh.point(v);
-                // Classify by proximity to a REAL original edge, not by mesh.is_border:
+                // Classify by proximity to a REAL edge, not by mesh.is_border:
                 // a vertex on a real edge is a boundary vertex; everything else (true
-                // interior, seam, subdivision cut) must lie on the surface.
+                // interior, seam) must lie on the surface.
                 double de = dist_to(edge_ext, pt);
                 if (de >= 0 && de <= tolerance) {
                     p.border_verts++;
@@ -831,8 +798,7 @@ TessellationValidation validate_tessellation(const std::vector<Mesh>& meshes,
         for (size_t m = 0; m < n; m++) {
             const Mesh& mesh = meshes[m];
             std::vector<std::array<double,3>> corners;
-            const TopoDS_Face& ef = (m < edge_faces.size()) ? edge_faces[m] : segments[m];
-            for (TopExp_Explorer ve(ef, TopAbs_VERTEX); ve.More(); ve.Next()) {
+            for (TopExp_Explorer ve(segments[m], TopAbs_VERTEX); ve.More(); ve.Next()) {
                 gp_Pnt cp = BRep_Tool::Pnt(TopoDS::Vertex(ve.Current()));
                 corners.push_back({cp.X(), cp.Y(), cp.Z()});
             }

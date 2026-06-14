@@ -124,14 +124,6 @@ static std::string curve_type_name(const Handle(Geom_Curve)& c) {
 
 // -- Public API ----------------------------------------------------------------
 
-std::vector<TopoDS_Face> get_faces(const TopoDS_Shape& shape) {
-    std::vector<TopoDS_Face> faces;
-    for (TopExp_Explorer iter(shape, TopAbs_FACE); iter.More(); iter.Next()) {
-        faces.push_back(TopoDS::Face(iter.Current()));
-    }
-    return faces;
-}
-
 int get_face_type(const TopoDS_Face& face) {
     auto surface = BRep_Tool::Surface(face);
 
