@@ -1144,20 +1144,11 @@ UvTessResult uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_ste
         v_apex = sphere_v_apex;
     }
 
-    // Torus faces fully periodic in V need v-seam pair insertion + v-seam wrap
-    // detection in constraint insertion and oriented_mark — the same machinery as
-    // the u-seam path but for the tube (V) direction.  Not yet implemented; skip
-    // and keep the BRepMesh interior for those faces.  Quarter/half-torus fillets
-    // (the common case) have partial v spans and are NOT affected.
-    if (is_torus && v_per && v_period > 1e-9) {
-        double v_span = std::abs(surf.LastVParameter() - surf.FirstVParameter());
-        if (v_span >= v_period * 0.99) {
-            spdlog::info("uv_grid_retessellate [face {}]: torus face spans full v-period "
-                         "— v-seam machinery not yet implemented, keeping BRepMesh interior",
-                         face_idx);
-            return UvTessResult::Skipped;
-        }
-    }
+    // Torus faces fully periodic in V (the tube wraps: donut_c) are now handled by the
+    // V-seam machinery below — the mirror of the U-seam path for the tube direction: a
+    // v-wrap closing-edge skip in constraint insertion / near_border / oriented_mark
+    // (sets v_seam_skipped), and a dedicated v-seam-pair ring welding the v_lo and v_hi
+    // boundary rings by identical evaluation.  No early Skip gate needed.
 
     // Revolution corner cases — keep the BRepMesh interior (never guess):
     //   - Pole: the profile meets the axis (r->0).  The rectangular development cannot
@@ -1276,15 +1267,25 @@ UvTessResult uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_ste
     Handle(Geom_Surface) geom_surf = BRep_Tool::Surface(face);
     ShapeAnalysis_Surface sa(geom_surf);
 
+    // The face's seam direction: a face that spans the full U period (cylinder/cone/sphere
+    // cap) wraps in U; one that spans the full V period (torus tube — donut_c) wraps in V.
+    // The rotation/unroll/append seam handling is run for that direction.  For a V-seam face
+    // the U-path is disabled (even though the surface is U-periodic) so the two are never
+    // applied at once; this is the ONLY change to existing (U-seam) faces — they have
+    // v_seam_dir = false and follow the unchanged U-path.
+    const bool v_seam_dir = v_per && v_period > 1e-9 &&
+        std::abs(surf.LastVParameter() - surf.FirstVParameter()) >= v_period * 0.99;
+    const bool u_seam_active = u_per && u_period > 1e-9 && !v_seam_dir;
+
     std::vector<std::vector<std::pair<double,double>>> loop_uvs(loops.size());
     for (size_t li = 0; li < loops.size(); li++) {
         size_t N = loops[li].size();
 
         // --- ARRAY ROTATION PASS ---
-        // Find the vertex geometrically closest to the U=0 seam and rotate the array
-        // so it becomes Index 0. This forces the unroller to anchor both the top
-        // and bottom cylinder caps to the exact same starting column.
-        if (u_per && u_period > 1e-9) {
+        // Find the vertex geometrically closest to the seam and rotate the array so it
+        // becomes Index 0.  This anchors both end loops to the same starting column so the
+        // seam pair welds cleanly (U-seam: anchor min-u; V-seam: anchor min-v).
+        if (u_seam_active) {
             double min_u = std::numeric_limits<double>::max();
             size_t min_idx = 0;
             for (size_t i = 0; i < N; i++) {
@@ -1301,6 +1302,20 @@ UvTessResult uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_ste
                     min_u = canon_u;
                     min_idx = i;
                 }
+            }
+            std::rotate(loops[li].begin(), loops[li].begin() + min_idx, loops[li].end());
+            std::rotate(loop_hes[li].begin(), loop_hes[li].begin() + min_idx, loop_hes[li].end());
+        } else if (v_seam_dir) {
+            double min_v = std::numeric_limits<double>::max();
+            size_t min_idx = 0;
+            for (size_t i = 0; i < N; i++) {
+                auto p = mesh.point(loops[li][i]);
+                gp_Pnt p3d(CGAL::to_double(p.x()), CGAL::to_double(p.y()), CGAL::to_double(p.z()));
+                gp_Pnt2d uv2d = sa.ValueOfUV(p3d, 1e-7);
+                double canon_v = std::fmod(uv2d.Y(), v_period);
+                if (canon_v < 0) canon_v += v_period;
+                if (v_period - canon_v < 1e-5) canon_v = 0.0;
+                if (canon_v < min_v) { min_v = canon_v; min_idx = i; }
             }
             std::rotate(loops[li].begin(), loops[li].begin() + min_idx, loops[li].end());
             std::rotate(loop_hes[li].begin(), loop_hes[li].begin() + min_idx, loop_hes[li].end());
@@ -1323,10 +1338,15 @@ UvTessResult uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_ste
             // places the loops one full period apart, making the CDT span two periods
             // (duplicate 3D evaluations -> merged vertices -> overlapping triangles ->
             // open edges along the seam).
-            if (i == 0 && u_per && u_period > 1e-9) {
+            if (i == 0 && u_seam_active) {
                 u_curr = std::fmod(u_curr, u_period);
                 if (u_curr < 0) u_curr += u_period;
                 if (u_period - u_curr < 1e-5) u_curr = 0.0;
+            }
+            if (i == 0 && v_seam_dir) {
+                v_curr = std::fmod(v_curr, v_period);
+                if (v_curr < 0) v_curr += v_period;
+                if (v_period - v_curr < 1e-5) v_curr = 0.0;
             }
 
             if (i > 0) {
@@ -1344,7 +1364,17 @@ UvTessResult uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_ste
         }
 
         // --- PERIODIC SEAM DUPLICATION ---
-        if (u_per && u_period > 1e-9) {
+        // Append vertex 0's copy one period along the seam direction so the closing edge
+        // spans the seam (Δ ≈ period) and is detected/skipped, and the seam pair welds.
+        if (v_seam_dir) {
+            double v_curr = loop_uvs[li][0].second;
+            double v_prev = loop_uvs[li][N-1].second;
+            double dv = v_curr - v_prev;
+            while (dv > v_period * 0.5)  { v_curr -= v_period; dv = v_curr - v_prev; }
+            while (dv < -v_period * 0.5) { v_curr += v_period; dv = v_curr - v_prev; }
+            loop_uvs[li][N] = {loop_uvs[li][0].first, v_curr};
+            loops[li].push_back(loops[li][0]);
+        } else if (u_per && u_period > 1e-9) {
             double u_curr = loop_uvs[li][0].first;
             double u_prev = loop_uvs[li][N-1].first;
             double du = u_curr - u_prev;
@@ -1358,9 +1388,18 @@ UvTessResult uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_ste
         }
 
         // ==============================================================
-        // Alignment Pass: Shift the entire loop so the minimum U is canonical [0, u_period)
+        // Alignment Pass: shift the loop so the minimum seam coordinate is canonical
+        // [0, period) — U for a U-seam face, V for a V-seam face.
         // ==============================================================
-        if (u_per && u_period > 1e-9) {
+        if (v_seam_dir) {
+            double min_v = std::numeric_limits<double>::max();
+            for (const auto& uv : loop_uvs[li]) min_v = std::min(min_v, uv.second);
+            double target_min = std::fmod(min_v, v_period);
+            if (target_min < 0.0) target_min += v_period;
+            double shift = target_min - min_v;
+            if (std::abs(shift) > 1e-9)
+                for (auto& uv : loop_uvs[li]) uv.second += shift;
+        } else if (u_per && u_period > 1e-9) {
             double min_u = std::numeric_limits<double>::max();
             for (const auto& uv : loop_uvs[li]) {
                 min_u = std::min(min_u, uv.first);
@@ -1398,6 +1437,10 @@ UvTessResult uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_ste
         // border loop is topologically open at the seam, so nesting-level domain marking would
         // leak — we fall back to centroid classification for those (full-cylinder) faces.
         bool seam_skipped = false;
+        // Same, for a V-periodic seam (the torus tube wraps: donut_c / donut).  Tracked
+        // separately so the ring sampler can place the v-seam-pair ring and domain marking
+        // can treat either/both seams as open.
+        bool v_seam_skipped = false;
         std::vector<std::vector<CRCDT::Vertex_handle>> loop_vhs(loops.size());
         try {
             for (size_t li = 0; li < loops.size(); li++) {
@@ -1433,16 +1476,26 @@ UvTessResult uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_ste
                     double dx = pa.x() - pb.x(), dy = pa.y() - pb.y();
                     if (dx*dx + dy*dy < 1e-20) continue;
                     // For periodic faces the last loop edge is the seam-wrap closing edge
-                    // (Δu ≈ ±u_period in unrolled UV — detected there, not in mapped 2D
-                    // coordinates).  Skip it — the seam is implicitly enforced by the
-                    // convex hull of the border vertices.
-                    if (u_per && u_period > 1e-9 && i == vhs.size() - 1) {
+                    // (Δu ≈ ±u_period or Δv ≈ ±v_period in unrolled UV — detected there, not
+                    // in mapped 2D coordinates).  Skip it — the seam is implicitly enforced by
+                    // the convex hull of the border vertices + the seam-pair Steiner weld.
+                    if (i == vhs.size() - 1) {
                         double du_uv = loop_uvs[li][i].first -
                                        loop_uvs[li][(i + 1) % vhs.size()].first;
-                        if (std::abs(std::abs(du_uv) - u_period) < u_period * 0.01) {
-                            spdlog::debug("  loop {}: skip seam-wrap closing constraint |du|={:.4f}",
+                        double dv_uv = loop_uvs[li][i].second -
+                                       loop_uvs[li][(i + 1) % vhs.size()].second;
+                        if (u_per && u_period > 1e-9 &&
+                            std::abs(std::abs(du_uv) - u_period) < u_period * 0.01) {
+                            spdlog::debug("  loop {}: skip u-seam-wrap closing constraint |du|={:.4f}",
                                           li, std::abs(du_uv));
                             seam_skipped = true;
+                            continue;
+                        }
+                        if (v_per && v_period > 1e-9 &&
+                            std::abs(std::abs(dv_uv) - v_period) < v_period * 0.01) {
+                            spdlog::debug("  loop {}: skip v-seam-wrap closing constraint |dv|={:.4f}",
+                                          li, std::abs(dv_uv));
+                            v_seam_skipped = true;
                             continue;
                         }
                     }
@@ -1494,11 +1547,16 @@ UvTessResult uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_ste
                     size_t nseg = uvl.size();
                     for (size_t i = 0; i < nseg; i++) {
                         size_t j = (i + 1) % nseg;
-                        if (j == 0 && u_per && u_period > 1e-9) {
+                        if (j == 0) {
                             // Closing edge: skip the periodic seam-wrap (same rule as the
                             // constraint insertion); for non-periodic loops it is real.
                             double du = uvl[i].first - uvl[0].first;
-                            if (std::abs(std::abs(du) - u_period) < u_period * 0.01)
+                            double dv = uvl[i].second - uvl[0].second;
+                            if (u_per && u_period > 1e-9 &&
+                                std::abs(std::abs(du) - u_period) < u_period * 0.01)
+                                continue;
+                            if (v_per && v_period > 1e-9 &&
+                                std::abs(std::abs(dv) - v_period) < v_period * 0.01)
                                 continue;
                         }
                         auto a2 = to2d(uvl[i].first, uvl[i].second);
@@ -1595,7 +1653,9 @@ UvTessResult uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_ste
                     // Skip for revolution: this narrow-face snap reasons in param-space
                     // gaps (uv_dv_step), which are not metric for a non-constant-|dS/dv|
                     // profile; the arc-length rows above are already metric-correct.
-                    const bool could_be_seam_row = seam_skipped && u_per && u_period > 1e-9;
+                    const bool could_be_seam_row =
+                        (seam_skipped && u_per && u_period > 1e-9) ||
+                        (v_seam_skipped && v_per && v_period > 1e-9);
                     if (!could_be_seam_row && !is_revolution && !is_extrusion) {
                         const double u_span_sc = std::max(u_max_g - u_min_g, 1e-12);
                         const double r_at_mid = row_radius((v_lo_ring + v_hi_ring) / 2.0);
@@ -1782,6 +1842,49 @@ UvTessResult uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_ste
                         }
                     }
                 }
+                // V-seam pair ring: a V-periodic face (the torus tube wraps — donut_c)
+                // develops with the v_lo and v_hi rings at opposite ends of the rectangle;
+                // they are the SAME 3D ring (v_period apart) and must weld.  Place one ring
+                // of interior u-points at the seam, emitting BOTH the v_lo and v_hi copy per
+                // point with a SHARED u + v perturbation so the two copies stay exactly
+                // v_period apart -> identical 3D evaluation -> the position merge welds them,
+                // continuing the lattice through the v-seam.  The per-point v-perturbation
+                // also breaks the constant-v collinearity.  (U-bounded case only — donut_c;
+                // the doubly-periodic donut adds the u-seam pairs in a later stage.)
+                if (v_seam_skipped && !seam_skipped) {
+                    double r_k = row_radius(v_lo_ring);
+                    double span = std::max(u_max_g - u_min_g, 1e-12);
+                    int n_k = std::max(1, (int)std::round(span * r_k / target));
+                    if (n_k == 1) n_k = 2;
+                    double du_k = span / n_k;
+                    for (int j = 1; j <= n_k - 1; j++) {
+                        // Perturb only U (the along-seam direction), SHARED by both v-copies
+                        // so they stay EXACTLY v_period apart -> identical 3D evaluation ->
+                        // weld.  v stays exact at the two seam ends (v_lo, v_hi); a v-
+                        // perturbation would push the v_hi copy past the period boundary and
+                        // it would be dropped, breaking the weld.  (Mirror of the u-seam
+                        // pair, which shares its v-perturbation across the two u-copies.)
+                        double pert_u = u_min_g + j * du_k +
+                                        ((j % 2 == 0) ? 1e-5 : -1e-5) * du_k;
+                        double u_cls = canon_u(pert_u);
+                        BRepClass_FaceClassifier clf(face, gp_Pnt2d(u_cls, v_lo_ring), 1e-6);
+                        if (clf.State() != TopAbs_IN && clf.State() != TopAbs_ON) {
+                            ++n_filtered; continue;
+                        }
+                        // Both copies share the v_lo evaluation so they are bit-identical 3D.
+                        gp_Pnt p3d = surf.Value(u_cls, v_lo_ring);
+                        for (double vv : {v_lo_ring, v_hi_ring}) {
+                            auto p2 = to2d(pert_u, vv);
+                            if (near_border(p2[0], p2[1])) { ++n_near_border; continue; }
+                            auto vh = cdt.insert(CRCDT::Point(p2[0], p2[1]));
+                            if (!vh_to_idx.count(vh)) {
+                                vh_to_idx[vh] = N_border_now + interior_info.size();
+                                interior_info.push_back({p3d, {u_cls, v_lo_ring}});
+                                ++n_inserted;
+                            }
+                        }
+                    }
+                }
                 spdlog::debug("  grid: {} inserted, {} filtered (BRepClass), {} rejected "
                               "(border clearance)", n_inserted, n_filtered, n_near_border);
 
@@ -1882,11 +1985,17 @@ UvTessResult uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_ste
                             auto pa = va->point(), pb = vb->point();
                             double dx = pa.x() - pb.x(), dy = pa.y() - pb.y();
                             if (dx * dx + dy * dy < 1e-20) continue;
-                            if (u_per && u_period > 1e-9 && i == vhs.size() - 1) {
+                            if (i == vhs.size() - 1) {
                                 double du_uv = loop_uvs[li][i].first -
                                                loop_uvs[li][(i + 1) % vhs.size()].first;
-                                if (std::abs(std::abs(du_uv) - u_period) < u_period * 0.01)
-                                    continue;   // seam-wrap closing edge: not a wall
+                                double dv_uv = loop_uvs[li][i].second -
+                                               loop_uvs[li][(i + 1) % vhs.size()].second;
+                                if (u_per && u_period > 1e-9 &&
+                                    std::abs(std::abs(du_uv) - u_period) < u_period * 0.01)
+                                    continue;   // u-seam-wrap closing edge: not a wall
+                                if (v_per && v_period > 1e-9 &&
+                                    std::abs(std::abs(dv_uv) - v_period) < v_period * 0.01)
+                                    continue;   // v-seam-wrap closing edge: not a wall
                             }
                             CRCDT::Face_handle fh;
                             int idx;
@@ -1933,7 +2042,8 @@ UvTessResult uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_ste
                 //    an open chain end — boundary bays at the seam), there is no exact
                 //    classification available: skip the face and keep the BRepMesh interior
                 //    rather than guess per-triangle (centroid tests bridge concave bays).
-                if (!seam_skipped) {
+                const bool any_seam_open = seam_skipped || v_seam_skipped;
+                if (!any_seam_open) {
                     cr_mark_domains(cdt);
                 } else if (!oriented_mark()) {
                     spdlog::info("uv_grid_retessellate [face {}]: oriented domain marking "
@@ -1942,17 +2052,17 @@ UvTessResult uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_ste
                     return UvTessResult::Skipped;
                 }
                 for (auto f = cdt.finite_faces_begin(); f != cdt.finite_faces_end(); ++f) {
-                    bool inside = !seam_skipped ? (f->info() % 2) == 1  // odd nesting == inside
-                                                : f->info() == 1;  // -1 (unreached) == outside
+                    bool inside = !any_seam_open ? (f->info() % 2) == 1  // odd nesting == inside
+                                                 : f->info() == 1;  // -1 (unreached) == outside
                     if (inside && tri_2area(f) < min_tri_2area) {
                         f->info() = 0; ++n_mark_degen; continue;
                     }
                     f->info() = inside ? 1 : 0;
                     if (inside) ++n_interior; else ++n_mark_outside;
                 }
-                spdlog::debug("  cdt: {} finite faces, {} inside ({} mode)",
+                spdlog::debug("  cdt: {} finite faces, {} inside ({} mode, u_seam={} v_seam={})",
                               (int)cdt.number_of_faces(), n_interior,
-                              seam_skipped ? "oriented" : "domain");
+                              any_seam_open ? "oriented" : "domain", seam_skipped, v_seam_skipped);
             }
         } catch (const std::exception& e) {
             spdlog::warn("uv_grid_retessellate: CDT exception: {}", e.what());
