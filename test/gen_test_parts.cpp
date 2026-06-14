@@ -8,6 +8,19 @@
 //                 revolution.  Exercises torus CDT (varying row_radius, u-seam).
 //   torus_half    Half-tube torus (v in [-pi/2, pi/2]), symmetric about outer equator,
 //                 full azimuthal revolution.  Wider v span than torus_quarter.
+//   sphere_zone   Equatorial band (R=20mm, v in [-30,30] deg), full longitude.  No pole —
+//                 rectangular CDT development + u-seam.
+//   sphere_wedge  Band v in [-30,30] deg, longitude u in [0,90] deg.  No pole, no seam —
+//                 the simplest sphere CDT case.
+//   sphere_hemi   Northern hemisphere (v in [0,90] deg), full longitude.  North pole —
+//                 azimuthal disk development with an apex Steiner fan.
+//   sphere_cap    Small polar cap (v in [60,90] deg), full longitude.  North pole —
+//                 azimuthal disk (narrow annulus around the pole).
+//   sphere_slice  Pie-slice cap (v in [45,90] deg, u in [0,90] deg).  North pole on a
+//                 border corner — polar SECTOR development (cone partial-wedge path).
+//   sphere_lune   Lune: full latitude (both poles), u in [0,90] deg.  Spans pole to pole —
+//                 CDT skips, BRepMesh fallback (watertight).
+//   sphere_full   Complete sphere.  Fully-closed face (no border loops) — CDT skips.
 //   donut         Complete torus (both u and v full-period).  Fully-closed face —
 //                 CDT skips (no border loops), falls back to BRepMesh.
 //   donut_c       C-shaped torus: half azimuthal revolution (u in [0, pi]), full tube
@@ -46,6 +59,7 @@
 #include <BRepPrimAPI_MakeCone.hxx>
 #include <BRepPrimAPI_MakePrism.hxx>
 #include <BRepPrimAPI_MakeRevol.hxx>
+#include <BRepPrimAPI_MakeSphere.hxx>
 #include <BRepPrimAPI_MakeTorus.hxx>
 #include <Geom_BSplineCurve.hxx>
 #include <GeomAPI_PointsToBSpline.hxx>
@@ -99,6 +113,67 @@ TopoDS_Shape make_torus_half()
     // equator and falls to R at both edges — exercises the full row_radius variation.
     // Full azimuthal revolution (u in [0, 2π]) — u-seam CDT path.
     return BRepPrimAPI_MakeTorus(20.0, 5.0, -M_PI / 2.0, M_PI / 2.0).Shape();
+}
+
+// Sphere R=20mm.  A sphere is a surface of revolution with a circular meridian (constant
+// |dS/dv|=R) and row_radius(v)=R*cos(v); poles at v=±π/2.  OCCT MakeSphere overloads:
+//   (R, v0, v1)      latitude band v∈[v0,v1], full longitude (u-seam exercised)
+//   (R, v0, v1, u1)  latitude band v∈[v0,v1], longitude u∈[0,u1]
+//   (R, u1)          full latitude (both poles), longitude u∈[0,u1]
+//   (R)              full sphere (no border loops)
+// Latitudes given in degrees for readability.
+constexpr double kSphereR = 20.0;
+inline double deg(double d) { return d * M_PI / 180.0; }
+
+TopoDS_Shape make_sphere_zone()
+{
+    // Equatorial band v∈[-30°,30°], full longitude — NO pole.  Rectangular best-effort
+    // development (u*R*cos(v_mid), v*R) + u-seam (full 2π).
+    return BRepPrimAPI_MakeSphere(kSphereR, deg(-30.0), deg(30.0)).Shape();
+}
+
+TopoDS_Shape make_sphere_wedge()
+{
+    // Band v∈[-30°,30°], longitude u∈[0,90°] — NO pole, NO seam.  The simplest sphere
+    // CDT case: rectangular development with real border loops on all four sides.
+    return BRepPrimAPI_MakeSphere(kSphereR, deg(-30.0), deg(30.0), deg(90.0)).Shape();
+}
+
+TopoDS_Shape make_sphere_hemi()
+{
+    // Northern hemisphere v∈[0,90°], full longitude — touches the NORTH pole.  Azimuthal
+    // disk development (pole at the origin); apex Steiner forms the tip fan.  The u=0/u=2π
+    // seam copies coincide in the azimuthal map → a complete disk ring.
+    return BRepPrimAPI_MakeSphere(kSphereR, deg(0.0), deg(90.0)).Shape();
+}
+
+TopoDS_Shape make_sphere_cap()
+{
+    // Small polar cap v∈[60°,90°], full longitude — touches the NORTH pole.  Azimuthal
+    // disk like the hemisphere but a narrow annulus around the pole.
+    return BRepPrimAPI_MakeSphere(kSphereR, deg(60.0), deg(90.0)).Shape();
+}
+
+TopoDS_Shape make_sphere_slice()
+{
+    // Pie-slice cap v∈[45°,90°], longitude u∈[0,90°] — touches the NORTH pole but the
+    // pole sits on a BORDER corner (two meridian edges meet there), so the development is
+    // a polar SECTOR and near_border suppresses the apex Steiner (cone partial-wedge path).
+    return BRepPrimAPI_MakeSphere(kSphereR, deg(45.0), deg(90.0), deg(90.0)).Shape();
+}
+
+TopoDS_Shape make_sphere_lune()
+{
+    // Lune: full latitude (both poles), longitude u∈[0,90°].  Spans pole to pole → no
+    // single-sheet development → CDT Skips, falls back to BRepMesh (watertight).
+    return BRepPrimAPI_MakeSphere(kSphereR, deg(90.0)).Shape();
+}
+
+TopoDS_Shape make_sphere_full()
+{
+    // Complete sphere: the spherical face is fully closed (no border loops) → CDT Skips,
+    // BRepMesh interior.
+    return BRepPrimAPI_MakeSphere(kSphereR).Shape();
 }
 
 TopoDS_Shape make_donut()
@@ -258,6 +333,13 @@ int main(int argc, char** argv)
         {"party_hat",     make_party_hat},
         {"torus_quarter", make_torus_quarter},
         {"torus_half",    make_torus_half},
+        {"sphere_zone",   make_sphere_zone},
+        {"sphere_wedge",  make_sphere_wedge},
+        {"sphere_hemi",   make_sphere_hemi},
+        {"sphere_cap",    make_sphere_cap},
+        {"sphere_slice",  make_sphere_slice},
+        {"sphere_lune",   make_sphere_lune},
+        {"sphere_full",   make_sphere_full},
         {"donut",         make_donut},
         {"donut_c",       make_donut_c},
         {"vase",          make_vase},

@@ -446,6 +446,89 @@ std::pair<int,int> compute_torus_steps(const Geom_ToroidalSurface& torus,
     return {u_steps, v_steps};
 }
 
+std::pair<int,int> compute_sphere_steps(const Geom_SphericalSurface& sphere,
+                                        const TopoDS_Face& face,
+                                        double min_edge_length,
+                                        double max_edge_length,
+                                        double max_surface_error)
+{
+    int u_steps = 1;
+    int v_steps = 1;
+
+    double radius = sphere.Radius();
+
+    spdlog::debug("sphere:");
+    spdlog::debug("  radius: {}", radius);
+
+    Standard_Real u1, u2, v1, v2;
+    BRepTools::UVBounds(face, u1, u2, v1, v2);
+
+    spdlog::debug("  U (longitude): {} -> {} ({})", u1, u2, u2 - u1);
+    spdlog::debug("  V (latitude): {} -> {} ({})", v1, v2, v2 - v1);
+    spdlog::debug("  max edge length: {}", max_edge_length);
+
+    // U rings have radius R*cos(v); the widest (worst-case chord/error) is at the v
+    // nearest the equator within the face's range.  Clamp 0 into [v1,v2].
+    double v_eq = std::min(std::max(0.0, v1), v2);
+    double ring_radius = std::max(radius * std::cos(v_eq), 1e-10);
+    spdlog::debug("  widest ring radius (R*cos v): {}", ring_radius);
+
+    double max_u_edge_length = max_edge_length / std::sqrt(2.0);
+    max_u_edge_length = std::min(max_u_edge_length, 2 * ring_radius);
+    double min_u_edge_length = std::min(min_edge_length, 2 * ring_radius);
+
+    double u_angle = 0;
+    if (max_surface_error / ring_radius <= 2) {
+        u_angle = 2 * std::acos(1 - max_surface_error / ring_radius);
+        spdlog::debug("  max surface error angle (U): {}", u_angle);
+    }
+
+    double min_u_angle = 2 * std::asin(min_u_edge_length / (2 * ring_radius));
+    if (min_u_angle > u_angle) {
+        u_angle = min_u_angle;
+    }
+
+    double max_u_angle = 2 * std::asin(max_u_edge_length / (2 * ring_radius));
+    if (max_u_angle < u_angle) {
+        u_angle = max_u_angle;
+    }
+
+    if (u_angle > 0) {
+        int steps = std::ceil((u2 - u1) / u_angle);
+        u_angle = (u2 - u1) / steps;
+        spdlog::debug("  U steps: {}", steps);
+        if (steps > 1) {
+            u_steps = steps;
+        }
+    }
+
+    double u_chord = 2 * ring_radius * std::sin(u_angle / 2);
+
+    // V (latitude): meridian is a great circle of radius R, so the V curvature is 1/R
+    // (mirrors compute_torus_steps with minor_radius -> R).  Two constraints: the
+    // diagonal edge-length budget and the meridian curvature (sagitta).
+    double max_v_chord = std::sqrt(
+        std::max(0.0, max_edge_length * max_edge_length - u_chord * u_chord));
+
+    if (max_surface_error / radius <= 2) {
+        double v_angle_from_error = 2 * std::acos(1 - max_surface_error / radius);
+        double v_chord_from_error = 2 * radius * std::sin(v_angle_from_error / 2);
+        max_v_chord = std::min(max_v_chord, v_chord_from_error);
+    }
+
+    max_v_chord = std::min(max_v_chord, 2 * radius);
+
+    if (max_v_chord > 0) {
+        double v_angle_max = 2 * std::asin(max_v_chord / (2 * radius));
+        if (v_angle_max > 0 && (v2 - v1) > v_angle_max) {
+            v_steps = static_cast<int>(std::ceil((v2 - v1) / v_angle_max));
+            spdlog::debug("  V steps: {}", v_steps);
+        }
+    }
+
+    return {u_steps, v_steps};
+}
+
 FaceTessellationSteps get_face_tessellation_steps(const TopoDS_Face& face,
                                                    double min_edge_length,
                                                    double max_edge_length,
@@ -470,6 +553,10 @@ FaceTessellationSteps get_face_tessellation_steps(const TopoDS_Face& face,
         result.type = CurvedFaceType::Extrusion;
         std::tie(result.u_steps, result.v_steps) = compute_extrusion_steps(*h, face, min_edge_length,
                                                                             max_edge_length, max_surface_error);
+    } else if (auto h = Handle(Geom_SphericalSurface)::DownCast(surface); !h.IsNull()) {
+        result.type = CurvedFaceType::Sphere;
+        std::tie(result.u_steps, result.v_steps) = compute_sphere_steps(*h, face, min_edge_length,
+                                                                         max_edge_length, max_surface_error);
     } else if (auto h = Handle(Geom_ToroidalSurface)::DownCast(surface); !h.IsNull()) {
         result.type = CurvedFaceType::Torus;
         std::tie(result.u_steps, result.v_steps) = compute_torus_steps(*h, face, min_edge_length,

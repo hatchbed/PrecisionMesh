@@ -4,12 +4,13 @@
 
 #include <Geom_ConicalSurface.hxx>
 #include <Geom_CylindricalSurface.hxx>
+#include <Geom_SphericalSurface.hxx>
 #include <Geom_SurfaceOfLinearExtrusion.hxx>
 #include <Geom_SurfaceOfRevolution.hxx>
 #include <Geom_ToroidalSurface.hxx>
 #include <TopoDS_Face.hxx>
 
-enum class CurvedFaceType { None, Cylinder, Cone, Torus, Revolution, Extrusion };
+enum class CurvedFaceType { None, Cylinder, Cone, Sphere, Torus, Revolution, Extrusion };
 
 struct FaceTessellationSteps {
     CurvedFaceType type = CurvedFaceType::None;
@@ -33,6 +34,7 @@ inline bool cdt_eligible(const FaceTessellationSteps& steps)
 {
     return steps.type == CurvedFaceType::Cylinder ||
            steps.type == CurvedFaceType::Cone ||
+           steps.type == CurvedFaceType::Sphere ||
            steps.type == CurvedFaceType::Torus ||
            steps.type == CurvedFaceType::Revolution ||
            steps.type == CurvedFaceType::Extrusion;
@@ -75,6 +77,17 @@ std::pair<int,int> compute_extrusion_steps(const Geom_SurfaceOfLinearExtrusion& 
                                            double min_edge_length,
                                            double max_edge_length,
                                            double max_surface_error);
+
+// Compute subdivision steps for a spherical face.  A sphere is a surface of revolution
+// with a circular meridian profile of radius R and constant axial speed |dS/dv| = R, so
+// U (longitude) is sized from the widest ring radius R*cos(v) over the face's v-range and
+// V (latitude) from the meridian arc length R*(v2-v1) and the curvature 1/R (sagitta).
+// Returns {u_steps, v_steps}, both >= 1.
+std::pair<int,int> compute_sphere_steps(const Geom_SphericalSurface& surface,
+                                        const TopoDS_Face& face,
+                                        double min_edge_length,
+                                        double max_edge_length,
+                                        double max_surface_error);
 
 // Compute subdivision steps for a toroidal face using the outer equator radius for
 // U and the tube cross-section radius for V, with a shared diagonal budget.

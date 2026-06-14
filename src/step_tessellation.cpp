@@ -889,6 +889,45 @@ UvTessResult uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_ste
         torus_R = gt.MajorRadius();
         torus_r = gt.MinorRadius();
     }
+    // Sphere: a surface of revolution with a circular meridian profile of radius R.
+    // |dS/dv| = R is constant (so V develops linearly via the generic uv_v_scale = R, no
+    // arc-length table needed) and the iso-v ring radius is row_radius(v) = R*cos(v).  The
+    // surface is non-developable (K = 1/R^2), so the map is best-effort like the torus:
+    //   - no pole: rectangular (u*R*cos(v_mid), v*R)  — the generic default to2d branch.
+    //   - one pole: cone-like sector (rho*cos(u*k), rho*sin(u*k)), rho = R*|v - v_apex|
+    //     (meridian arc from the touched pole), pole at the development origin.  The k<1
+    //     sector (see sphere_apex_k) keeps the u-seam meridians on distinct rays so the
+    //     existing cone seam+weld+apex machinery applies (theta=u would coincide them).
+    const bool is_sphere = surf.GetType() == GeomAbs_Sphere;
+    double sphere_R = 0.0;
+    bool sphere_apex_touch = false;   // face touches exactly one pole (sector map)
+    bool sphere_both_poles = false;   // face spans pole to pole (no single-sheet dev)
+    double sphere_v_apex = 0.0;       // v of the touched pole (+pi/2 north, -pi/2 south)
+    double sphere_apex_k = 1.0;       // angular compression of the apex sector (see below)
+    if (is_sphere) {
+        sphere_R = surf.Sphere().Radius();
+        const double half_pi = std::acos(0.0);   // pi/2 (avoids M_PI dependency)
+        double fv1 = surf.FirstVParameter(), fv2 = surf.LastVParameter();
+        const double v_tol = 1e-6;
+        bool north = fv2 >= half_pi - v_tol;
+        bool south = fv1 <= -half_pi + v_tol;
+        sphere_both_poles = north && south;
+        sphere_apex_touch = (north || south) && !sphere_both_poles;
+        sphere_v_apex = north ? half_pi : -half_pi;
+        // Pole-touching faces develop azimuthally with the pole at the origin (cone-apex
+        // pattern).  Using the full angle (theta = u) would make the two u-seam meridians
+        // (u=0 and u=2pi) map to the SAME radial ray — a coincident slit the seam-weld
+        // can't separate, tearing the disk.  Instead develop as a cone-like SECTOR
+        // theta = u*k with k<1, so the seam meridians land on distinct rays and the
+        // existing cone seam+weld+apex machinery applies verbatim.  k = sin(colat)/colat
+        // at the cap edge (the v farthest from the pole) matches the true ring
+        // circumference there and is always < 1 (sin x < x), guaranteeing a real gap.
+        if (sphere_apex_touch) {
+            double colat = std::max(std::abs(fv1 - sphere_v_apex),
+                                    std::abs(fv2 - sphere_v_apex));
+            sphere_apex_k = colat > 1e-9 ? std::sin(colat) / colat : 1.0;
+        }
+    }
 
     // Surface of revolution: U = revolution angle (periodic, like a cylinder), V = profile-
     // curve parameter.  A general revolution is NOT developable, so the map is best-effort
@@ -1032,6 +1071,16 @@ UvTessResult uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_ste
             // s'(u) * uv_v_scale > 0, so dev_map_reverses = false.
             return {ext_s_of_u(u), v * uv_v_scale};
         }
+        if (is_sphere && sphere_apex_touch) {
+            // Cone-like SECTOR development centered on the touched pole: rho = meridian
+            // arc distance from the pole = R*|v - v_apex|, theta = u*k (k<1, so the u-seam
+            // meridians land on distinct rays — see sphere_apex_k above).  Pole ->
+            // development origin.  Jacobian det = -rho*k*rho', so north (rho'=-R) preserves,
+            // south (rho'=+R) reverses — same as the cone.
+            double rho = sphere_R * std::abs(v - sphere_v_apex);
+            double theta = u * sphere_apex_k;
+            return {rho * std::cos(theta), rho * std::sin(theta)};
+        }
         // Cylinder and torus both use a rectangular product embedding:
         //   cylinder: (u*r, v)    exact isometry, row_radius = r constant
         //   torus:    (u*R_mid, v*r_min)  best-effort, row_radius varies per ring
@@ -1047,6 +1096,7 @@ UvTessResult uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_ste
     auto row_radius = [&](double v) -> double {
         if (is_cone) return std::max(std::abs((v + cone_apex_s) * cone_sin), 1e-10);
         if (is_torus) return std::max(torus_R + torus_r * std::cos(v), 1e-10);
+        if (is_sphere) return std::max(sphere_R * std::cos(v), 1e-10);
         if (is_revolution) return std::max(rev_radius_at(v), 1e-10);
         return uv_u_scale;
     };
@@ -1055,8 +1105,12 @@ UvTessResult uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_ste
     // side of the apex) and +r for the cylinder (always preserving).  CDT triangles are
     // CCW in development coordinates, so this flips their 3D winding and must be folded
     // into the face-orientation flip at add_face time.
+    // The sphere's azimuthal map (det = -rho*rho') reverses for the south pole (rho'>0);
+    // the rectangular no-pole map and the north-pole map preserve orientation.  The
+    // winding validator (--validate flipped_triangles) is the backstop if this is wrong.
     const bool dev_map_reverses =
-        is_cone && ((surf.FirstVParameter() + surf.LastVParameter()) / 2.0 + cone_apex_s) > 0.0;
+        (is_cone && ((surf.FirstVParameter() + surf.LastVParameter()) / 2.0 + cone_apex_s) > 0.0) ||
+        (is_sphere && sphere_apex_touch && sphere_v_apex < 0.0);
 
     // Apex containment, from the FACE's parametric v-bounds (BRepAdaptor restricts to
     // the face; the apex enters via the degenerate edge's pcurve).  The border loops
@@ -1077,6 +1131,17 @@ UvTessResult uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_ste
                          "keeping BRepMesh interior", face_idx);
             return UvTessResult::Skipped;
         }
+    }
+    if (is_sphere) {
+        // A face spanning pole to pole cannot be developed onto a single sheet (one
+        // azimuthal map can place only one pole at the origin) — leave it to BRepMesh.
+        if (sphere_both_poles) {
+            spdlog::info("uv_grid_retessellate [face {}]: sphere face spans both poles — "
+                         "no single-sheet development, keeping BRepMesh interior", face_idx);
+            return UvTessResult::Skipped;
+        }
+        apex_touch = sphere_apex_touch;
+        v_apex = sphere_v_apex;
     }
 
     // Torus faces fully periodic in V need v-seam pair insertion + v-seam wrap
@@ -1595,7 +1660,11 @@ UvTessResult uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_ste
                 for (double v : ring_vs) {
                     // Rings closer to the apex than half the target edge length would sit
                     // nearer to the apex Steiner point than to each other — slivers only.
-                    if (apex_touch && std::abs(v + cone_apex_s) < 0.5 * target) { ++i_v; continue; }
+                    // 3D arc distance from the apex: cone slant (|dS/dv|=1) or sphere
+                    // meridian arc R*|v - v_apex|.
+                    double apex_dist = is_cone ? std::abs(v + cone_apex_s)
+                                               : sphere_R * std::abs(v - v_apex);
+                    if (apex_touch && apex_dist < 0.5 * target) { ++i_v; continue; }
                     double r_k = row_radius(v);
                     const bool seam_row = seam_skipped && u_per && u_period > 1e-9;
                     double du_k;
