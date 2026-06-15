@@ -11,10 +11,14 @@
 
 #include <BRep_Tool.hxx>
 #include <BRepTools.hxx>
+#include <BRepAdaptor_Surface.hxx>
 #include <Geom_Curve.hxx>
+#include <Geom_BSplineSurface.hxx>
 #include <GeomLProp_CLProps.hxx>
 #include <gp_Pnt.hxx>
 #include <gp_Vec.hxx>
+
+#include <precision_mesh/surface_metrics.h>
 
 std::pair<int,int> compute_cylinder_steps(const Geom_CylindricalSurface& cylinder,
                                           const TopoDS_Face& face,
@@ -561,6 +565,25 @@ FaceTessellationSteps get_face_tessellation_steps(const TopoDS_Face& face,
         result.type = CurvedFaceType::Torus;
         std::tie(result.u_steps, result.v_steps) = compute_torus_steps(*h, face, min_edge_length,
                                                                         max_edge_length, max_surface_error);
+    } else if (auto h = Handle(Geom_BSplineSurface)::DownCast(surface); !h.IsNull()) {
+        // Generic sweep-like B-spline (Workstream D): route to the UV-grid CDT path when the
+        // face is a coherent, non-degenerate, low-shear sweep we can develop.  Not gated on
+        // cdt_beneficial — CDT is the first-class path; we only decline what we cannot develop
+        // (sweep_coherent) or a FULL-period wrap (the seam machinery is exercised only on
+        // analytic full-period faces; deferred for B-splines, D7).  A periodic surface whose
+        // FACE spans only part of the period (e.g. the hook fillets, half of a periodic donut
+        // sweep) is a bounded patch — handled like a partial cylinder/cone.
+        // u=v=1 -> uv_grid_retessellate uses max_edge_length as the ring target.
+        BRepAdaptor_Surface surf(face);
+        double u1, u2, v1, v2;
+        BRepTools::UVBounds(face, u1, u2, v1, v2);
+        bool u_full = surf.IsUPeriodic() && (u2 - u1) >= surf.UPeriod() * 0.99;
+        bool v_full = surf.IsVPeriodic() && (v2 - v1) >= surf.VPeriod() * 0.99;
+        if (!u_full && !v_full) {
+            FaceMetricAnalysis fm = analyze_face_metric(face, u1, u2, v1, v2);
+            if (sweep_coherent(fm))
+                result.type = CurvedFaceType::SweptBSpline;
+        }
     }
 
     return result;

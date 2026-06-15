@@ -36,7 +36,9 @@
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wpedantic"
 #include <BRep_Tool.hxx>
+#include <BRepTools.hxx>
 #include <Geom_Curve.hxx>
+#include <Geom_BSplineSurface.hxx>
 #include <BRepGProp.hxx>
 #include <BRepMesh_IncrementalMesh.hxx>
 #include <gp_Trsf.hxx>
@@ -73,6 +75,7 @@
 #include <precision_mesh/step_projection.h>
 #include <precision_mesh/step_reader.h>
 #include <precision_mesh/step_subdivision.h>
+#include <precision_mesh/surface_metrics.h>
 #include <precision_mesh/unit_conversion.h>
 #include <precision_mesh/step_tessellation.h>
 #include <precision_mesh/stl.h>
@@ -859,6 +862,32 @@ int main(int argc, char **argv) {
             for (size_t i = 0; i < segments.size(); i++) {
                 auto steps = get_face_tessellation_steps(segments[i], min_edge_length,
                                                          max_edge_length, max_surface_error);
+                // [Workstream D / Phase D1 — measurement only, no behavior change]
+                // Report the face-metric analysis + sweep-coherence / CDT-benefit verdicts
+                // for non-periodic B-spline faces, so we can validate the thresholds on real
+                // parts (e.g. the HOOK1 fillet sweeps) before wiring the generic CDT path.
+                {
+                    auto srf = BRep_Tool::Surface(segments[i]);
+                    if (auto bs = Handle(Geom_BSplineSurface)::DownCast(srf); !bs.IsNull()) {
+                        double u1, u2, v1, v2;
+                        BRepTools::UVBounds(segments[i], u1, u2, v1, v2);
+                        auto fm = analyze_face_metric(segments[i], u1, u2, v1, v2);
+                        spdlog::debug(
+                            "  seg {}: BSpline {}x{} deg({},{}) closed(u={},v={}) "
+                            "periodic(u={},v={}) uv=[{:.3f},{:.3f}]x[{:.3f},{:.3f}] | valid={} "
+                            "k_max={:.4g} aniso={:.1f} shear(mean/max)={:.3f}/{:.3f} "
+                            "su_cv={:.3f} sv_cv={:.3f} su(min/med)={:.3g}/{:.3g} "
+                            "sv(min/med)={:.3g}/{:.3g} | sweep_coherent={} cdt_beneficial={}",
+                            i, bs->NbUPoles(), bs->NbVPoles(), bs->UDegree(), bs->VDegree(),
+                            bs->IsUClosed(), bs->IsVClosed(),
+                            bs->IsUPeriodic(), bs->IsVPeriodic(), u1, u2, v1, v2,
+                            fm.valid, fm.k_max_abs, fm.aniso_ratio, fm.shear_mean, fm.shear_max,
+                            fm.su_cv_along_ring, fm.sv_cv_along_col,
+                            fm.su_min, fm.su_med, fm.sv_min, fm.sv_med,
+                            sweep_coherent(fm),
+                            cdt_beneficial(fm, max_edge_length, max_surface_error));
+                    }
+                }
                 // u=v=1 means the BRepMesh interior is already at target density.
                 if (!cdt_eligible(steps))
                     continue;
@@ -873,7 +902,8 @@ int main(int argc, char **argv) {
             for (auto& f : uv_faces) {
                 auto res = uv_grid_retessellate(meshes[f.idx], segments[f.idx],
                                                 f.u_steps, f.v_steps, min_edge_length,
-                                                max_edge_length, f.idx, dump_cdt_dir);
+                                                max_edge_length, f.idx, dump_cdt_dir,
+                                                /*quiet_failure=*/true);
                 if (res == UvTessResult::Ok) {
                     tess_approaches[f.idx] = "UV-grid CDT";
                 } else {

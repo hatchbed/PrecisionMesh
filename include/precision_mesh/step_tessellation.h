@@ -45,9 +45,14 @@ enum class UvTessResult { Ok, Skipped, Failed };
 // Requires "v:uv" property map to exist on `mesh` (set by tessellate_shape).
 // dump_dir: when non-empty, write the 2D CDT to <dump_dir>/Face_<face_idx>_CDT.obj
 // for diagnosis (the directory must already exist).
+// quiet_failure: when true, the internal watertightness-gate diagnostics (add_face
+// rejected / border-halfedge mismatch) are logged at debug instead of warn — used when
+// the caller falls back to BRepMesh (watertight) for the face, so a recoverable
+// rejection isn't surfaced as a hard failure.
 UvTessResult uv_grid_retessellate(Mesh& mesh, const TopoDS_Face& face, int u_steps,
                                   int v_steps, double min_edge_length, double max_edge_length,
-                                  size_t face_idx = 0, const std::string& dump_dir = {});
+                                  size_t face_idx = 0, const std::string& dump_dir = {},
+                                  bool quiet_failure = false);
 
 // Post-tessellation open boundary loop repair.  Merges the soup by exact vertex
 // position, traces open boundary edges into closed loops, and classifies each by

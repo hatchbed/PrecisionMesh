@@ -49,15 +49,15 @@ endforeach
 cgal_dep = declare_dependency(include_directories: _cgal_include_dirs)
 
 occt_targets = ['TKBO', 'TKBRep', 'TKCAF', 'TKCDF', 'TKG2d', 'TKG3d', 'TKGeomAlgo', 'TKGeomBase',
-                'TKernel', 'TKHLR', 'TKLCAF', 'TKMath', 'TKMesh', 'TKService', 'TKShHealing',
-                'TKSTEP', 'TKSTEP209', 'TKSTEPAttr', 'TKSTEPBase', 'TKTopAlgo', 'TKV3d', 'TKVCAF',
-                'TKXCAF', 'TKXDESTEP', 'TKXSBase']
+                'TKernel', 'TKHLR', 'TKLCAF', 'TKMath', 'TKMesh', 'TKOffset', 'TKPrim', 'TKService',
+                'TKShHealing', 'TKSTEP', 'TKSTEP209', 'TKSTEPAttr', 'TKSTEPBase', 'TKTopAlgo',
+                'TKV3d', 'TKVCAF', 'TKXCAF', 'TKXDESTEP', 'TKXSBase']
 
 # OCCT 7.8+ consolidated TKSTEP/TKSTEP209/TKSTEPAttr/TKSTEPBase/TKXDESTEP into TKDESTEP.
 # The subproject (V7_7_2) still uses old names, so keep occt_targets unchanged for that path.
 occt_system_targets = ['TKBO', 'TKBRep', 'TKCAF', 'TKCDF', 'TKG2d', 'TKG3d', 'TKGeomAlgo', 'TKGeomBase',
-                       'TKernel', 'TKHLR', 'TKLCAF', 'TKMath', 'TKMesh', 'TKService', 'TKShHealing',
-                       'TKDESTEP', 'TKTopAlgo', 'TKV3d', 'TKVCAF',
+                       'TKernel', 'TKHLR', 'TKLCAF', 'TKMath', 'TKMesh', 'TKOffset', 'TKPrim',
+                       'TKService', 'TKShHealing', 'TKDESTEP', 'TKTopAlgo', 'TKV3d', 'TKVCAF',
                        'TKXCAF', 'TKXSBase']
 
 occt_dep = dependency('OpenCASCADE', method: 'cmake', version: '>=7.7.2', required: false,
@@ -121,6 +121,7 @@ precision_mesh = executable('precision_mesh',
   'src/step_reader.cpp',
   'src/step_subdivision.cpp',
   'src/step_tessellation.cpp',
+  'src/surface_metrics.cpp',
   'src/unit_conversion.cpp',
   viewer_sources,
   cpp_args : ['-DCGAL_DISABLE_ROUNDING_MATH_CHECK'] + viewer_cpp_args,

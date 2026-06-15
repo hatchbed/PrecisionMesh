@@ -49,12 +49,14 @@
 #include <cstdio>
 #include <map>
 #include <string>
+#include <vector>
 
 #include <BRepAlgoAPI_Cut.hxx>
 #include <BRepBuilderAPI_MakeEdge.hxx>
 #include <BRepBuilderAPI_MakeFace.hxx>
 #include <BRepBuilderAPI_MakeWire.hxx>
 #include <BRepBuilderAPI_Transform.hxx>
+#include <BRepOffsetAPI_MakePipeShell.hxx>
 #include <BRepPrimAPI_MakeBox.hxx>
 #include <BRepPrimAPI_MakeCone.hxx>
 #include <BRepPrimAPI_MakePrism.hxx>
@@ -62,6 +64,7 @@
 #include <BRepPrimAPI_MakeSphere.hxx>
 #include <BRepPrimAPI_MakeTorus.hxx>
 #include <Geom_BSplineCurve.hxx>
+#include <Geom_Circle.hxx>
 #include <GeomAPI_PointsToBSpline.hxx>
 #include <gp_Ax1.hxx>
 #include <gp_Ax2.hxx>
@@ -325,6 +328,146 @@ TopoDS_Shape make_ext_lens()
     return BRepPrimAPI_MakePrism(profile, gp_Vec(0, 30, 0)).Shape();
 }
 
+// ---- Swept B-spline pipes (Workstream D — generic B-spline CDT) -------------------
+// A circular profile swept along a B-spline spine produces genuine general-sweep lateral
+// surfaces; after the STEP round-trip these are stored as B_SPLINE_SURFACE_WITH_KNOTS
+// (the analytic types — line/arc/circle profiles along straight/circular spines — would
+// downcast to plane/cylinder/cone/torus and never reach the generic path).  These mimic
+// the HOOK1 fillet sweeps that motivated Workstream D.
+//
+// Profile choice controls the face topology:
+//   two arcs  -> the lateral surface splits into TWO bounded (non-periodic) faces, each a
+//                half-tube the generic CDT path tessellates directly.
+//   full ring -> ONE periodic lateral face spanning the full u-period -> the CDT defers the
+//                full-wrap case (seam machinery is analytic-only) and falls back to BRepMesh.
+// MakeSolid() caps the spine ends with planar disks, so every part is a watertight solid.
+
+// Closed circular profile at `c`, in the plane normal to `n`, radius `r`.  `full`: one
+// periodic edge (single periodic face) vs two semicircle arcs (two bounded faces).
+TopoDS_Wire bs_circle_profile(const gp_Pnt& c, const gp_Dir& n, double r, bool full)
+{
+    gp_Ax2 ax(c, n);                       // X-direction auto-derived perpendicular to n
+    Handle(Geom_Circle) circ = new Geom_Circle(ax, r);
+    BRepBuilderAPI_MakeWire mw;
+    if (full) {
+        mw.Add(BRepBuilderAPI_MakeEdge(circ).Edge());
+    } else {
+        mw.Add(BRepBuilderAPI_MakeEdge(circ, 0.0, M_PI).Edge());
+        mw.Add(BRepBuilderAPI_MakeEdge(circ, M_PI, 2.0 * M_PI).Edge());
+    }
+    return mw.Wire();
+}
+
+// Sweep a circular profile of radius r0 (tapering to r1 at the far end if r1 != r0) along a
+// B-spline spine through `pts`, capped into a watertight solid.
+TopoDS_Shape bs_pipe(const std::vector<gp_Pnt>& pts, double r0, double r1, bool full)
+{
+    TColgp_Array1OfPnt arr(1, static_cast<int>(pts.size()));
+    for (int i = 0; i < static_cast<int>(pts.size()); i++) arr.SetValue(i + 1, pts[i]);
+    Handle(Geom_BSplineCurve) spine = GeomAPI_PointsToBSpline(arr).Curve();
+    TopoDS_Wire spine_w = BRepBuilderAPI_MakeWire(BRepBuilderAPI_MakeEdge(spine).Edge());
+
+    BRepOffsetAPI_MakePipeShell ps(spine_w);
+    gp_Pnt p0; gp_Vec d0;
+    spine->D1(spine->FirstParameter(), p0, d0);
+    ps.Add(bs_circle_profile(p0, gp_Dir(d0), r0, full));
+    if (r1 != r0) {                        // tapered: a second section at the far end
+        gp_Pnt p1; gp_Vec d1;
+        spine->D1(spine->LastParameter(), p1, d1);
+        ps.Add(bs_circle_profile(p1, gp_Dir(d1), r1, full));
+    }
+    ps.Build();
+    ps.MakeSolid();
+    return ps.Shape();
+}
+
+// Gentle arc duct — low, uniform curvature: the textbook clean sweep (-> CDT).
+TopoDS_Shape make_bs_duct()
+{
+    return bs_pipe({{0,0,0}, {12,0,4}, {24,0,5}, {36,0,4}, {48,0,0}}, 6.0, 6.0, false);
+}
+
+// 90° elbow — a clean pipe elbow with bend radius ≈ 3× the tube radius (no inner-wall
+// self-intersection); the bend still tightens the along-sweep curvature (-> CDT).
+TopoDS_Shape make_bs_elbow()
+{
+    return bs_pipe({{0,0,0}, {0,0,14}, {0,0,26}, {5,0,34}, {14,0,38}, {26,0,39}, {38,0,39}},
+                   4.0, 4.0, false);
+}
+
+// S-bend — curvature reverses sign along the sweep; the outer/inner of each bend differ in
+// length (exercises the |S_v| variation / sv_cv gate).  Bend radius kept > tube radius.
+TopoDS_Shape make_bs_ess()
+{
+    return bs_pipe({{0,0,0}, {0,0,15}, {7,0,25}, {7,0,40}, {0,0,50}, {0,0,65}}, 3.0, 3.0, false);
+}
+
+// Helix — a genuinely 3D spine (out-of-plane), constant curvature & torsion.  pitch (12) >
+// the tube diameter (6) so consecutive turns clear each other.
+TopoDS_Shape make_bs_helix()
+{
+    std::vector<gp_Pnt> pts;
+    const double R = 14.0, pitch = 12.0;
+    for (int i = 0; i <= 12; i++) {
+        double t = i * (3.0 * M_PI) / 12.0;            // 1.5 turns
+        pts.push_back(gp_Pnt(R * std::cos(t), R * std::sin(t), pitch * t / (2.0 * M_PI)));
+    }
+    return bs_pipe(pts, 3.0, 3.0, false);
+}
+
+// Multi-bend wave — several curvature reversals along a long spine.  Amplitude/wavelength
+// chosen so the min radius of curvature (≈ L²/(4π²A) ≈ 7.6) stays above the tube radius.
+TopoDS_Shape make_bs_wave()
+{
+    return bs_pipe({{0,0,0}, {15,0,3}, {30,0,-3}, {45,0,3}, {60,0,-3}, {75,0,0}}, 2.5, 2.5, false);
+}
+
+// Near-C loop — a large sweep angle (curvature high enough to look like a tube fillet).
+TopoDS_Shape make_bs_loop()
+{
+    std::vector<gp_Pnt> pts;
+    const double R = 22.0;
+    for (int i = 0; i <= 9; i++) {
+        double t = i * (1.5 * M_PI) / 9.0;             // 270° arc in XZ
+        pts.push_back(gp_Pnt(R * std::cos(t), 0.0, R * std::sin(t)));
+    }
+    return bs_pipe(pts, 4.0, 4.0, false);
+}
+
+// Horn — a moderate taper (r 8 -> 3) along a gentle arc: |S_u| varies smoothly between
+// rings (degenerate-edge gate passes; tests the CV thresholds).
+TopoDS_Shape make_bs_horn()
+{
+    return bs_pipe({{0,0,0}, {12,0,4}, {24,0,5}, {36,0,4}, {48,0,0}}, 8.0, 3.0, false);
+}
+
+// Trumpet — taper the other way (r 2 -> 9) along a bend.
+TopoDS_Shape make_bs_trumpet()
+{
+    return bs_pipe({{0,0,0}, {0,0,15}, {6,0,27}, {18,0,33}, {32,0,34}}, 2.0, 9.0, false);
+}
+
+// Needle — taper almost to a point (r 9 -> 0.1): the small end is a near-collapsed edge,
+// so su_min << su_med -> sweep_coherent REJECTS it (degenerate-patch gate) -> BRepMesh.
+TopoDS_Shape make_bs_needle()
+{
+    return bs_pipe({{0,0,0}, {14,0,5}, {28,0,7}, {42,0,5}, {56,0,0}}, 9.0, 0.1, false);
+}
+
+// Full-ring profile — the lateral surface is a SINGLE u-periodic face spanning the whole
+// period: the generic path defers the full-wrap case and falls back to BRepMesh (watertight).
+TopoDS_Shape make_bs_pipe_full()
+{
+    return bs_pipe({{0,0,0}, {12,0,4}, {24,0,5}, {36,0,4}, {48,0,0}}, 6.0, 6.0, true);
+}
+
+// Big-radius gentle bow — very low curvature relative to a fine target: a case where the
+// curvature is gentle (the old cdt_beneficial test would route it to remeshing).
+TopoDS_Shape make_bs_bow()
+{
+    return bs_pipe({{0,0,0}, {25,0,4}, {50,0,5}, {75,0,4}, {100,0,0}}, 12.0, 12.0, false);
+}
+
 }  // namespace
 
 int main(int argc, char** argv)
@@ -349,6 +492,18 @@ int main(int argc, char** argv)
         {"ext_arch",      make_ext_arch},
         {"ext_skew",      make_ext_skew},
         {"ext_lens",      make_ext_lens},
+        // Swept B-spline pipes (Workstream D — generic B-spline CDT).
+        {"bs_duct",       make_bs_duct},
+        {"bs_elbow",      make_bs_elbow},
+        {"bs_ess",        make_bs_ess},
+        {"bs_helix",      make_bs_helix},
+        {"bs_wave",       make_bs_wave},
+        {"bs_loop",       make_bs_loop},
+        {"bs_horn",       make_bs_horn},
+        {"bs_trumpet",    make_bs_trumpet},
+        {"bs_needle",     make_bs_needle},
+        {"bs_pipe_full",  make_bs_pipe_full},
+        {"bs_bow",        make_bs_bow},
     };
 
     if (argc < 2 || !shapes.count(argv[1])) {

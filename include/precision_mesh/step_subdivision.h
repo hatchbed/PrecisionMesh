@@ -10,7 +10,8 @@
 #include <Geom_ToroidalSurface.hxx>
 #include <TopoDS_Face.hxx>
 
-enum class CurvedFaceType { None, Cylinder, Cone, Sphere, Torus, Revolution, Extrusion };
+enum class CurvedFaceType { None, Cylinder, Cone, Sphere, Torus, Revolution, Extrusion,
+                            SweptBSpline };
 
 struct FaceTessellationSteps {
     CurvedFaceType type = CurvedFaceType::None;
@@ -37,7 +38,8 @@ inline bool cdt_eligible(const FaceTessellationSteps& steps)
            steps.type == CurvedFaceType::Sphere ||
            steps.type == CurvedFaceType::Torus ||
            steps.type == CurvedFaceType::Revolution ||
-           steps.type == CurvedFaceType::Extrusion;
+           steps.type == CurvedFaceType::Extrusion ||
+           steps.type == CurvedFaceType::SweptBSpline;
 }
 
 // Compute the number of U (angular) and V (axial) parametric step counts for a
